@@ -1,0 +1,16 @@
+{{- if .Values.sampleMcpServers.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aom.sampleMcpServersServiceName" . }}
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "sample-mcp-servers") .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "aom.componentSelectorLabels" (merge (dict "component" "sample-mcp-servers") .) | nindent 4 }}
+  ports:
+    - name: http
+      port: 8100
+      targetPort: http
+{{- end }}

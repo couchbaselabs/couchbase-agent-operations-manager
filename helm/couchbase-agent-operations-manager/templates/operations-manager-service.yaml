@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aom.operationsManagerServiceName" . }}
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "aom.componentSelectorLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

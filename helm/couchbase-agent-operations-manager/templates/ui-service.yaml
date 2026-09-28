@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aom.uiServiceName" . }}
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "ui") .) | nindent 4 }}
+spec:
+  type: {{ .Values.ui.service.type }}
+  selector:
+    {{- include "aom.componentSelectorLabels" (merge (dict "component" "ui") .) | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.ui.service.port }}
+      targetPort: https
+    {{- if .Values.ui.service.exposeHttp }}
+    - name: http
+      port: {{ .Values.ui.service.httpPort | default 80 }}
+      targetPort: http
+    {{- end }}

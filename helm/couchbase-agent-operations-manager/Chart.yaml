@@ -1,0 +1,23 @@
+apiVersion: v2
+name: couchbase-agent-operations-manager
+description: >-
+  Couchbase Agent Operations Manager - a Couchbase-backed control plane for
+  AI agent tool registries: RBAC-scoped tool discovery over a single vector
+  kNN + RBAC pre-filter Couchbase Search request, per-call authorization
+  re-checks, an append-only audit log, and LLM response caching. Mirrors the
+  bundled docker-compose.yml topology (Couchbase, a one-time provisioning
+  step, the sample MCP servers, the operations-manager API, and the nginx
+  dashboard) as native Kubernetes resources - see this chart's README.md for
+  what's identical, what's deliberately different (e.g. a real Job instead
+  of docker-compose.yml's idling init container), and what you must supply
+  yourself (built+pushed images; see "Before you install").
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - couchbase
+  - ai-agents
+  - mcp
+  - rbac
+  - vector-search
+  - llm-cache

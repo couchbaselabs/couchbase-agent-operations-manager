@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "couchbase-aom-sdk"
+version = "0.5.0"
+description = "Official Python client SDK for the Couchbase Agent Operations Manager"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+# Only needed for aom_sdk.mcp_server, the bridge that exposes this
+# appliance as a real MCP server. Everything else in the SDK depends on
+# nothing but `requests`.
+mcp = ["mcp>=1.2.0"]
+
+[project.scripts]
+aom-mcp-server = "aom_sdk.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["aom_sdk*"]

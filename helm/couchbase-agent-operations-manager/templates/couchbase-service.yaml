@@ -1,0 +1,33 @@
+{{- if .Values.couchbase.enabled }}
+# Headless (clusterIP: None) - required for a StatefulSet's serviceName,
+# and gives operations-manager/couchbase-init a stable DNS name
+# (couchbase://<this-service-name>) without needing a real ClusterIP.
+# Not exposed outside the cluster, matching docker-compose.yml's
+# loopback-only publish of the admin console/data ports - use
+# `kubectl port-forward` for admin console access instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aom.couchbaseServiceName" . }}
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "couchbase") .) | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "aom.componentSelectorLabels" (merge (dict "component" "couchbase") .) | nindent 4 }}
+  ports:
+    - name: admin
+      port: 8091
+    - name: port8092
+      port: 8092
+    - name: query
+      port: 8093
+    - name: search
+      port: 8094
+    - name: analytics
+      port: 8095
+    - name: eventing
+      port: 8096
+    - name: data
+      port: 11210
+{{- end }}

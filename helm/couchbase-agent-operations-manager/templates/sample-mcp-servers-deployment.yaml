@@ -1,0 +1,54 @@
+{{- if .Values.sampleMcpServers.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aom.fullname" . }}-sample-mcp-servers
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "sample-mcp-servers") .) | nindent 4 }}
+spec:
+  replicas: {{ .Values.sampleMcpServers.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aom.componentSelectorLabels" (merge (dict "component" "sample-mcp-servers") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aom.componentSelectorLabels" (merge (dict "component" "sample-mcp-servers") .) | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: sample-mcp-servers
+          image: {{ include "aom.image" (dict "root" $ "repository" .Values.sampleMcpServers.image.repository "tag" .Values.sampleMcpServers.image.tag) }}
+          imagePullPolicy: {{ .Values.sampleMcpServers.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8100
+          env:
+            - name: LOG_LEVEL
+              value: INFO
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 15
+          resources:
+            {{- toYaml .Values.sampleMcpServers.resources | nindent 12 }}
+{{- end }}
