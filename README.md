@@ -4,7 +4,7 @@
 
 Couchbase Agent Operations Manager (AOM) is a self-hosted control plane for
 AI agents, built on Couchbase Server Enterprise Edition that eases adoption
-of the Couchbase AI Data Plane. Migrating an agents existing memory to 
+of the Couchbase AI Data Plane. Migrating an agent's existing memory to 
 Couchbase Agent Memory for Context Caching and LLM Caching is simplified,
 allowing existing and new agents to rapidly benefit from the Couchbase AI Data Plane.
 
