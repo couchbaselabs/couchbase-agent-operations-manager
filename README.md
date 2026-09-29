@@ -18,8 +18,8 @@ allowing existing and new agents rapidly benefit from the Couchbase AI Data Plan
   spend budgets, and PII guardrails.
 - **Memory and knowledge** - per-user agent memory with consolidation, a
   context cache, and a knowledge base for RAG with role-filtered retrieval.
-- **Oversight** - agent identities with key rotation and OIDC, a human
-  approval tier for risky tools, run traces, evaluations with a regression
+- **Oversight** - agent identities with key rotation and OIDC, audit logging of
+  all agent operations with tools, run traces, evaluations with a regression
   gate, an audit log with SIEM forwarding, and a web dashboard for all of it.
 
 A Python SDK and Claude, ChatGPT and Gemini skills (under **Tools** in the
