@@ -73,6 +73,11 @@ DEFAULT_LOCAL_ROLE = "user"
 # plus a small set of concrete weaknesses (common/breached passwords,
 # password == username) rather than requiring e.g. "one symbol, one digit".
 MIN_PASSWORD_LENGTH = 12
+# bcrypt only ever reads the first 72 bytes of its input. bcrypt < 5
+# silently ignored the rest; bcrypt >= 5 raises instead. Rejecting longer
+# passwords up front gives the user a clear message rather than a 500, and
+# never lets them believe characters past the limit are protecting them.
+MAX_PASSWORD_BYTES = 72
 
 # Not an exhaustive breached-password list (that would mean shipping/
 # fetching a real corpus, e.g. Have I Been Pwned's list, which is a
@@ -90,6 +95,8 @@ _COMMON_WEAK_PASSWORDS = {
 def password_policy_error(password: str, username: str | None = None) -> str | None:
     if not password or len(password) < MIN_PASSWORD_LENGTH:
         return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return f"Password must be at most {MAX_PASSWORD_BYTES} bytes (bcrypt ignores anything longer)."
     normalized = password.strip().lower()
     if normalized in _COMMON_WEAK_PASSWORDS:
         return "That password is too common - choose something less guessable."
@@ -112,7 +119,10 @@ def verify_password(plain: str, password_hash: str | None) -> bool:
     if not password_hash:
         return False
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
+        # Truncated to bcrypt's 72-byte input limit - exactly what bcrypt < 5
+        # did implicitly - so an account whose password was set before that
+        # limit was enforced (see MAX_PASSWORD_BYTES) can still sign in.
+        return bcrypt.checkpw(plain.encode("utf-8")[:MAX_PASSWORD_BYTES], password_hash.encode("utf-8"))
     except ValueError:
         # A malformed/legacy hash should fail closed, not raise.
         logger.warning("verify_password: malformed hash")

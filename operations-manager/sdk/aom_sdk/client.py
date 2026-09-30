@@ -56,9 +56,9 @@ class AOMClient:
         ``aom_``) or, when the appliance is configured to federate identity,
         an OIDC access token from your own provider - both are sent as
         ``Authorization: Bearer``, and the appliance works out which it is.
-        Only required for calls that authenticate - discover, invoke,
-        complete, memory and knowledge - not for ``health()`` or
-        ``roles()``.
+        Required for every agent call - discover, invoke, catalog,
+        complete, context, memory, approvals and knowledge. Only
+        ``health()`` works without one.
 
         Keys are stored by the appliance only as a hash, so a lost key is
         rotated rather than looked up. If yours stops working, the refusal
@@ -242,7 +242,11 @@ class AOMClient:
         return self._request("GET", "/api/health")
 
     def roles(self) -> List[dict]:
-        """GET /v1/roles - the RBAC roles configured on this appliance."""
+        """GET /v1/roles - the RBAC roles configured on this appliance.
+        Requires a dashboard session, not an agent API key: this is the
+        operator's view (pass a ``session`` carrying the dashboard's
+        session cookie). An agent learns its own role from ``discover()``
+        or ``catalog()``, both of which return it."""
         return self._request("GET", "/v1/roles")["roles"]
 
     # -- tool discovery / invocation -------------------------------------------
@@ -295,6 +299,7 @@ class AOMClient:
         namespace: Optional[str] = None,
         bypass_cache: bool = False,
         params: Optional[dict] = None,
+        semantic: Optional[bool] = None,
     ) -> dict:
         """POST /v1/llm/complete - a cached completion. A repeat or
         near-duplicate prompt (see the similarity threshold in the LLM
@@ -303,7 +308,10 @@ class AOMClient:
         ``hit_exact`` / ``hit_semantic`` / ``miss`` / ``bypass``;
         ``response["usage"]`` and ``response["cost_usd"]`` reflect actual
         provider spend - i.e. zero on any hit. Set ``bypass_cache=True`` for
-        a prompt that must always reach the live model."""
+        a prompt that must always reach the live model. Set
+        ``semantic=False`` for exact-match-only caching on this call - use it
+        for prompts that embed fetched data, where a near-identical prompt
+        can carry different facts."""
         return self._request(
             "POST", "/v1/llm/complete", auth=True,
             json_body={
@@ -312,6 +320,7 @@ class AOMClient:
                 "model": model,
                 "namespace": namespace,
                 "bypass_cache": bypass_cache,
+                "semantic": semantic,
                 "params": params or {},
             },
         )
@@ -552,11 +561,17 @@ class AOMClient:
         return self._request("POST", "/v1/agent/knowledge/search", auth=True, json_body=body)["results"]
 
     def catalog(self) -> List[dict]:
-        """GET /v1/catalog - the full vetted tool catalog (no API key
-        required): every tool's id, name, description, input_schema,
-        allowed_roles and trust status. `discover()` alone doesn't carry
-        `input_schema`; this is how `discover_mcp_tools()` fills it in."""
-        return self._request("GET", "/v1/catalog")["tools"]
+        """GET /v1/agent/tools - every tool this API key can actually
+        invoke: trusted, allowed for its role, and inside the agent's
+        scope. Each entry carries the tool's id, name, description,
+        input_schema, allowed_roles and trust status. `discover()` alone
+        doesn't carry `input_schema`; this is how `discover_mcp_tools()`
+        fills it in.
+
+        Needs an appliance that bundles SDK 0.6.0 or later. The operator's unfiltered
+        catalog (``GET /v1/catalog``) sits behind a dashboard session and
+        is not reachable with an agent API key."""
+        return self._request("GET", "/v1/agent/tools", auth=True)["tools"]
 
     def discover_mcp_tools(self, query: str, top_k: int = 5) -> List[dict]:
         """Like `discover()`, but returns each matched tool already

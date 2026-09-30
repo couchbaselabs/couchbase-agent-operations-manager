@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { Sidebar } from "./components/nav/Sidebar";
 import { DashboardPage } from "./pages/DashboardPage";

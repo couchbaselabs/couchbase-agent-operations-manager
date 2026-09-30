@@ -244,6 +244,9 @@ LLM_API_KEYS = {
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
     "openai": os.getenv("OPENAI_API_KEY", ""),
     "google": os.getenv("GEMINI_API_KEY", ""),
+    # Databricks needs a workspace URL as well as a token; without
+    # DATABRICKS_HOST the provider is treated as unconfigured (offline stub).
+    "databricks": os.getenv("DATABRICKS_TOKEN", "") if os.getenv("DATABRICKS_HOST", "").strip() else "",
 }
 
 # Runtime cache policy lives in Couchbase (settings::llm_cache) because it is

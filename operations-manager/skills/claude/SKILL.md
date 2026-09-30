@@ -52,7 +52,7 @@ than call the SDK's Python API (see Step 4), install the optional extra:
 ## Step 2 - configure a client
 
 Every call needs the appliance's base URL and (for anything but
-`health()`/`roles()`/`catalog()`) a bearer credential. That is either an
+`health()`) a bearer credential. That is either an
 agent key issued from **Settings -> Agent Identities** (prefixed `aom_`),
 or - where the appliance federates identity - an OIDC access token from
 the organisation's own provider. Both go in the same field; the appliance

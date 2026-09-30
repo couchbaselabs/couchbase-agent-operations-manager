@@ -208,6 +208,16 @@ operationsManager:
     anthropic: ""
     openai: ""
     gemini: ""
+    # Databricks Model Serving: a personal access token or service
+    # principal token. Needs databricks.host below as well.
+    databricks: ""
+
+  databricks:
+    # Workspace URL, e.g. https://dbc-1234abcd-5678.cloud.databricks.com
+    host: ""
+    # Extra serving endpoints (custom or provisioned throughput) to offer
+    # as models, comma-separated.
+    servingEndpoints: ""
 
   audit:
     logRetentionHours: 720

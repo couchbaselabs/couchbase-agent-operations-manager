@@ -170,6 +170,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "aom.authSecretName" . }}
                   key: GEMINI_API_KEY
+            - name: DATABRICKS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: DATABRICKS_TOKEN
+                  optional: true
+            - name: DATABRICKS_HOST
+              value: {{ (.Values.operationsManager.databricks | default dict).host | default "" | quote }}
+            - name: DATABRICKS_SERVING_ENDPOINTS
+              value: {{ (.Values.operationsManager.databricks | default dict).servingEndpoints | default "" | quote }}
             - name: LLM_CACHE_ENABLED
               value: {{ .Values.operationsManager.llmCache.enabled | quote }}
             - name: LLM_CACHE_PROVIDER

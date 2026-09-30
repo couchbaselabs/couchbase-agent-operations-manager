@@ -25,7 +25,7 @@ from .exceptions import (
 )
 from .mcp_tools import to_mcp_tool, to_mcp_tools
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AOMClient",

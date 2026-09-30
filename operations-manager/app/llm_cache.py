@@ -8,7 +8,7 @@ difference is what the choke point buys you here - a cache.
 
 Three things live in this module:
 
-  1. The provider catalog (Claude / ChatGPT / Gemini), including per-model
+  1. The provider catalog (Claude / ChatGPT / Gemini / Databricks), including per-model
      token pricing so "tokens saved" can be reported as money saved. Prices
      are list-price *estimates* and are meant to be edited - see PRICING.
   2. The cache key + invalidation policy engine. Everything a user can
@@ -27,6 +27,7 @@ app/couchbase_client.py and orchestration lives in app/main.py.
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -72,7 +73,34 @@ PROVIDERS: dict[str, dict] = {
         "models": ["gemini-3.1-pro-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
         "default_model": "gemini-2.5-flash",
     },
+    # Databricks Model Serving. A "model" here is a serving endpoint name:
+    # the pay-per-token Foundation Model API endpoints below, plus any
+    # custom/provisioned-throughput endpoints listed in
+    # DATABRICKS_SERVING_ENDPOINTS (comma-separated). The endpoint URL is
+    # per-workspace, so it is built from DATABRICKS_HOST at call time.
+    "databricks": {
+        "id": "databricks",
+        "label": "Databricks",
+        "vendor": "Databricks",
+        "env_key": "DATABRICKS_TOKEN",
+        "endpoint": "{host}/serving-endpoints/{model}/invocations",
+        "docs_url": "https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference",
+        "models": [
+            "databricks-meta-llama-3-3-70b-instruct",
+            "databricks-claude-sonnet-4-5",
+            "databricks-gpt-oss-120b",
+            "databricks-llama-4-maverick",
+            "databricks-gemini-2-5-flash",
+        ],
+        "default_model": "databricks-meta-llama-3-3-70b-instruct",
+    },
 }
+
+for _endpoint in (os.getenv("DATABRICKS_SERVING_ENDPOINTS") or "").split(","):
+    _endpoint = _endpoint.strip()
+    if _endpoint and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", _endpoint) \
+            and _endpoint not in PROVIDERS["databricks"]["models"]:
+        PROVIDERS["databricks"]["models"].append(_endpoint)
 
 # USD per 1,000,000 tokens, (input, output). These are *estimates* used to
 # turn "tokens saved" into "dollars saved" on the dashboard - they are not
@@ -87,6 +115,13 @@ PRICING: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro-preview": (2.00, 12.00),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.075, 0.30),
+    # Databricks bills pay-per-token endpoints in DBUs; these are rough USD
+    # equivalents at list price. Replace them with your workspace's rates.
+    "databricks-meta-llama-3-3-70b-instruct": (0.50, 1.50),
+    "databricks-claude-sonnet-4-5": (3.00, 15.00),
+    "databricks-gpt-oss-120b": (0.15, 0.60),
+    "databricks-llama-4-maverick": (0.50, 1.50),
+    "databricks-gemini-2-5-flash": (0.30, 2.50),
 }
 
 CACHE_SCOPES = ("global", "per_role", "per_subject")
@@ -474,6 +509,40 @@ def call_provider(provider: str, model: str, prompt: str, cfg: dict, api_keys: d
             text=text,
             prompt_tokens=int(usage.get("promptTokenCount") or estimate_tokens(prompt)),
             completion_tokens=int(usage.get("candidatesTokenCount") or estimate_tokens(text)),
+            stub=False,
+            provider=provider,
+            model=model,
+        )
+
+    if provider == "databricks":
+        host = (os.getenv("DATABRICKS_HOST") or "").strip().rstrip("/")
+        if not host:
+            return _stub_completion(provider, model, prompt, cfg)
+        if not host.startswith("http"):
+            host = f"https://{host}"
+        resp = requests.post(
+            spec["endpoint"].format(host=host, model=model),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        choices = body.get("choices") or [{}]
+        content = (choices[0].get("message") or {}).get("content") or ""
+        if isinstance(content, list):
+            # Some served models return content as typed parts.
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        text = content
+        usage = body.get("usage") or {}
+        return ProviderResult(
+            text=text,
+            prompt_tokens=int(usage.get("prompt_tokens") or estimate_tokens(prompt)),
+            completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(text)),
             stub=False,
             provider=provider,
             model=model,

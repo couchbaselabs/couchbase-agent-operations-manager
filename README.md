@@ -461,11 +461,14 @@ spent at all.
 
 ### Choosing the LLM
 
-Claude, ChatGPT and Gemini are all selectable from **LLM Caching ->
-Providers & Policy**, each with its own model list and list-price
-estimates (`operations-manager/app/llm_cache.py`). Set
+Claude, ChatGPT, Gemini and Databricks Model Serving are all selectable
+from **LLM Caching -> Providers & Policy**, each with its own model list
+and list-price estimates (`operations-manager/app/llm_cache.py`). Set
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` in `.env` to
-proxy calls for real.
+proxy calls for real. For Databricks, set `DATABRICKS_HOST` (the
+workspace URL) and `DATABRICKS_TOKEN`; each "model" is a serving endpoint
+name, and `DATABRICKS_SERVING_ENDPOINTS` (comma-separated) adds your own
+custom or provisioned-throughput endpoints to the list.
 
 **No key is required to try it.** A provider with no key configured
 answers a cache miss from a clearly-labelled deterministic stub, so
@@ -525,7 +528,10 @@ The response carries the answer plus `cache.status`
 (`hit_exact` / `hit_semantic` / `miss` / `bypass`), the similarity that
 earned a semantic hit, token usage, and what the hit saved. Send the same
 prompt twice to watch the second one cost nothing. `provider` and `model`
-can be overridden per request; `bypass_cache: true` forces a live call.
+can be overridden per request; `bypass_cache: true` forces a live call,
+and `semantic: false` limits that call to exact matches (for prompts that
+embed fetched data, where a near-identical prompt can carry different
+facts).
 
 | Endpoint | Purpose |
 |---|---|

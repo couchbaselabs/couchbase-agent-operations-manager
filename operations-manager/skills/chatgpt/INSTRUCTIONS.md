@@ -46,7 +46,7 @@ Need the SDK to speak MCP directly (Step 4)? Install the optional extra:
 ## Step 2 - configure a client
 
 Every call needs the appliance's base URL and (for anything but
-`health()`/`roles()`/`catalog()`) a bearer credential - either an agent key issued from **Settings ->
+`health()`) a bearer credential - either an agent key issued from **Settings ->
 Agent Identities** (prefixed `aom_`), or an OIDC access token from the
 organisation's own provider where the appliance federates identity. Both
 go in the same field.

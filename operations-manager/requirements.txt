@@ -1,14 +1,21 @@
-fastapi==0.141.1
+fastapi==0.142.2
 uvicorn[standard]==0.54.0
-requests==2.33.0
-numpy==1.26.4
-couchbase==4.6.2
-mcp==1.29.1
-sentence-transformers==3.3.1
-bcrypt==4.2.1
-PyJWT==2.13.0
+requests==2.34.2
+# 2.4.x is the newest numpy line with Python 3.11 wheels (2.5 requires
+# 3.12) - move with the python:3.11-slim base image, not ahead of it.
+numpy==2.4.6
+couchbase==4.6.3
+mcp==1.30.0
+# 6.x requires transformers 5.x, which clears the transformers 4.x
+# advisories (PYSEC-2026-2288/2289/2290/3929) that 3.x's transformers<5
+# cap left unfixable.
+sentence-transformers==6.1.0
+# 5.x raises on passwords over 72 bytes instead of silently truncating -
+# see MAX_PASSWORD_BYTES in app/user_auth.py.
+bcrypt==5.0.0
+PyJWT==2.15.1
 ldap3==2.9.1
-cryptography==49.0.0
+cryptography==50.0.2
 # Optional at runtime: knowledge-base PDF extraction degrades to a clear
 # error when it is missing, rather than indexing an empty document.
-pypdf==6.16.1
+pypdf==6.19.0

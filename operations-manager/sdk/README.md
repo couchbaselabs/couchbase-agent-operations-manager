@@ -136,6 +136,9 @@ SDK makes that protocol visible on the client side too:
   MCP-compatible agent runtime or tool-calling API.
 - `client.invoke_mcp_tool(name, arguments)` - alias for `invoke()` using
   MCP tool-call terminology.
+- `client.catalog()` - every tool your API key can actually invoke
+  (trusted, allowed for its role, inside the agent's scope), with each
+  tool's full `input_schema`. Reads `GET /v1/agent/tools`.
 - `aom_sdk.mcp_server` - an optional bridge (`pip install
   "couchbase-aom-sdk[mcp]"`) that runs this appliance as a real local MCP
   server over stdio, so any MCP host (Claude Desktop, Claude Code, etc.)

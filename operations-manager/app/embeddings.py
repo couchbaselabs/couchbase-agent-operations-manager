@@ -18,7 +18,10 @@ class ToolEmbeddings:
 
         logger.info("Loading embedding model '%s'...", model_name)
         self.model = SentenceTransformer(model_name)
-        self.dimension = self.model.get_sentence_embedding_dimension()
+        # sentence-transformers 6 renamed get_sentence_embedding_dimension()
+        # to get_embedding_dimension(); fall back for older installs.
+        get_dimension = getattr(self.model, "get_embedding_dimension", None) or self.model.get_sentence_embedding_dimension
+        self.dimension = get_dimension()
         self._cache: dict[str, list[float]] = {}
         self._max_cache_size = 2000
         # embed() is called from worker threads (see embed_async), so the

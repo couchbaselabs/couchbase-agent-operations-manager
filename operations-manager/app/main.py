@@ -2276,6 +2276,39 @@ async def catalog():
     return {"tools": await store.list_tools()}
 
 
+@app.get("/v1/agent/tools")
+async def agent_tools(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """The agent-facing counterpart to /v1/catalog: every tool the caller
+    could actually invoke, with its full `input_schema`, and nothing else.
+
+    /v1/catalog is the dashboard's transparency view and sits behind a
+    dashboard session, so an agent holding only an API key cannot read it.
+    The SDK's `discover_mcp_tools()` and its `aom-mcp-server` bridge both
+    need each tool's input schema (discover does not return it), so they
+    read this instead. The filter is the same one invoke enforces - trusted,
+    the caller's role in `allowed_roles`, and inside the agent's scope - so
+    this never lists a tool invoke would refuse."""
+    role, subject = await authenticate(authorization, request)
+    if not store.connected:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    start = time.time()
+    tools = [
+        t for t in await store.list_tools()
+        if t.get("trust_status") == "trusted" and role in (t.get("allowed_roles") or [])
+    ]
+    tools = agent_identity.filter_to_scope(caller_identity(request), tools)
+    await store.log_access(
+        action="list_tools", role=role, subject_label=subject, query=None,
+        tool_id=None, server_id=None, decision="ALLOW",
+        reason=f"{len(tools)} invokable tool(s) listed for role '{role}'",
+        latency_ms=int((time.time() - start) * 1000),
+    )
+    return {"role": role, "tools": tools}
+
+
 @app.get("/v1/audit-log")
 async def audit_log(limit: int = 50):
     return {"entries": await store.recent_access_log(limit=min(limit, 200))}
@@ -2891,6 +2924,11 @@ class LLMCompleteRequest(BaseModel):
     model: str | None = None
     namespace: str | None = None
     bypass_cache: bool = False
+    # False = exact-match only for this call: no semantic lookup and no
+    # embedding stored. For prompts that embed data (a query result, a
+    # document), where a near-identical prompt can carry different facts.
+    # None/True follow the cache policy.
+    semantic: bool | None = None
     params: dict = Field(default_factory=dict)
 
 
@@ -2980,6 +3018,9 @@ async def llm_complete(
     if req.namespace:
         cfg["namespace"] = req.namespace
         cfg = llm_cache.normalize_config(cfg)
+    if req.semantic is False:
+        # Applied after normalize_config so it only ever narrows the policy.
+        cfg["semantic_enabled"] = False
 
     provider = req.provider or cfg["provider"]
     if provider not in llm_cache.PROVIDERS:
