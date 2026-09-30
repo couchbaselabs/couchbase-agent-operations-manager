@@ -1,0 +1,342 @@
+# Docker's default json-file log driver never rotates, so on a host that
+# runs this stack for months the container logs (a health-check line every
+# 10 seconds, plus one per request) grow until the disk fills. Every
+# service below uses this bounded configuration instead.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  # ---------------------------------------------------------------------
+  # Couchbase Server - the appliance's tool registry, RBAC identity table,
+  # and audit log. Enterprise Edition is required (not a preference): RBAC
+  # pre-filtering combined with vector kNN search inside a single Couchbase
+  # Search (FTS) request depends on vector-typed index fields, which
+  # Couchbase Community Edition rejects outright. Enterprise Edition's
+  # Docker image is free to run for development/testing under Couchbase's
+  # standard license - no key or account needed for this use case.
+  # ---------------------------------------------------------------------
+  couchbase:
+    image: couchbase:enterprise-7.6.2
+    container_name: agent-operations-couchbase
+    restart: unless-stopped
+    logging: *default-logging
+    # Only starts under the "local-couchbase" profile (see COMPOSE_PROFILES
+    # in .env.example) - active by default, so nothing changes unless
+    # you've pointed this appliance at an external Couchbase Enterprise
+    # server instead. See "Using an external Couchbase server" in the
+    # README.
+    profiles: ["local-couchbase"]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # Loopback-only (127.0.0.1, not 0.0.0.0): the Couchbase admin console
+      # and data ports have no business being reachable from anywhere but
+      # this machine - operations-manager reaches Couchbase over the
+      # private docker-compose network (couchbase://couchbase), never via
+      # these published host ports. You can still open
+      # https://localhost:8091 for the Couchbase Web Console from this
+      # machine; another host on the network no longer can (CIS Docker
+      # Benchmark 5.x / PCI DSS 4.0 Req. 1 - restrict network exposure to
+      # only what's needed). Drop the "127.0.0.1:" prefix if you genuinely
+      # need remote admin-console access.
+      - "127.0.0.1:8091-8096:8091-8096"
+      - "127.0.0.1:11210:11210"
+    volumes:
+      - couchbase-data:/opt/couchbase/var
+    healthcheck:
+      # No `-f`: this Couchbase Server version returns 401 on the
+      # unauthenticated /pools endpoint, which curl -f treats as a hard
+      # failure even when the server is perfectly healthy.
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8091/pools"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ---------------------------------------------------------------------
+  # One-time cluster/bucket/collection provisioning for Couchbase. init.sh
+  # is fully idempotent (every mutating step tolerates "already exists"),
+  # so it's safe to let this run on every startup. Rather than exiting
+  # when it's done - which Docker Desktop shows as a stopped container
+  # even though that's expected/healthy - it touches a sentinel file and
+  # then idles, and the healthcheck below reports healthy once that
+  # sentinel exists. operations-manager waits on that healthcheck (not on
+  # this container exiting) before it starts.
+  # ---------------------------------------------------------------------
+  couchbase-init:
+    image: couchbase:enterprise-7.6.2
+    container_name: agent-operations-couchbase-init
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["local-couchbase"]
+    depends_on:
+      couchbase:
+        condition: service_healthy
+    volumes:
+      - ./couchbase-init/init.sh:/init.sh:ro
+    environment:
+      COUCHBASE_USERNAME: ${COUCHBASE_USERNAME:-Administrator}
+      COUCHBASE_PASSWORD: ${COUCHBASE_PASSWORD:-CouchbaseDemo123!}
+      COUCHBASE_BUCKET: ${COUCHBASE_BUCKET:-agent_operations}
+      COUCHBASE_SCOPE: ${COUCHBASE_SCOPE:-agent_operations}
+      # RAM quotas in MB, re-asserted on every start by init.sh (cluster-init
+      # and bucket-create both no-op on an existing cluster/bucket, so this is
+      # the only thing that resizes a deployment that already exists). The
+      # data-service quota is the binding constraint: Couchbase keeps every
+      # document's metadata in RAM even with values ejected to disk, so an
+      # appliance that logs an audit entry per request outgrows a small bucket
+      # by item count long before it does by data size - and a bucket that
+      # full stops accepting writes entirely. Total reserved is
+      # CLUSTER + INDEX + FTS; lower these if Docker's memory is tight.
+      COUCHBASE_CLUSTER_RAMSIZE: ${COUCHBASE_CLUSTER_RAMSIZE:-2048}
+      COUCHBASE_INDEX_RAMSIZE: ${COUCHBASE_INDEX_RAMSIZE:-512}
+      COUCHBASE_FTS_RAMSIZE: ${COUCHBASE_FTS_RAMSIZE:-512}
+      COUCHBASE_BUCKET_RAMSIZE: ${COUCHBASE_BUCKET_RAMSIZE:-1024}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/init-complete"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 90s
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------
+  # Bundled sample MCP tool servers (jira/zendesk/snowflake, plus an
+  # intentionally-unregistered shadow-diagnostics server) so the appliance
+  # is testable immediately. Point the Servers page at your own real MCP
+  # endpoints whenever you're ready - this container is optional and can
+  # be removed once you no longer need the samples.
+  # ---------------------------------------------------------------------
+  sample-mcp-servers:
+    build:
+      context: ./sample-mcp-servers
+    container_name: agent-operations-sample-servers
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      # Loopback-only: operations-manager reaches this over the private
+      # docker-compose network (http://sample-mcp-servers:8100), not via
+      # this published host port - it exists only so you can poke the
+      # bundled sample servers directly from this machine while testing.
+      - "127.0.0.1:8100:8100"
+    environment:
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ---------------------------------------------------------------------
+  # THE APPLIANCE ITSELF: the Couchbase Agent Operations Manager. Authenticates
+  # callers, resolves them to an RBAC role, ingests only explicitly
+  # registered/trusted MCP servers' tool catalogs into Couchbase with
+  # embeddings + allowed_roles + trust_status, answers tool-discovery
+  # requests with a single Couchbase Search request that combines a vector
+  # kNN query with an RBAC term-query pre-filter, re-checks authorization
+  # before proxying any tool call to its real downstream MCP server, and
+  # writes every decision to an append-only audit log in Couchbase.
+  # ---------------------------------------------------------------------
+  operations-manager:
+    build:
+      context: ./operations-manager
+    container_name: agent-operations-manager
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      # required: false on both Couchbase deps - they only exist at all
+      # under the "local-couchbase" profile (see COMPOSE_PROFILES in
+      # .env.example). When that profile is off (pointed at an external
+      # Couchbase Enterprise server instead), Compose skips waiting on
+      # them rather than erroring that they're undefined; when it's on
+      # (the default), required: false changes nothing - the
+      # service_healthy condition below still applies exactly as before.
+      couchbase:
+        condition: service_healthy
+        required: false
+      # couchbase-init provisions the bucket/scope/collections
+      # operations-manager writes to on startup (e.g. the identities
+      # collection it seeds API keys into) and then idles rather than
+      # exiting. Waiting only for it to *start* - the old plain-list form
+      # of depends_on - let operations-manager race it and crash with
+      # ScopeNotFoundException before the scope existed, and waiting for
+      # it to *exit* doesn't work now that it stays running. service_healthy
+      # blocks operations-manager from starting until init.sh has actually
+      # finished (its healthcheck only passes once the sentinel file it
+      # writes at the end of the script exists).
+      couchbase-init:
+        condition: service_healthy
+        required: false
+      sample-mcp-servers:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8090
+      APPLIANCE_NAME: ${APPLIANCE_NAME:-Couchbase Agent Operations Manager}
+      COUCHBASE_CONNECTION_STRING: ${COUCHBASE_CONNECTION_STRING:-couchbase://couchbase}
+      COUCHBASE_USERNAME: ${COUCHBASE_USERNAME:-Administrator}
+      COUCHBASE_PASSWORD: ${COUCHBASE_PASSWORD:-CouchbaseDemo123!}
+      COUCHBASE_BUCKET: ${COUCHBASE_BUCKET:-agent_operations}
+      COUCHBASE_SCOPE: ${COUCHBASE_SCOPE:-agent_operations}
+      COUCHBASE_SEARCH_HOST: ${COUCHBASE_SEARCH_HOST:-couchbase}
+      SAMPLE_MCP_SERVERS_BASE_URL: http://sample-mcp-servers:8100
+      API_KEY_SUPPORT_AGENT: ${API_KEY_SUPPORT_AGENT:-demo-support-agent-9f21}
+      API_KEY_FINANCE_ANALYST: ${API_KEY_FINANCE_ANALYST:-demo-finance-analyst-7e83}
+      API_KEY_ADMIN: ${API_KEY_ADMIN:-demo-admin-4c56}
+      AUDIT_LOG_RETENTION_HOURS: ${AUDIT_LOG_RETENTION_HOURS:-168}
+      # Capacity limits. WORKER_THREADS sizes the pool every blocking
+      # Couchbase call runs in; MAX_CONCURRENT_REQUESTS caps simultaneous
+      # in-flight HTTP requests so overload answers 503 instead of queueing
+      # until nginx times the whole dashboard out. INSIGHTS_LOOKBACK_ENTRIES
+      # is how many audit rows the Dashboard/Insights pages read per refresh -
+      # the single heaviest recurring query in the appliance.
+      WORKER_THREADS: ${WORKER_THREADS:-32}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-64}
+      QUERY_TIMEOUT_SECONDS: ${QUERY_TIMEOUT_SECONDS:-30}
+      DASHBOARD_REQUEST_TIMEOUT_SECONDS: ${DASHBOARD_REQUEST_TIMEOUT_SECONDS:-55}
+      INSIGHTS_LOOKBACK_ENTRIES: ${INSIGHTS_LOOKBACK_ENTRIES:-250}
+      HIJACK_SCAN_INTERVAL_MINUTES: ${HIJACK_SCAN_INTERVAL_MINUTES:-5}
+      TRACING_ENABLED: ${TRACING_ENABLED:-true}
+      TRACE_RETENTION_HOURS: ${TRACE_RETENTION_HOURS:-72}
+      TRACE_SAMPLE_RATE: ${TRACE_SAMPLE_RATE:-1.0}
+      TRACE_LOOKBACK_RUNS: ${TRACE_LOOKBACK_RUNS:-500}
+      EVAL_RUN_ON_CATALOG_CHANGE: ${EVAL_RUN_ON_CATALOG_CHANGE:-true}
+      EVAL_SEED_STARTER_DATASET: ${EVAL_SEED_STARTER_DATASET:-true}
+      EVAL_RUN_HISTORY: ${EVAL_RUN_HISTORY:-50}
+      KNOWLEDGE_CHUNK_CHARS: ${KNOWLEDGE_CHUNK_CHARS:-1200}
+      KNOWLEDGE_CHUNK_OVERLAP: ${KNOWLEDGE_CHUNK_OVERLAP:-200}
+      KNOWLEDGE_MAX_UPLOAD_MB: ${KNOWLEDGE_MAX_UPLOAD_MB:-20}
+      AGENT_KEY_ROTATION_GRACE_SECONDS: ${AGENT_KEY_ROTATION_GRACE_SECONDS:-3600}
+      HIJACK_CHAIN_WINDOW_SECONDS: ${HIJACK_CHAIN_WINDOW_SECONDS:-120}
+      # Local dashboard login (see operations-manager/app/user_auth.py).
+      # start.sh generates a random AUTH_SECRET_KEY into .env on first run.
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-}
+      AUTH_SESSION_TTL_HOURS: ${AUTH_SESSION_TTL_HOURS:-12}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      # Empty by default - see config.py and SECURITY_HARDENING.md. Only
+      # needed for a custom browser-based integration calling this API
+      # cross-origin with the dashboard session cookie attached.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      # Serves HTTPS by default on :8090 using a self-signed cert baked into
+      # the image at build time (operations-manager/Dockerfile) - see
+      # docker-entrypoint.sh. Mount your own cert/key over
+      # operations-manager/tls/server.{crt,key} for a real deployment
+      # (uncomment the volume mount below). DISABLE_TLS=true falls back to
+      # plain HTTP - if you set that, also set OPERATIONS_MANAGER_SCHEME=http
+      # on the `ui` service below so its proxy hop still matches.
+      DISABLE_TLS: ${DISABLE_TLS:-false}
+      # LLM response caching for agents. Every provider key is optional -
+      # without one, a cache miss is answered by a labelled offline stub so
+      # the feature is demoable with no egress.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LLM_CACHE_ENABLED: ${LLM_CACHE_ENABLED:-true}
+      LLM_CACHE_PROVIDER: ${LLM_CACHE_PROVIDER:-anthropic}
+      LLM_CACHE_MODEL: ${LLM_CACHE_MODEL:-claude-sonnet-4-5}
+      LLM_CACHE_TTL_SECONDS: ${LLM_CACHE_TTL_SECONDS:-3600}
+      LLM_CACHE_MAX_ENTRIES: ${LLM_CACHE_MAX_ENTRIES:-5000}
+      LLM_CACHE_SEMANTIC_ENABLED: ${LLM_CACHE_SEMANTIC_ENABLED:-true}
+      LLM_CACHE_SIMILARITY_THRESHOLD: ${LLM_CACHE_SIMILARITY_THRESHOLD:-0.94}
+      LLM_CACHE_LOG_RETENTION_HOURS: ${LLM_CACHE_LOG_RETENTION_HOURS:-168}
+      LOG_LEVEL: INFO
+    volumes:
+      - hf-cache:/home/appuser/.cache/huggingface
+      # HTTPS certificate storage, shared with the `ui` service's
+      # /etc/nginx/tls below - one certificate, installed once, serves
+      # both the API and the dashboard. Starts out populated with the
+      # baked-in self-signed fallback (Docker copies the image's existing
+      # /app/tls into this volume the first time it's used, since the
+      # volume starts empty) and from then on holds whatever Settings ->
+      # HTTPS Certificate has installed - see app/user_auth.py.
+      - tls-shared:/app/tls
+      # Alternative to the Settings page: bind-mount your own cert/key
+      # directly instead (files must be named server.crt/server.key) - do
+      # NOT use this at the same time as the line above, since only one
+      # mount can occupy /app/tls:
+      # - ./operations-manager/tls:/app/tls:ro
+    healthcheck:
+      # Tries HTTPS first (the default), then plain HTTP, so this works
+      # whether or not DISABLE_TLS is set - see the Dockerfile's own
+      # HEALTHCHECK for why -k is safe here (loopback, not an untrusted network).
+      test: ["CMD-SHELL", "curl -kfs https://localhost:8090/api/health || curl -fs http://localhost:8090/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ---------------------------------------------------------------------
+  # Admin dashboard - React + TypeScript + Vite, built and served by nginx.
+  # nginx proxies /v1/* and /api/* through to the operations-manager so the UI
+  # only ever needs to know about its own origin.
+  # ---------------------------------------------------------------------
+  ui:
+    build:
+      context: ./ui
+    container_name: agent-operations-ui
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # nginx's master process runs as root inside the container (its
+    # workers drop to the unprivileged `nginx` user automatically - see
+    # the base image's own nginx.conf). That startup sequence needs more
+    # than just the ability to bind ports 80/443 (CAP_NET_BIND_SERVICE):
+    # the master process also chown()s /var/cache/nginx/* to the `nginx`
+    # user (CAP_CHOWN) and then setuid()/setgid()s into that user before
+    # forking workers (CAP_SETUID, CAP_SETGID). All four are added back
+    # after the blanket cap_drop above; dropping any of them causes nginx
+    # to fail at startup with "chown(...) failed (1: Operation not
+    # permitted)" and crash-loop under restart: unless-stopped.
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+    depends_on:
+      operations-manager:
+        condition: service_healthy
+    ports:
+      # Serves HTTPS on 443 (self-signed by default, baked into the image -
+      # see ui/Dockerfile), published on the standard HTTPS host port so
+      # the dashboard is just https://localhost with no port number. Plain
+      # HTTP still exists inside the container (nginx.conf.template
+      # redirects it to HTTPS); publish it too - e.g. add "80:80" here -
+      # if you want that redirect reachable from the host as well.
+      - "443:443"
+    environment:
+      OPERATIONS_MANAGER_UPSTREAM: operations-manager:8090
+      # Must match operations-manager's own TLS state (see DISABLE_TLS
+      # above) - this is what scheme nginx uses for its own proxy hop to it.
+      OPERATIONS_MANAGER_SCHEME: ${OPERATIONS_MANAGER_SCHEME:-https}
+    volumes:
+      # Same shared volume as operations-manager's /app/tls above - one
+      # certificate installed via Settings -> HTTPS Certificate applies to
+      # both services. Alternative: bind-mount your own cert/key instead
+      # (files must be named server.crt/server.key), but not both at once:
+      #   volumes:
+      #     - ./ui/tls:/etc/nginx/tls:ro
+      - tls-shared:/etc/nginx/tls
+
+volumes:
+  couchbase-data:
+  hf-cache:
+  tls-shared:

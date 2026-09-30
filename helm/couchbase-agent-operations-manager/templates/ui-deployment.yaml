@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aom.fullname" . }}-ui
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "ui") .) | nindent 4 }}
+spec:
+  replicas: {{ .Values.ui.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aom.componentSelectorLabels" (merge (dict "component" "ui") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aom.componentSelectorLabels" (merge (dict "component" "ui") .) | nindent 8 }}
+    spec:
+      # nginx's master process runs as root inside the container (its
+      # workers drop to the unprivileged `nginx` user automatically) so
+      # it can bind ports 80/443 - no pod-level runAsNonRoot here. See
+      # the matching comment/capabilities in docker-compose.yml for why
+      # this container needs exactly these four capabilities and no more.
+      containers:
+        - name: ui
+          image: {{ include "aom.image" (dict "root" $ "repository" .Values.ui.image.repository "tag" .Values.ui.image.tag) }}
+          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"]
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+          env:
+            - name: OPERATIONS_MANAGER_UPSTREAM
+              value: "{{ include "aom.operationsManagerServiceName" . }}:8090"
+            - name: OPERATIONS_MANAGER_SCHEME
+              value: {{ .Values.operationsManager.tls.disabled | ternary "http" "https" }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/nginx/tls
+              readOnly: true
+          # wget, not curl - it's already part of Alpine's base busybox
+          # install on this image, same reasoning as the Dockerfile's own
+          # HEALTHCHECK.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 15
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "aom.tlsSecretName" . }}
+            defaultMode: 0644
+            items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key

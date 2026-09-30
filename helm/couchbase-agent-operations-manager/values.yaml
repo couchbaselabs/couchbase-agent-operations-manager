@@ -1,0 +1,339 @@
+# Default values for couchbase-agent-operations-manager.
+# The three custom images (operations-manager, sample-mcp-servers, ui) are
+# built from this repository - no prebuilt images are published. Build them
+# and push them to a registry your cluster can pull from, then set
+# global.imageRegistry (or each *.image.repository) to match. See README.md's
+# "Before you install" section.
+
+global:
+  # Prefixed to every image.repository below if set, e.g. "ghcr.io/yourorg".
+  # Leave empty to use each image.repository as-is (assumes it already
+  # includes any registry host it needs).
+  imageRegistry: ""
+
+# ---------------------------------------------------------------------
+# Couchbase Server - same image and role as docker-compose.yml: the tool
+# registry, RBAC identity table, and audit log. Enterprise Edition is
+# required (not a preference) - RBAC pre-filtering combined with vector
+# kNN search in a single Couchbase Search (FTS) request depends on
+# vector-typed index fields, which Community Edition rejects outright.
+# ---------------------------------------------------------------------
+couchbase:
+  # Set to false to skip the bundled Couchbase StatefulSet and the
+  # couchbase-init provisioning Job entirely, and point operations-manager
+  # at a Couchbase Enterprise server you already run and manage yourself
+  # instead (see operationsManager.couchbase.connectionString/searchHost
+  # below, and "Using an external Couchbase Enterprise server" in this
+  # chart's README). init.sh reasserts cluster-wide data/index/fts RAM
+  # quotas on every run, which is fine for a Couchbase node this chart
+  # owns outright and not something to run against a cluster other
+  # workloads share - that's the whole reason this is a separate toggle
+  # from operationsManager.couchbase.* rather than something inferred
+  # from whether those are set.
+  enabled: true
+  image:
+    repository: couchbase
+    tag: enterprise-7.6.2
+    pullPolicy: IfNotPresent
+  # Couchbase's own service RAM allocations (see couchbaseInit below:
+  # cluster-ramsize 512 + index-ramsize 256 + fts-ramsize 256 = ~1GB)
+  # are on top of Couchbase Server EE's own baseline Erlang-VM/OS
+  # footprint just to start - that baseline alone is bigger than it
+  # looks. Validated by actually installing this chart (2026-09-15):
+  # a 3Gi limit OOMKilled the container ~2s after start, before it got
+  # anywhere near bucket/service provisioning; 6Gi ran stably through a
+  # full cluster-init + bucket/scope/collection/index provisioning
+  # cycle. 3Gi-6Gi wasn't bisected, so 6Gi may have headroom to spare,
+  # but it's the number that's actually been proven to work - lower it
+  # only after re-testing against a real `helm install`, not `helm
+  # template`/lint (neither exercises the container at all, so neither
+  # would have caught this).
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 6Gi
+  # Couchbase service RAM quotas in MB, applied (and re-applied on every
+  # helm upgrade) by the couchbase-init Job. data + index + fts must fit
+  # inside resources.limits.memory above with headroom for the query
+  # service and OS (~1.5Gi); bucket must be <= data. The chart used to
+  # hard-code data=512/index=256/fts=256/bucket=256, which under sustained
+  # demo traffic pushes nearly every read to disk and index scans out of
+  # memory - the main infrastructure cause of slow dashboard pages.
+  ramQuotaMB:
+    data: 2048
+    index: 512
+    fts: 512
+    bucket: 1024
+  persistence:
+    # StatefulSet volumeClaimTemplate - ReadWriteOnce is fine, only ever
+    # one Couchbase pod in this chart.
+    size: 20Gi
+    storageClassName: ""
+
+# One-time cluster/bucket/collection/index provisioning, run as a Helm
+# post-install/post-upgrade hook Job (see templates/couchbase-init-job.yaml)
+# rather than docker-compose.yml's always-running idling container - a Job
+# that runs to completion is the normal, expected-green Kubernetes pattern,
+# so there's no equivalent need for the "idle so it looks healthy" trick
+# docker-compose.yml uses to keep Docker Desktop's UI from showing it as
+# stopped. init.sh is fully idempotent, so re-running it on every upgrade
+# is safe.
+couchbaseInit:
+  backoffLimit: 3
+
+# ---------------------------------------------------------------------
+# Bundled sample MCP tool servers (jira/zendesk/snowflake, plus an
+# intentionally-unregistered shadow-diagnostics server) so the appliance
+# is testable immediately. Optional - disable once you're pointing the
+# Servers page at your own real MCP endpoints.
+# ---------------------------------------------------------------------
+sampleMcpServers:
+  enabled: true
+  replicaCount: 1
+  image:
+    # Built from ./sample-mcp-servers - see README.md "Before you install".
+    repository: couchbase-aom-sample-mcp-servers
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# ---------------------------------------------------------------------
+# THE APPLIANCE ITSELF. See operations-manager/config.py /
+# operations-manager/app/*.py for what each setting below actually does -
+# these mirror docker-compose.yml's environment block and .env.example
+# 1:1 so behavior matches the bundled Docker Compose stack.
+# ---------------------------------------------------------------------
+operationsManager:
+  replicaCount: 1
+  # NOT yet safe to scale above 1: login-lockout tracking (see
+  # app/user_auth.py) is in-process memory, not stored in Couchbase, so
+  # multiple replicas would each track lockouts independently instead of
+  # sharing state. Documented as a known gap in SECURITY_HARDENING.md;
+  # true horizontal scaling needs that moved into Couchbase first.
+  image:
+    # Built from ./operations-manager - see README.md "Before you install".
+    repository: couchbase-aom-operations-manager
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  applianceName: "Couchbase Agent Operations Manager"
+
+  couchbase:
+    # Only used when the top-level couchbase.enabled (above) is false -
+    # i.e. you're pointing at a Couchbase Enterprise server you already
+    # run and manage yourself instead of the bundled StatefulSet. Empty
+    # (the default) means "use the bundled couchbase Service" and is
+    # computed for you (see aom.couchbaseConnectionString/
+    # aom.couchbaseSearchHost in _helpers.tpl) - leave both empty while
+    # couchbase.enabled is true.
+    #
+    # connectionString needs the full scheme your server requires -
+    # couchbases:// (TLS) rather than couchbase:// is typical for a real
+    # external Enterprise cluster, e.g.
+    # "couchbases://cb.example.internal". searchHost is the bare
+    # hostname, used both for the admin/query REST calls
+    # operations-manager's startup initContainer polls and for its own
+    # Search (FTS) requests.
+    connectionString: ""
+    searchHost: ""
+    username: Administrator
+    # Leave blank with the bundled Couchbase (couchbase.enabled=true) to
+    # have the chart generate a random admin password on first install and
+    # keep it across upgrades. When couchbase.enabled is false, set these
+    # to the credentials for your external server. Stored in a Kubernetes
+    # Secret (templates/secret-app.yaml), never rendered into a ConfigMap
+    # or Pod spec in plain text.
+    password: ""
+    # When couchbase.enabled is false, create this bucket and, inside it,
+    # this scope on your external server yourself first - they're the
+    # only things operations-manager doesn't create on its own (every
+    # collection, primary index, and Search/vector index it needs is
+    # created automatically at startup - see
+    # operations-manager/app/couchbase_client.py).
+    bucket: agent_operations
+    scope: agent_operations
+
+  # The three seeded agent API keys (one per demo role). Leave blank to have
+  # the chart generate random keys on first install and keep them across
+  # upgrades; read them back with:
+  #   kubectl get secret <release>-...-auth -o jsonpath='{.data.API_KEY_ADMIN}' | base64 -d
+  # (see NOTES.txt for the exact command). Set them explicitly only if your
+  # agents need known values.
+  apiKeys:
+    supportAgent: ""
+    financeAnalyst: ""
+    admin: ""
+
+  auth:
+    # Signs dashboard session cookies and encrypts the LDAP bind password
+    # at rest (app/user_auth.py). Leave blank to have the chart generate
+    # and persist a random 64-char value on first install (see
+    # templates/secret-app.yaml) - it's kept stable across `helm upgrade`
+    # runs by reading it back from the existing Secret, since rotating it
+    # logs everyone out and invalidates any stored LDAP bind password.
+    secretKey: ""
+    sessionTtlHours: 12
+    defaultAdminUsername: admin
+
+  # Comma-separated exact origins allowed to make credentialed
+  # cross-origin requests to the API. Empty is correct as long as the
+  # dashboard only ever reaches this API through the bundled `ui` nginx
+  # (same-origin) - see SECURITY_HARDENING.md.
+  cors:
+    allowedOrigins: ""
+
+  llmCache:
+    enabled: true
+    provider: anthropic
+    model: claude-sonnet-4-5
+    ttlSeconds: 3600
+    maxEntries: 5000
+    semanticEnabled: true
+    similarityThreshold: 0.94
+    logRetentionHours: 720
+
+  # All three optional - a provider with no key still answers on a cache
+  # miss with a clearly-labelled offline stub, so the feature is demoable
+  # with no outbound network access. Stored in the same Secret as above.
+  providerApiKeys:
+    anthropic: ""
+    openai: ""
+    gemini: ""
+
+  audit:
+    logRetentionHours: 720
+
+  hijackDetection:
+    scanIntervalMinutes: 5
+    chainWindowSeconds: 120
+
+  tls:
+    # Mirrors docker-compose.yml's DISABLE_TLS - serves HTTPS on :8090 by
+    # default. Leave false unless something in front of this Service
+    # (e.g. a service mesh sidecar) already terminates TLS for it.
+    disabled: false
+
+  # sentence-transformers' embedding model cache (huggingface_hub) - same
+  # role as docker-compose.yml's hf-cache named volume. Without
+  # persistence this re-downloads the model on every pod restart.
+  hfCache:
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClassName: ""
+
+  resources:
+    # torch (CPU build) + sentence-transformers need real headroom for
+    # the embedding model; tune down only if you've confirmed it fits.
+    requests:
+      cpu: 500m
+      memory: 1536Mi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+
+  # Extra environment variables merged in verbatim, e.g. for the less
+  # commonly changed settings in config.py that aren't surfaced above
+  # (EMBEDDING_MODEL, COUCHBASE_TOOLS_INDEX, INSIGHTS_LOOKBACK_ENTRIES...).
+  # Each entry is a full Kubernetes EnvVar: {name, value} or {name, valueFrom}.
+  extraEnv: []
+
+# ---------------------------------------------------------------------
+# Admin dashboard - React + TypeScript + Vite, built and served by nginx.
+# nginx proxies /v1/* and /api/* through to operations-manager.
+# ---------------------------------------------------------------------
+ui:
+  replicaCount: 1
+  image:
+    # Built from ./ui - see README.md "Before you install".
+    repository: couchbase-aom-ui
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    # LoadBalancer is the closest match to docker-compose.yml publishing
+    # 443 straight to the host. Switch to ClusterIP if you're fronting
+    # this with your own Ingress/LoadBalancer instead (see ingress below).
+    type: LoadBalancer
+    port: 443
+    # Also expose the plain-http:80 listener (nginx's redirect-to-https)
+    # as its own Service port. Set to false if port 80 on your node(s)
+    # is already spoken for (e.g. an existing ingress controller) - the
+    # UI is fully reachable over https on `port` above either way.
+    exposeHttp: true
+    # httpPort: 80
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+# ---------------------------------------------------------------------
+# The certificate served by both operations-manager (:8090) and ui
+# (:443) - one cert, same as docker-compose.yml's shared tls-shared
+# volume, but provided differently: Kubernetes has no built-in
+# equivalent of "one named volume mounted read-write by two different
+# Pods" unless your cluster's default StorageClass supports
+# ReadWriteMany (NFS/EFS/Azure Files/Longhorn/...) - most single-node/dev
+# clusters (kind, minikube, Docker Desktop's own Kubernetes) do NOT
+# support this out of the box, so this chart does not use that approach.
+# Instead:
+#
+#   mode: generated (default) - the chart generates a self-signed
+#     cert/key pair on first install and stores it in a Kubernetes
+#     Secret (templates/secret-tls.yaml), mounted read-only into both
+#     Pods. Stable across `helm upgrade` (reads the existing Secret back
+#     instead of regenerating). Works on every cluster, no storage
+#     requirements. Trade-off: the in-app Settings -> HTTPS Certificate
+#     upload feature (app/user_auth.py's install_server_certificate())
+#     writes to its mount at runtime, and a Secret-backed mount is
+#     read-only, so that upload flow will fail with a permission/
+#     read-only-filesystem error in this mode. Update the Secret (or
+#     switch to existingSecret below) and roll the Deployments instead.
+#
+#   mode: existingSecret - bring your own `kubernetes.io/tls` Secret
+#     (e.g. from cert-manager) via tls.existingSecret. Same read-only
+#     trade-off as generated mode.
+#
+# If you specifically need the in-app upload page to work exactly like
+# docker-compose.yml's, see the "TLS: shared ReadWriteMany volume" note
+# in README.md for how to adapt this chart if your storage class
+# supports RWX.
+tls:
+  mode: generated
+  generated:
+    dnsNames:
+      - localhost
+      - agent-operations-manager
+      - agent-operations-ui
+    days: 825
+  existingSecret: ""
+
+# Disabled by default - ui.service.type: LoadBalancer already gets you a
+# working external endpoint on most clusters. Enable this instead if
+# your cluster doesn't support LoadBalancer Services and you're fronting
+# this with an Ingress controller. Because ui serves HTTPS itself (with
+# whatever certificate `tls` above provides) rather than plain HTTP, this
+# needs an SSL-passthrough-capable Ingress controller (e.g. ingress-nginx
+# with nginx.ingress.kubernetes.io/ssl-passthrough: "true") pointed at
+# port 443 - a standard HTTP-backend Ingress won't work here, since ui's
+# plain-:80 listener only ever redirects to :443.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: agent-operations.local
+      paths:
+        - path: /
+          pathType: Prefix

@@ -1,0 +1,36 @@
+# Example override values for a single-node K3s (or Rancher-managed K3s)
+# cluster, exposing the dashboard on port 3111 of the node's IP.
+# Usage: see deploy/deploy.sh, or directly:
+#   helm upgrade --install aom ./helm/couchbase-agent-operations-manager \
+#     -f ./helm/couchbase-agent-operations-manager/values-k3s.yaml \
+#     --namespace agent-ops --create-namespace
+
+# Short, fixed release identity so other apps in the cluster can address
+# this appliance at a predictable in-cluster DNS name:
+# aom-operations-manager.agent-ops.svc.cluster.local
+fullnameOverride: aom
+
+ui:
+  service:
+    # LoadBalancer + this port: K3s's built-in Klipper ServiceLB binds
+    # 3111 directly on every node's IP.
+    type: LoadBalancer
+    port: 3111
+    # K3s's own Traefik ingress controller already owns hostPorts 80/443
+    # on the node (it's the cluster's default ingress). Klipper's
+    # per-Service load-balancer pod needs every port a LoadBalancer
+    # Service lists to be free on the node, so leaving the chart's
+    # default plain-http:80 port enabled here left the aom-ui Service
+    # stuck at EXTERNAL-IP <pending> (its svclb pod couldn't schedule -
+    # "0/1 nodes are available: node(s) didn't have free ports").
+    # The UI is fully reachable over https on 3111 without it.
+    exposeHttp: false
+
+# CHANGE THESE before using this for anything beyond local evaluation -
+# see values.yaml's own comments and the main repo's SECURITY_HARDENING.md.
+# Override them on the command line rather than committing real secrets to
+# this file:
+#   --set operationsManager.couchbase.password=... \
+#   --set operationsManager.apiKeys.supportAgent=... \
+#   --set operationsManager.apiKeys.financeAnalyst=... \
+#   --set operationsManager.apiKeys.admin=...

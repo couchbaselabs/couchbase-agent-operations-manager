@@ -1,0 +1,16 @@
+{{- if .Values.operationsManager.hfCache.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "aom.fullname" . }}-hf-cache
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.operationsManager.hfCache.persistence.storageClassName }}
+  storageClassName: {{ .Values.operationsManager.hfCache.persistence.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.operationsManager.hfCache.persistence.size }}
+{{- end }}
