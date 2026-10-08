@@ -73,6 +73,9 @@ helm install agent-ops ./helm/couchbase-agent-operations-manager \
   --set operationsManager.couchbase.searchHost=cb.example.internal \
   --set operationsManager.couchbase.username=<your-username> \
   --set operationsManager.couchbase.password=<your-password> \
+  --set operationsManager.llm.anthropicApiKey=<sk-ant-...> \
+  --set operationsManager.llm.openaiApiKey=<sk-...> \
+  --set operationsManager.llm.geminiApiKey=<AIza...> \
   --namespace agent-ops --create-namespace
 ```
 
