@@ -50,8 +50,9 @@ helm install agent-ops ./helm/couchbase-agent-operations-manager \
 "Before you install" above.)
 
 Or point `-f` at a values file with your registry, credentials, and API
-keys filled in - see the comments in `values.yaml`. `helm install` prints connection instructions (`NOTES.txt`)
-once it completes.
+keys filled in - see the comments in `values.yaml` and
+[LLM provider API keys](#llm-provider-api-keys) below. `helm install`
+prints connection instructions (`NOTES.txt`) once it completes.
 
 `helm uninstall agent-ops -n agent-ops` tears it down; add `--set
 couchbase.persistence.size=...` etc. up front if you want more than the
@@ -66,16 +67,36 @@ does in Docker Compose, as a post-install/post-upgrade hook. To point
 operations-manager at a Couchbase Enterprise server you already run and
 manage yourself instead:
 
+**First, prepare the cluster.** Create the bucket and scope, a dedicated
+RBAC user with the roles operations-manager needs, and open the ports it
+uses, as described in the main README's
+[Preparing an external cluster](../../README.md#preparing-an-external-cluster).
+All of that applies here unchanged.
+
+Then keep the credentials and API keys in a values file that stays out of
+git, rather than passing them with `--set` (see
+[Keeping secrets off the command line](#keeping-secrets-off-the-command-line)):
+
+```yaml
+# secrets.values.yaml - add this file to .gitignore
+operationsManager:
+  couchbase:
+    username: <your-username>
+    password: <your-password>
+  providerApiKeys:
+    anthropic: <sk-ant-...>   # optional - see LLM provider API keys
+    openai: <sk-...>          # optional
+    gemini: <AIza...>         # optional
+```
+
 ```bash
 helm install agent-ops ./helm/couchbase-agent-operations-manager \
+  -f secrets.values.yaml \
   --set couchbase.enabled=false \
   --set operationsManager.couchbase.connectionString=couchbases://cb.example.internal \
   --set operationsManager.couchbase.searchHost=cb.example.internal \
-  --set operationsManager.couchbase.username=<your-username> \
-  --set operationsManager.couchbase.password=<your-password> \
-  --set operationsManager.llm.anthropicApiKey=<sk-ant-...> \
-  --set operationsManager.llm.openaiApiKey=<sk-...> \
-  --set operationsManager.llm.geminiApiKey=<AIza...> \
+  --set operationsManager.couchbase.bucket=<your-bucket> \
+  --set operationsManager.couchbase.scope=<your-scope> \
   --namespace agent-ops --create-namespace
 ```
 
@@ -86,24 +107,96 @@ helm install agent-ops ./helm/couchbase-agent-operations-manager \
   outright and not something you want run against a cluster other
   workloads share, so external mode doesn't run it at all rather than
   trying to make it "safe" for someone else's cluster.
+- Nothing is lost by skipping that Job: operations-manager's startup
+  creates every collection, primary index, secondary GSI index and
+  Search/vector index itself (see
+  `operations-manager/app/couchbase_client.py`). It does so best-effort,
+  so if the RBAC user is missing a role you'll see `Could not create
+  collection` / `Could not ensure index` warnings in the Pod log rather
+  than a crash - check `kubectl logs` on first install.
+- `operationsManager.couchbase.username` defaults to `Administrator`, so
+  set it to your dedicated user. The chart refuses to render (`helm
+  install` fails up front) if `couchbase.enabled=false` and no password is
+  set.
 - `connectionString` needs whatever scheme your server actually requires
   - `couchbases://` (TLS) is typical for a real external Enterprise
     cluster, unlike the bundled StatefulSet's plain `couchbase://`.
-- Create the bucket named in `operationsManager.couchbase.bucket` and,
-  inside it, the scope named in `operationsManager.couchbase.scope` on
-  that server yourself first - these two are the only things
-  operations-manager doesn't create on its own. Every collection, its
-  primary index, and the Search/vector indexes are created automatically
-  at startup (see `operations-manager/app/couchbase_client.py`) - the
-  same self-healing path that lets an appliance upgrade add a new
-  collection without rerunning the provisioning Job.
 - operations-manager's startup `initContainer` still waits for that
   bucket/scope to actually exist before the main container starts,
   whether Couchbase is the bundled StatefulSet or your external server -
-  only *what* it waits on changes.
+  only *what* it waits on changes. It polls over plain HTTP on port 8091,
+  so that port must be reachable from the cluster even if your
+  connection string uses `couchbases://`. If the Pod sits in `Init`
+  against an external cluster, check 8091 reachability, the bucket/scope
+  names and the RBAC user, in that order.
 
 Switch back to the bundled StatefulSet at any time with
 `--set couchbase.enabled=true` (and unset the `operationsManager.couchbase.connectionString`/`searchHost` overrides) on a `helm upgrade`.
+
+## LLM provider API keys
+
+operations-manager's LLM caching gateway can forward cache misses to
+Claude (Anthropic), ChatGPT (OpenAI) and Gemini (Google). Set the keys
+under `operationsManager.providerApiKeys` in a values file (see the
+example above). They're stored in the chart's `<release>-...-app-secrets`
+Secret (`templates/secret-app.yaml`) and wired into the
+operations-manager Pod as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and
+`GEMINI_API_KEY`, the same variables Docker Compose reads from `.env`.
+
+- **All three are optional.** Set only the providers you'll use. A
+  provider without a key answers cache misses from a labelled
+  deterministic stub, so caching, the savings dashboard and invalidation
+  all work with no outbound access - you can install first and add keys
+  later. Databricks Model Serving works the same way:
+  `providerApiKeys.databricks` plus `databricks.host` (and optionally
+  `databricks.servingEndpoints`) - the token is ignored without the host.
+- **Pass them on every upgrade.** Unlike the generated Couchbase password
+  and agent API keys, provider keys aren't read back from the existing
+  Secret: a `helm upgrade` without `-f secrets.values.yaml` (or
+  `--reuse-values`) silently resets them to empty, and the providers drop
+  back to the stub.
+- **A configured key that's wrong fails loudly.** The gateway returns an
+  error instead of caching made-up text, so a typo shows up on the first
+  cache miss.
+- **Adding or rotating a key later.** Update the value and `helm upgrade`,
+  then restart the API so it picks up the new environment - keys are read
+  at startup:
+
+  ```bash
+  helm upgrade agent-ops ./helm/couchbase-agent-operations-manager \
+    -n agent-ops --reuse-values -f secrets.values.yaml
+  kubectl rollout restart deployment -n agent-ops \
+    -l app.kubernetes.io/instance=agent-ops,app.kubernetes.io/component=operations-manager
+  ```
+
+- **Checking it worked.** **LLM Caching -> Providers & Policy** in the
+  dashboard shows which providers have a key configured (never the key
+  itself; `GET /v1/llm/providers` returns the same `api_key_configured`
+  flag). Send a test completion from the
+  Providers & Policy page and confirm the answer doesn't start with
+  `[offline stub - no ..._API_KEY configured]`.
+- **Air-gapped clusters.** Leave the keys out. Real provider calls need
+  outbound HTTPS from the operations-manager Pod to `api.anthropic.com`,
+  `api.openai.com` and `generativelanguage.googleapis.com` - check your
+  NetworkPolicies and egress proxy if a configured key times out.
+
+## Keeping secrets off the command line
+
+Anything passed with `--set` ends up in your shell history and in the
+process list while Helm runs. Anything set through Helm values at all -
+`--set` or `-f` - is also stored in the release, so anyone who can run
+`helm get values agent-ops -n agent-ops` can read the Couchbase password
+and the provider API keys. So:
+
+- **Use a values file kept out of git** (`-f secrets.values.yaml`, as
+  above) rather than `--set`, and limit who can read Secrets and run
+  `helm get values` in the namespace with Kubernetes RBAC.
+- **`--set` is fine on a laptop**, not for anything shared.
+- **Bring-your-own Secret isn't supported yet.** The chart always renders
+  and owns `<release>-...-app-secrets`, so a Secret created by External
+  Secrets, Sealed Secrets or Vault would be overwritten on the next
+  upgrade. Until the chart gains an `existingSecret` option, keys have to
+  go through Helm values.
 
 ## What's identical to docker-compose.yml
 
@@ -206,4 +299,5 @@ exists for future use, not to be raised today.
 See the comments directly in `values.yaml` - every setting is documented
 there. Credentials left blank (`operationsManager.couchbase.password`,
 the three `operationsManager.apiKeys.*`) are generated on first install;
-set anything under `operationsManager.providerApiKeys` you intend to use.
+set anything under `operationsManager.providerApiKeys` you intend to use
+(see [LLM provider API keys](#llm-provider-api-keys)).

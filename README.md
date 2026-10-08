@@ -149,7 +149,8 @@ every request.
 
 ```bash
 cp .env.example .env
-# edit .env and add Claude, ChatGPT and or Gemini LLM API keys
+# optional: add ANTHROPIC_API_KEY, OPENAI_API_KEY and/or GEMINI_API_KEY to .env
+# (without them, LLM caching answers misses from a labelled stub - see below)
 docker compose up --build
 ```
 
@@ -208,6 +209,18 @@ cluster, `deploy/deploy.sh` builds the images on the node, imports them into
 K3s, and installs the chart with
 `helm/couchbase-agent-operations-manager/values-k3s.yaml`.
 
+### Deploying with Helm: external Couchbase and LLM API keys
+
+The chart README covers both in full: see
+[Using an external Couchbase Enterprise server](./helm/couchbase-agent-operations-manager/README.md#using-an-external-couchbase-enterprise-server)
+and
+[LLM provider API keys](./helm/couchbase-agent-operations-manager/README.md#llm-provider-api-keys).
+In short: prepare the bucket, scope and RBAC user exactly as in the next
+section, keep the Couchbase password and the Anthropic, OpenAI
+and Gemini keys in a values file that stays out of git (not on the
+command line with `--set`), and restart the operations-manager
+Deployment after adding or rotating a key.
+
 ### Using an external Couchbase Enterprise server
 
 By default `docker compose up` runs and fully manages its own bundled
@@ -224,24 +237,93 @@ Enterprise server you already run and manage yourself instead:
    this appliance owns outright and not something you want run against a
    cluster other workloads share.
 2. Set `COUCHBASE_CONNECTION_STRING` and `COUCHBASE_SEARCH_HOST` to your
-   server, e.g. `couchbase://cb.example.internal` and
-   `cb.example.internal`.
-3. Set `COUCHBASE_USERNAME`/`COUCHBASE_PASSWORD` to credentials with
-   enough privilege on the bucket below to create collections and
-   indexes.
-4. On that server, create the bucket named in `COUCHBASE_BUCKET` and,
-   inside it, the scope named in `COUCHBASE_SCOPE` yourself first - these
-   two are the only things operations-manager doesn't create on its own.
-   Everything below them (every collection, its primary index, and the
-   Search/vector indexes) is created automatically on startup, the same
-   self-healing path that lets an appliance upgrade add a new collection
-   without rerunning `couchbase-init` (see
-   `operations-manager/app/couchbase_client.py`).
+   server, e.g. `couchbases://cb.example.internal` (TLS, typical for a
+   real Enterprise cluster) and `cb.example.internal`.
+3. Prepare the cluster as described in
+   [Preparing an external cluster](#preparing-an-external-cluster) below:
+   the bucket and scope, a dedicated RBAC user, and network access.
+4. Set `COUCHBASE_BUCKET`, `COUCHBASE_SCOPE`, `COUCHBASE_USERNAME` and
+   `COUCHBASE_PASSWORD` to match what you created.
 
 Then `docker compose up --build` as usual - `sample-mcp-servers` and
 `operations-manager` still come up the same way, just against your server
 instead of the bundled one. Switch back to the bundled container at any
 time by restoring `COMPOSE_PROFILES=local-couchbase`.
+
+#### Preparing an external cluster
+
+These steps apply to both Docker Compose and the Helm chart
+(`couchbase.enabled=false`). In both, the bundled provisioning step
+(`couchbase-init`) is skipped entirely in external mode, and
+operations-manager's own startup creates everything inside the scope
+instead.
+
+**Cluster requirements.** Couchbase Server Enterprise Edition with the
+Data, Index, Query and Search services running. Community Edition rejects
+the vector-typed index field this appliance depends on.
+
+**Bucket and scope (you create these).** Create a Couchbase-type bucket
+and, inside it, a scope - these two are the only things operations-manager
+won't create on its own. Both default to `agent_operations`; set
+`COUCHBASE_BUCKET`/`COUCHBASE_SCOPE` if you use other names. Give the
+bucket at least 1 GB of RAM quota (the bundled cluster's default); much
+less pushes most reads to disk under real agent traffic.
+
+Everything below the scope is created automatically at startup (see
+`operations-manager/app/couchbase_client.py`): every collection, a primary
+index on each, the secondary GSI indexes the dashboard pages depend on
+(`SECONDARY_INDEXES`), and the Search/vector indexes. All of it is
+`IF NOT EXISTS`, so this is the same self-healing path that lets an
+appliance upgrade add a new collection or index without rerunning
+`couchbase-init`. Creation is best-effort: if a step fails (usually a
+missing role), operations-manager logs a `Could not create collection` or
+`Could not ensure index` warning and carries on, so check the logs on
+first boot. On a large existing collection an index build can outlast the
+query timeout; the server finishes it in the background.
+
+**A dedicated RBAC user.** Because operations-manager creates collections
+and indexes itself, a plain read/write user isn't enough - it will
+connect, log warnings when startup can't create collections and indexes,
+and then fail on every page that needs one of them. It does *not* need `bucket_admin` or `cluster_admin`, and
+nothing it needs reaches outside its own bucket:
+
+| What operations-manager does | Role | Granted on |
+|---|---|---|
+| Reads/writes documents, TTLs, counters | `data_reader`, `data_writer` | `<bucket>:<scope>` |
+| Dashboard queries and aggregates | `query_select` | `<bucket>:<scope>` |
+| Purges, eviction and status updates via N1QL | `query_update`, `query_delete` | `<bucket>:<scope>` |
+| Creates collections at startup | `scope_admin` ("Manage Scopes") | `<bucket>:<scope>` |
+| Creates primary and secondary indexes | `query_manage_index` | `<bucket>:<scope>` |
+| Creates the Search/vector indexes (REST, port 8094) | `fts_admin` | `<bucket>` (bucket-level only) |
+| Runs vector and Search queries | `fts_searcher` | `<bucket>:<scope>` |
+
+```bash
+couchbase-cli user-manage -c cb.example.internal -u Administrator -p '<admin-password>' \
+  --set --auth-domain local \
+  --rbac-username aom --rbac-password '<password>' \
+  --roles 'data_reader[<bucket>:<scope>],data_writer[<bucket>:<scope>],query_select[<bucket>:<scope>],query_update[<bucket>:<scope>],query_delete[<bucket>:<scope>],query_manage_index[<bucket>:<scope>],scope_admin[<bucket>:<scope>],fts_searcher[<bucket>:<scope>],fts_admin[<bucket>]'
+```
+
+`scope_admin`, `query_manage_index` and `fts_admin` are what let an
+upgrade add a new collection or index without anyone stepping in. You can
+remove them after first boot if your security review requires it, but
+every later upgrade that adds a collection or index will then need those
+created by hand before the new version starts (the full list is
+`ALL_COLLECTIONS` and `SECONDARY_INDEXES` in `couchbase_client.py`).
+
+**Network access.** The SDK connection follows your connection string
+(`couchbases://` for TLS), but two other calls currently use plain HTTP,
+so these ports must be reachable from operations-manager even on a
+TLS-only cluster:
+
+- **8094** (Search REST API) - creating and checking the Search/vector
+  indexes. The port is `COUCHBASE_SEARCH_PORT` in operations-manager's
+  config; on Helm you can override it through
+  `operationsManager.extraEnv`, but `docker-compose.yml` doesn't pass it
+  through yet, so under Compose it has to be 8094.
+- **8091** (cluster REST API) - Helm only: the operations-manager Pod's
+  `wait-for-dependencies` initContainer polls it until the bucket and
+  scope exist. If only 18091 is open, the Pod stays in `Init` forever.
 
 ## HTTPS / TLS
 
@@ -468,7 +550,11 @@ and list-price estimates (`operations-manager/app/llm_cache.py`). Set
 proxy calls for real. For Databricks, set `DATABRICKS_HOST` (the
 workspace URL) and `DATABRICKS_TOKEN`; each "model" is a serving endpoint
 name, and `DATABRICKS_SERVING_ENDPOINTS` (comma-separated) adds your own
-custom or provisioned-throughput endpoints to the list.
+custom or provisioned-throughput endpoints to the list. On Kubernetes, see
+[LLM provider API keys](./helm/couchbase-agent-operations-manager/README.md#llm-provider-api-keys)
+in the chart README. Keys are read at startup, so restart
+operations-manager after adding or changing one
+(`docker compose restart operations-manager`).
 
 **No key is required to try it.** A provider with no key configured
 answers a cache miss from a clearly-labelled deterministic stub, so
