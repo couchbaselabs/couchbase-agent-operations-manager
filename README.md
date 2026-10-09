@@ -145,6 +145,82 @@ override to `TOOL_POLICY`. Couchbase's `tools` collection - not the Python
 file - is the actual runtime source of truth the operations manager queries on
 every request.
 
+## Installation requirements
+
+Two ways to deploy, both running the same five pieces: Couchbase Server
+Enterprise, a one-time provisioning step, the operations manager (API +
+embedding model), the dashboard, and the optional sample MCP servers.
+
+| | Docker Compose | Kubernetes (Helm) |
+|---|---|---|
+| Best for | A laptop, a demo, or a single VM | A shared or production-like environment |
+| You need | Docker Engine with the Compose v2 plugin, or Docker Desktop | Kubernetes with a default StorageClass (ReadWriteOnce volumes), Helm 3, and a registry the cluster can pull from (or a single-node K3s host, via `deploy/deploy.sh`) |
+| CPU architecture | x86_64 or arm64 | x86_64 or arm64 |
+| How | [Run it](#run-it) below | [Helm chart README](./helm/couchbase-agent-operations-manager) |
+
+### Docker Compose: CPU, RAM and disk
+
+| | Minimum | Recommended |
+|---|---|---|
+| CPU | 4 cores | 8 cores |
+| RAM available to Docker | 8 GB | 12-16 GB |
+| Free disk | 30 GB | 50 GB |
+
+Where it goes:
+
+- **Couchbase Server** reserves 3 GB of service quotas by default (data
+  2048 MB + index 512 MB + search 512 MB), plus roughly 1.5 GB for the
+  query service and its own runtime - about 4.5 GB in all. The quotas are
+  set by `COUCHBASE_CLUSTER_RAMSIZE`, `COUCHBASE_INDEX_RAMSIZE`,
+  `COUCHBASE_FTS_RAMSIZE` and `COUCHBASE_BUCKET_RAMSIZE` in `.env`; lower
+  them only for short demos (see the comment in `docker-compose.yml`).
+- **The operations manager** uses about 1.5 GB with the default embedding
+  model, up to about 3 GB under load. Each additional *local* embedding
+  model loaded for a knowledge set adds up to about 2 GB (BGE-M3 and
+  multilingual-E5-large are the largest); hosted models add nothing.
+- **The dashboard and sample MCP servers** need under 0.5 GB together.
+- **Disk:** about 2 GB for the Couchbase image and 2-3 GB for the
+  operations-manager image (CPU-only PyTorch), plus Docker build cache,
+  the Couchbase data volume (grows with the audit log, caches and
+  Knowledge Base - plan on 20 GB, like the Helm default), and the
+  embedding-model cache (about 100 MB for the default model, up to a few
+  GB if you add local models).
+
+On Docker Desktop, raise the memory limit under **Settings → Resources**
+before the first `docker compose up` - Couchbase fails to start, or is
+killed shortly after, when it can't get its quota.
+
+### Kubernetes: CPU, RAM and disk
+
+The chart's defaults in
+[`values.yaml`](./helm/couchbase-agent-operations-manager/values.yaml):
+
+| Component | CPU request / limit | Memory request / limit | Persistent storage |
+|---|---|---|---|
+| Couchbase Server | 500m / 2 | 2 GiB / 6 GiB | 20 GiB |
+| Operations manager | 500m / 2 | 1.5 GiB / 3 GiB | 5 GiB (embedding-model cache) |
+| Sample MCP servers (optional) | 100m / 500m | 128 MiB / 256 MiB | - |
+| Dashboard (nginx) | 100m / 250m | 64 MiB / 128 MiB | - |
+| **Total** | **1.2 / 4.75 vCPU** | **~3.7 GiB / ~9.4 GiB** | **25 GiB** |
+
+The provisioning Job runs briefly after each install or upgrade and sets
+no resource requests of its own.
+
+Size nodes to the limits rather than the requests: Couchbase's 6 GiB limit
+is the value proven in a real install (3 GiB was OOM-killed seconds after
+start). For a single node - K3s, for example - that means at least
+**4 vCPU, 16 GB RAM and 50 GB of disk** (the 25 GiB of volumes, about 5 GB
+of images, and room for the OS and system pods). Raise
+`operationsManager.resources.limits.memory` before setting
+`operationsManager.embeddingMaxLoadedModels` above 2 to keep several large
+local embedding models loaded.
+
+**Using an external Couchbase cluster** (see
+[below](#using-an-external-couchbase-enterprise-server)) removes the
+Couchbase row: the appliance itself then needs about 0.7 vCPU / 1.7 GiB
+requested and 2.75 vCPU / 3.4 GiB at its limits, plus the 5 GiB model
+cache.
+
 ## Run it
 
 ```bash
