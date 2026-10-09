@@ -112,24 +112,29 @@ function AgentExampleView({ example }: { example: AgentExample }) {
             </button>
           </div>
         </div>
-        <div className="helper-banner helper-banner-neutral" style={{ marginTop: 14, marginBottom: 0 }}>
-          <Inline text={example.note} />
-        </div>
       </div>
 
-      <div className="two-col section-gap">
+      <div className="section-gap" style={{ display: "grid", gap: 24 }}>
         <div className="panel">
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Install</div>
           <pre className="json-block" style={{ marginBottom: 14 }}>{example.install}</pre>
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Configure</div>
           <div className="table-wrap">
             <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Variable</th>
+                  <th>Example</th>
+                  <th>What to supply</th>
+                </tr>
+              </thead>
               <tbody>
-                {example.env.map(([name, value]) => (
+                {example.env.map(([name, sample, help]) => (
                   <tr key={name}>
-                    <td className="cell-mono" style={{ whiteSpace: "nowrap" }}>{name}</td>
+                    <td className="cell-mono" style={{ fontSize: 11.5, whiteSpace: "nowrap" }}>{name}</td>
+                    <td className="cell-mono" style={{ fontSize: 11.5, overflowWrap: "anywhere" }}>{sample}</td>
                     <td className="cell-muted">
-                      <Inline text={value} />
+                      <Inline text={help} />
                     </td>
                   </tr>
                 ))}

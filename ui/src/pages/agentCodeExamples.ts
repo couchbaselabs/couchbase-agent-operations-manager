@@ -18,8 +18,8 @@ export type AgentExample = {
   filename: string;
   tagline: string;
   install: string;
-  env: Array<[string, string]>;
-  note: string;
+  // [variable, example value, what to supply]
+  env: Array<[string, string, string]>;
   cache: CacheLayer[];
   setup?: AgentSetup;
   code: string;
@@ -30,18 +30,18 @@ export const AGENT_EXAMPLES: AgentExample[] = [
     id: "snowflake",
     label: "Snowflake Agent",
     filename: "snowflake_agent.py",
-    tagline: "Natural-language finance analytics over Snowflake, where every warehouse query is an AOM-governed MCP tool call - the bundled demo server out of the box, or your own Snowflake MCP server.",
-    install: "pip install ./couchbase-aom-sdk-*",
+    tagline: "Natural-language finance analytics over Snowflake, where every warehouse query is an AOM-governed MCP tool call to your Snowflake MCP server.",
+    install: "pip install ./couchbase-aom-sdk-*      # the zip from Tools → Developer SDK",
     env: [
-      ["AOM_BASE_URL", "https://localhost:8090"],
-      ["AOM_API_KEY", "`demo-finance-analyst-7e83` on the demo stack, or your Agent Identity's key"],
-      ["SNOWFLAKE_MCP_SERVER", "AOM Server ID - `snowflake` (demo default) or the ID you registered"],
-      ["SNOWFLAKE_QUERY_TOOL", "query tool name from Tool Catalog (demo: `query`)"],
-      ["SNOWFLAKE_SQL_ARG", "that tool's SQL argument name (demo: `sql`)"],
-      ["SNOWFLAKE_LIST_TOOL", "table-listing tool (demo: `list_tables`), or empty to skip"],
-      ["SNOWFLAKE_WAREHOUSE", "optional - sent as a `warehouse` argument only if set"],
+      ["AOM_BASE_URL", "https://aom.example.com:8090", "Your AOM operations-manager URL - port 8090 by default. On Helm/Kubernetes installs, where that port isn't exposed, use your dashboard URL instead."],
+      ["AOM_API_KEY", "aom_…", "The Agent Identity key from step 4."],
+      ["AOM_VERIFY_SSL", "true", "`true` once AOM has a trusted certificate; `false` while it's self-signed."],
+      ["SNOWFLAKE_MCP_SERVER", "snowflake-prod", "The Server ID you registered in step 2."],
+      ["SNOWFLAKE_QUERY_TOOL", "run_query", "Your query tool's name, from Tool Catalog."],
+      ["SNOWFLAKE_SQL_ARG", "sql", "That tool's SQL argument name."],
+      ["SNOWFLAKE_LIST_TOOL", "list_tables", "Your table-listing tool, or leave unset if there isn't one."],
+      ["SNOWFLAKE_WAREHOUSE", "ANALYTICS_WH", "Optional - sent as a `warehouse` argument only if set."],
     ],
-    note: "Runs as-is on the demo stack against the bundled sample `snowflake` MCP server - no warehouse connection or credentials to set up. The agent never connects to Snowflake itself: every query is an AOM tool call, so RBAC, agent scoping, audit logging and guardrails apply to each one. To run it against your own Snowflake, follow \"Use your own Snowflake MCP server\" below.",
     cache: [
       { layer: "Context", what: "Table list", key: "tables:<server_id>", ttl: "6 h" },
       { layer: "Context", what: "Query result", key: "sql:<server_id>:<sha256 of normalized SQL>", ttl: "15 min" },
@@ -62,7 +62,7 @@ export const AGENT_EXAMPLES: AgentExample[] = [
           "fields": [
             [
               "Server ID",
-              "Anything except `snowflake`, e.g. `snowflake-prod`. The demo server owns `snowflake` and is re-created on every restart. This ID becomes the prefix of every tool ID."
+              "Anything except `snowflake`, e.g. `snowflake-prod`. AOM's bundled sample Snowflake server already uses `snowflake` and is re-created on every restart. This ID becomes the prefix of every tool ID."
             ],
             [
               "MCP URL",
@@ -107,7 +107,7 @@ export const AGENT_EXAMPLES: AgentExample[] = [
         },
         {
           "title": "Point the script at it",
-          "body": "Set these alongside `AOM_BASE_URL`. Leave `SNOWFLAKE_LIST_TOOL` empty if your server has no table-listing tool - the model is then told to use fully-qualified table names. The script accepts query results shaped as a list of rows or as `rows` / `data` / `results` in an object.",
+          "body": "Set these alongside `AOM_BASE_URL`. Leave `SNOWFLAKE_LIST_TOOL` unset if your server has no table-listing tool - the model is then told to use fully-qualified table names. The script accepts query results shaped as a list of rows or as `rows` / `data` / `results` in an object.",
           "code": "export AOM_API_KEY=aom_...                  # the Agent Identity key from step 4\nexport SNOWFLAKE_MCP_SERVER=snowflake-prod  # Server ID from step 2\nexport SNOWFLAKE_QUERY_TOOL=run_query       # tool names from step 3\nexport SNOWFLAKE_SQL_ARG=sql\nexport SNOWFLAKE_LIST_TOOL=list_tables\npython snowflake_agent.py \"What was daily revenue over the last week?\""
         },
         {
@@ -125,24 +125,19 @@ Snowflake analytics agent - Couchbase AOM SDK + LLM Caching + Context Caching.
 
 Answers natural-language finance questions against Snowflake. The agent
 never connects to Snowflake itself: every warehouse call is an AOM-governed
-MCP tool call (RBAC, agent scope, audit, guardrails), and the MCP server
-holds the Snowflake credentials.
+MCP tool call (RBAC, agent scope, audit, guardrails) to your Snowflake MCP
+server, which holds the Snowflake credentials. Register the server in AOM
+(MCP Servers), issue an Agent Identity scoped to its tools, then:
 
-Demo stack - runs as-is against the bundled sample \`snowflake\` server:
-
-    pip install ./couchbase-aom-sdk-*      # from Tools -> Developer SDK
-    export AOM_BASE_URL=https://localhost:8090
-    export AOM_API_KEY=demo-finance-analyst-7e83
-    python snowflake_agent.py "What was daily revenue over the last week?"
-
-Your own Snowflake MCP server - register it in AOM (MCP Servers), issue an
-Agent Identity scoped to its tools, then point this script at it:
-
+    pip install ./couchbase-aom-sdk-*           # from Tools -> Developer SDK
+    export AOM_BASE_URL=https://aom.example.com:8090
     export AOM_API_KEY=aom_...                  # the Agent Identity's key
+    export AOM_VERIFY_SSL=true                  # false while AOM's cert is self-signed
     export SNOWFLAKE_MCP_SERVER=snowflake-prod  # the Server ID you registered
     export SNOWFLAKE_QUERY_TOOL=run_query       # tool names as shown in Tool Catalog
     export SNOWFLAKE_SQL_ARG=sql                # that tool's SQL argument name
-    export SNOWFLAKE_LIST_TOOL=list_tables      # or "" if your server has none
+    export SNOWFLAKE_LIST_TOOL=list_tables      # or leave unset if your server has none
+    python snowflake_agent.py "What was daily revenue over the last week?"
 
 Caching layers:
   1. Context Cache  - table list (6 h) and each query result (15 min), keyed
@@ -167,17 +162,17 @@ from aom_sdk import (
 )
 
 NAMESPACE = "snowflake-analytics"
-MCP_SERVER = os.environ.get("SNOWFLAKE_MCP_SERVER", "snowflake")   # AOM Server ID
-QUERY_TOOL = os.environ.get("SNOWFLAKE_QUERY_TOOL", "query")
+MCP_SERVER = os.environ["SNOWFLAKE_MCP_SERVER"]                  # AOM Server ID
+QUERY_TOOL = os.environ["SNOWFLAKE_QUERY_TOOL"]
 SQL_ARG = os.environ.get("SNOWFLAKE_SQL_ARG", "sql")
-LIST_TOOL = os.environ.get("SNOWFLAKE_LIST_TOOL", "list_tables")   # "" to skip
+LIST_TOOL = os.environ.get("SNOWFLAKE_LIST_TOOL", "")               # unset/empty = skip
 WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "")  # sent as \`warehouse\` only if set
 SCHEMA_TTL_S = 6 * 3600     # table lists change rarely
 RESULT_TTL_S = 15 * 60      # analytics results go stale - keep this short
 MAX_ROWS = 200              # keep cached values under the policy's max_value_bytes (64 KB default)
 
 client = AOMClient(
-    base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
+    base_url=os.environ["AOM_BASE_URL"],
     api_key=os.environ["AOM_API_KEY"],
     verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     agent_id="snowflake-analytics-agent",
@@ -190,7 +185,7 @@ def tool_id(name: str) -> str:
 
 
 def sql_key(sql: str) -> str:
-    normalized = re.sub(r"\\s+", " ", sql.strip().rstrip(";")).lower()
+    normalized = re.sub(r"\s+", " ", sql.strip().rstrip(";")).lower()
     return f"sql:{MCP_SERVER}:" + hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
 
@@ -207,12 +202,12 @@ def rows_of(result) -> list:
 
 def strip_fences(text: str) -> str:
     text = text.strip()
-    text = re.sub(r"^\`\`\`[a-zA-Z]*\\s*", "", text)
-    return re.sub(r"\\s*\`\`\`$", "", text).strip()
+    text = re.sub(r"^\`\`\`[a-zA-Z]*\s*", "", text)
+    return re.sub(r"\s*\`\`\`$", "", text).strip()
 
 
 def assert_read_only(sql: str) -> None:
-    if not re.match(r"^\\s*(select|with)\\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
+    if not re.match(r"^\s*(select|with)\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
         raise ValueError(f"Refusing to run a non-SELECT or multi-statement query: {sql!r}")
 
 
@@ -237,7 +232,7 @@ def question_to_sql(question: str, tables: list) -> str:
     # (dates, IDs), pass semantic=False here too.
     hint = f"Available tables: {', '.join(tables)}. " if tables else "Use fully-qualified table names. "
     resp = client.complete(
-        f"Question: {question}\\n"
+        f"Question: {question}\n"
         f"Write ONE read-only Snowflake SQL query that answers it. {hint}Return only the SQL.",
         namespace=f"{NAMESPACE}:nl2sql",
     )
@@ -262,8 +257,8 @@ def answer(question: str, sql: str, result: dict) -> dict:
     # LLM Cache, exact-match only: the prompt embeds live data, so a
     # near-identical prompt could carry different numbers.
     return client.complete(
-        f"Question: {question}\\nSQL: {sql}\\n"
-        f"Rows (JSON): {json.dumps(result['rows'], default=str)}\\n"
+        f"Question: {question}\nSQL: {sql}\n"
+        f"Rows (JSON): {json.dumps(result['rows'], default=str)}\n"
         "Answer in 2-3 sentences with the key figures.",
         namespace=f"{NAMESPACE}:answer",
         semantic=False,
@@ -289,7 +284,7 @@ def main(question: str) -> None:
             sys.exit(f"Rate limit or budget hit ({exc.limit}); retry in {exc.retry_after}s.")
 
         print(final["response"])
-        print(f"\\nSQL: {sql}")
+        print(f"\nSQL: {sql}")
         print(f"LLM cache: {final['cache']['status']} | cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
 
 
@@ -304,16 +299,17 @@ if __name__ == "__main__":
     tagline: "Questions over Unity Catalog tables - through AOM-governed MCP tool calls to your Databricks MCP server, or a direct SQL warehouse connection - answered by a Databricks-served model through AOM's LLM gateway.",
     install: "pip install ./couchbase-aom-sdk-*         # both modes\npip install databricks-sql-connector      # direct mode only",
     env: [
-      ["AOM_BASE_URL / AOM_API_KEY", "your appliance, and your Agent Identity's key"],
-      ["DATABRICKS_TABLES", "`main.sales.orders,main.sales.customers`"],
-      ["DATABRICKS_MCP_SERVER", "governed - AOM Server ID, e.g. `databricks-prod`; unset for direct"],
-      ["DATABRICKS_QUERY_TOOL", "governed - SQL tool name from Tool Catalog (default `execute_sql`)"],
-      ["DATABRICKS_SQL_ARG", "governed - that tool's SQL argument name (default `sql`)"],
-      ["DATABRICKS_SERVER_HOSTNAME", "direct - `adb-….azuredatabricks.net`"],
-      ["DATABRICKS_HTTP_PATH", "direct - `/sql/1.0/warehouses/…`"],
-      ["DATABRICKS_TOKEN", "direct - `dapi…`"],
+      ["AOM_BASE_URL", "https://aom.example.com:8090", "Your AOM operations-manager URL - port 8090 by default. On Helm/Kubernetes installs, where that port isn't exposed, use your dashboard URL instead."],
+      ["AOM_API_KEY", "aom_…", "The Agent Identity key from step 4."],
+      ["AOM_VERIFY_SSL", "true", "`true` once AOM has a trusted certificate; `false` while it's self-signed."],
+      ["DATABRICKS_TABLES", "main.sales.orders,main.sales.customers", "Comma-separated tables the agent may query."],
+      ["DATABRICKS_MCP_SERVER", "databricks-prod", "Governed: the Server ID from step 2. Leave unset for direct mode."],
+      ["DATABRICKS_QUERY_TOOL", "execute_sql", "Governed: your SQL tool's name, from Tool Catalog."],
+      ["DATABRICKS_SQL_ARG", "sql", "Governed: that tool's SQL argument name."],
+      ["DATABRICKS_SERVER_HOSTNAME", "adb-1234567890123456.7.azuredatabricks.net", "Direct: your workspace hostname."],
+      ["DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123def456", "Direct: your SQL warehouse's HTTP path."],
+      ["DATABRICKS_TOKEN", "dapi…", "Direct: a token for a principal with read access to those tables."],
     ],
-    note: "Two ways to reach the lakehouse. Governed (recommended): set `DATABRICKS_MCP_SERVER` and every SQL statement - including the `DESCRIBE TABLE` schema lookups - becomes an AOM tool call to your Databricks MCP server, so RBAC, agent scoping, audit logging and guardrails apply and the agent holds no Databricks credentials. Direct: leave it unset and the agent connects to a SQL warehouse itself; caching and tracing still run through AOM. Either way, a Context Cache hit never wakes a stopped warehouse. To go governed, follow \"Use your own Databricks MCP server\" below.",
     cache: [
       { layer: "Context", what: "Table schema (DESCRIBE TABLE)", key: "schema:<source>:<catalog.schema.table>", ttl: "6 h" },
       { layer: "Context", what: "Query result", key: "sql:<source>:<sha256 of normalized SQL>", ttl: "15 min" },
@@ -403,8 +399,9 @@ through AOM's LLM gateway. Two ways to reach the data:
   guardrails); the MCP server holds the Databricks credentials:
 
     pip install ./couchbase-aom-sdk-*      # from Tools -> Developer SDK
-    export AOM_BASE_URL=https://localhost:8090
+    export AOM_BASE_URL=https://aom.example.com:8090
     export AOM_API_KEY=aom_...                     # your Agent Identity's key
+    export AOM_VERIFY_SSL=true                     # false while AOM's cert is self-signed
     export DATABRICKS_MCP_SERVER=databricks-prod   # the Server ID you registered
     export DATABRICKS_QUERY_TOOL=execute_sql       # tool name as shown in Tool Catalog
     export DATABRICKS_SQL_ARG=sql                  # that tool's SQL argument name
@@ -455,7 +452,7 @@ RESULT_TTL_S = 15 * 60
 MAX_ROWS = 200
 
 client = AOMClient(
-    base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
+    base_url=os.environ["AOM_BASE_URL"],
     api_key=os.environ["AOM_API_KEY"],
     verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     agent_id="databricks-lakehouse-agent",
@@ -494,17 +491,17 @@ def _execute(statement: str) -> list:
 
 
 def sql_key(sql: str) -> str:
-    normalized = re.sub(r"\\s+", " ", sql.strip().rstrip(";")).lower()
+    normalized = re.sub(r"\s+", " ", sql.strip().rstrip(";")).lower()
     return f"sql:{SOURCE}:" + hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
 
 def strip_fences(text: str) -> str:
-    text = re.sub(r"^\`\`\`[a-zA-Z]*\\s*", "", text.strip())
-    return re.sub(r"\\s*\`\`\`$", "", text).strip()
+    text = re.sub(r"^\`\`\`[a-zA-Z]*\s*", "", text.strip())
+    return re.sub(r"\s*\`\`\`$", "", text).strip()
 
 
 def assert_read_only(sql: str) -> None:
-    if not re.match(r"^\\s*(select|with)\\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
+    if not re.match(r"^\s*(select|with)\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
         raise ValueError(f"Refusing to run a non-SELECT or multi-statement query: {sql!r}")
 
 
@@ -529,7 +526,7 @@ def question_to_sql(question: str) -> str:
     )
     # LLM Cache, semantic ON - paraphrased questions reuse the cached SQL.
     resp = client.complete(
-        f"Question: {question}\\n"
+        f"Question: {question}\n"
         f"Write ONE read-only Databricks SQL query that answers it. Tables: {schemas}. "
         "Use fully-qualified catalog.schema.table names. Return only the SQL.",
         provider=LLM_PROVIDER,
@@ -554,7 +551,7 @@ def main(question: str) -> None:
             rows = run_query(sql)
             # LLM Cache, exact-match only: the prompt carries live rows.
             final = client.complete(
-                f"Question: {question}\\nSQL: {sql}\\nRows (JSON): {json.dumps(rows)}\\n"
+                f"Question: {question}\nSQL: {sql}\nRows (JSON): {json.dumps(rows)}\n"
                 "Answer in 2-3 sentences with the key figures.",
                 provider=LLM_PROVIDER,
                 model=LLM_MODEL,
@@ -571,7 +568,7 @@ def main(question: str) -> None:
             sys.exit(f"Rate limit or budget hit ({exc.limit}); retry in {exc.retry_after}s.")
 
         print(final["response"])
-        print(f"\\nSQL: {sql}")
+        print(f"\nSQL: {sql}")
         print(f"LLM cache: {final['cache']['status']} | cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
 
 
@@ -586,16 +583,17 @@ if __name__ == "__main__":
     tagline: "Questions over a BigQuery dataset - through AOM-governed MCP tool calls to your BigQuery MCP server, or directly with a dry-run cost check and bytes-billed cap - with Gemini through AOM's LLM gateway.",
     install: "pip install ./couchbase-aom-sdk-*      # both modes\npip install google-cloud-bigquery      # direct mode only",
     env: [
-      ["AOM_BASE_URL / AOM_API_KEY", "your appliance, and your Agent Identity's key"],
-      ["BQ_DATASET", "`my-project.analytics`"],
-      ["BQ_MCP_SERVER", "governed - AOM Server ID, e.g. `bigquery-prod`; unset for direct"],
-      ["BQ_QUERY_TOOL", "governed - SQL tool name from Tool Catalog (default `execute_sql`)"],
-      ["BQ_SQL_ARG", "governed - that tool's SQL argument name (default `sql`)"],
-      ["GCP_PROJECT", "direct - billing project, e.g. `my-project`"],
-      ["BQ_MAX_BYTES", "direct - optional per-query cap (default 10 GiB)"],
-      ["GOOGLE_APPLICATION_CREDENTIALS", "direct - or `gcloud auth application-default login`"],
+      ["AOM_BASE_URL", "https://aom.example.com:8090", "Your AOM operations-manager URL - port 8090 by default. On Helm/Kubernetes installs, where that port isn't exposed, use your dashboard URL instead."],
+      ["AOM_API_KEY", "aom_…", "The Agent Identity key from step 4."],
+      ["AOM_VERIFY_SSL", "true", "`true` once AOM has a trusted certificate; `false` while it's self-signed."],
+      ["BQ_DATASET", "my-project.analytics", "The dataset to query, as `project.dataset`."],
+      ["BQ_MCP_SERVER", "bigquery-prod", "Governed: the Server ID from step 2. Leave unset for direct mode."],
+      ["BQ_QUERY_TOOL", "execute_sql", "Governed: your SQL tool's name, from Tool Catalog."],
+      ["BQ_SQL_ARG", "sql", "Governed: that tool's SQL argument name."],
+      ["GCP_PROJECT", "my-project", "Direct: the project queries are billed to."],
+      ["BQ_MAX_BYTES", "10737418240", "Direct, optional: per-query bytes-billed cap (default 10 GiB)."],
+      ["GOOGLE_APPLICATION_CREDENTIALS", "/path/to/service-account.json", "Direct: or run `gcloud auth application-default login`."],
     ],
-    note: "Two ways to reach the warehouse. Governed (recommended): set `BQ_MCP_SERVER` and every SQL statement - including the `INFORMATION_SCHEMA` schema read - becomes an AOM tool call to your BigQuery MCP server, so RBAC, agent scoping, audit logging and guardrails apply and the agent holds no Google credentials. Direct: leave it unset and the agent queries BigQuery itself, with a free dry run and a bytes-billed cap on every query. BigQuery bills by bytes scanned, so every Context Cache hit is spend avoided as well as latency. To go governed, follow \"Use your own BigQuery MCP server\" below.",
     cache: [
       { layer: "Context", what: "Dataset schema (INFORMATION_SCHEMA)", key: "schema:<source>:<project.dataset>", ttl: "6 h" },
       { layer: "Context", what: "Query result (+ bytes billed, direct)", key: "sql:<source>:<sha256 of normalized SQL>", ttl: "30 min" },
@@ -685,8 +683,9 @@ LLM gateway. Two ways to reach the data:
   guardrails); the MCP server holds the Google credentials:
 
     pip install ./couchbase-aom-sdk-*      # from Tools -> Developer SDK
-    export AOM_BASE_URL=https://localhost:8090
+    export AOM_BASE_URL=https://aom.example.com:8090
     export AOM_API_KEY=aom_...                  # your Agent Identity's key
+    export AOM_VERIFY_SSL=true                  # false while AOM's cert is self-signed
     export BQ_MCP_SERVER=bigquery-prod          # the Server ID you registered
     export BQ_QUERY_TOOL=execute_sql            # tool name as shown in Tool Catalog
     export BQ_SQL_ARG=sql                       # that tool's SQL argument name
@@ -738,7 +737,7 @@ RESULT_TTL_S = 30 * 60
 MAX_ROWS = 200
 
 client = AOMClient(
-    base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
+    base_url=os.environ["AOM_BASE_URL"],
     api_key=os.environ["AOM_API_KEY"],
     verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     agent_id="bigquery-analytics-agent",
@@ -785,17 +784,17 @@ def _execute(sql: str) -> dict:
 
 
 def sql_key(sql: str) -> str:
-    normalized = re.sub(r"\\s+", " ", sql.strip().rstrip(";")).lower()
+    normalized = re.sub(r"\s+", " ", sql.strip().rstrip(";")).lower()
     return f"sql:{SOURCE}:" + hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
 
 def strip_fences(text: str) -> str:
-    text = re.sub(r"^\`\`\`[a-zA-Z]*\\s*", "", text.strip())
-    return re.sub(r"\\s*\`\`\`$", "", text).strip()
+    text = re.sub(r"^\`\`\`[a-zA-Z]*\s*", "", text.strip())
+    return re.sub(r"\s*\`\`\`$", "", text).strip()
 
 
 def assert_read_only(sql: str) -> None:
-    if not re.match(r"^\\s*(select|with)\\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
+    if not re.match(r"^\s*(select|with)\b", sql, re.IGNORECASE) or ";" in sql.strip().rstrip(";"):
         raise ValueError(f"Refusing to run a non-SELECT or multi-statement query: {sql!r}")
 
 
@@ -819,7 +818,7 @@ def question_to_sql(question: str) -> str:
     tables = "; ".join(f"\`{DATASET}.{t}\`({', '.join(cols)})" for t, cols in dataset_schema().items())
     # LLM Cache, semantic ON - paraphrased questions reuse the cached SQL.
     resp = client.complete(
-        f"Question: {question}\\n"
+        f"Question: {question}\n"
         f"Write ONE read-only GoogleSQL (BigQuery) query that answers it. Tables: {tables}. "
         "Return only the SQL.",
         provider=LLM_PROVIDER,
@@ -844,7 +843,7 @@ def main(question: str) -> None:
             result = run_query(sql)
             # LLM Cache, exact-match only: the prompt carries live rows.
             final = client.complete(
-                f"Question: {question}\\nSQL: {sql}\\nRows (JSON): {json.dumps(result['rows'])}\\n"
+                f"Question: {question}\nSQL: {sql}\nRows (JSON): {json.dumps(result['rows'])}\n"
                 "Answer in 2-3 sentences with the key figures.",
                 provider=LLM_PROVIDER,
                 model=LLM_MODEL,
@@ -861,7 +860,7 @@ def main(question: str) -> None:
             sys.exit(f"Rate limit or budget hit ({exc.limit}); retry in {exc.retry_after}s.")
 
         print(final["response"])
-        print(f"\\nSQL: {sql}")
+        print(f"\nSQL: {sql}")
         print(f"LLM cache: {final['cache']['status']} | cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
 
 
@@ -876,14 +875,17 @@ if __name__ == "__main__":
     tagline: "Answers questions over text documents under an S3 prefix - through AOM-governed MCP tool calls to your S3 MCP server, or directly with boto3: list once, summarize each document once, answer from the summaries.",
     install: "pip install ./couchbase-aom-sdk-*   # both modes\npip install boto3                   # direct mode only",
     env: [
-      ["AOM_BASE_URL / AOM_API_KEY", "your appliance, and your Agent Identity's key"],
-      ["S3_BUCKET / S3_PREFIX", "`acme-contracts` / `suppliers/2026/`"],
-      ["S3_MCP_SERVER", "governed - AOM Server ID, e.g. `s3-docs`; unset for direct"],
-      ["S3_LIST_TOOL / S3_GET_TOOL", "governed - tool names from Tool Catalog (defaults `list_objects` / `get_object`)"],
-      ["S3_BUCKET_ARG / S3_PREFIX_ARG / S3_KEY_ARG", "governed - those tools' argument names (defaults `bucket` / `prefix` / `key`)"],
-      ["AWS_PROFILE", "direct - or any standard boto3 credential source"],
+      ["AOM_BASE_URL", "https://aom.example.com:8090", "Your AOM operations-manager URL - port 8090 by default. On Helm/Kubernetes installs, where that port isn't exposed, use your dashboard URL instead."],
+      ["AOM_API_KEY", "aom_…", "The Agent Identity key from step 4."],
+      ["AOM_VERIFY_SSL", "true", "`true` once AOM has a trusted certificate; `false` while it's self-signed."],
+      ["S3_BUCKET", "acme-contracts", "The bucket holding the documents."],
+      ["S3_PREFIX", "suppliers/2026/", "The prefix to read under."],
+      ["S3_MCP_SERVER", "s3-docs", "Governed: the Server ID from step 2. Leave unset for direct mode."],
+      ["S3_LIST_TOOL", "list_objects", "Governed: your list tool's name, from Tool Catalog."],
+      ["S3_GET_TOOL", "get_object", "Governed: your read tool's name, from Tool Catalog."],
+      ["S3_BUCKET_ARG / S3_PREFIX_ARG / S3_KEY_ARG", "bucket / prefix / key", "Governed: those tools' argument names."],
+      ["AWS_PROFILE", "contracts-reader", "Direct: or any standard boto3 credential source."],
     ],
-    note: "Two ways to reach the bucket. Governed (recommended): set `S3_MCP_SERVER` and every list and read becomes an AOM tool call to your S3 MCP server, so RBAC, agent scoping, audit logging and guardrails apply and the agent holds no AWS credentials. Direct: leave it unset and the agent calls S3 itself with boto3. Object text is cached under its ETag, so a re-uploaded document gets a new key and can never be served stale, and an unchanged document is summarized once, ever. To go governed, follow \"Use your own S3 MCP server\" below.",
     cache: [
       { layer: "Context", what: "Prefix listing", key: "list:<source>:<bucket>/<prefix>", ttl: "5 min" },
       { layer: "Context", what: "Object text", key: "s3://<bucket>/<key>@<etag>", ttl: "7 days (1 h if no ETag)" },
@@ -974,8 +976,9 @@ document once, then answer from the summaries. Two ways to reach the bucket:
   MCP server holds the AWS credentials:
 
     pip install ./couchbase-aom-sdk-*      # from Tools -> Developer SDK
-    export AOM_BASE_URL=https://localhost:8090
+    export AOM_BASE_URL=https://aom.example.com:8090
     export AOM_API_KEY=aom_...                 # your Agent Identity's key
+    export AOM_VERIFY_SSL=true                 # false while AOM's cert is self-signed
     export S3_MCP_SERVER=s3-docs               # the Server ID you registered
     export S3_LIST_TOOL=list_objects           # tool names as shown in Tool Catalog
     export S3_GET_TOOL=get_object
@@ -1025,7 +1028,7 @@ MAX_DOCS = 20
 MAX_CHARS = 48_000              # stay under the Context Cache max_value_bytes (64 KB default)
 
 client = AOMClient(
-    base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
+    base_url=os.environ["AOM_BASE_URL"],
     api_key=os.environ["AOM_API_KEY"],
     verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     agent_id="s3-document-agent",
@@ -1104,7 +1107,7 @@ def summarize(doc: dict) -> str:
     # after the first summary. semantic=False because two near-identical
     # contracts can differ in exactly the clause that matters.
     resp = client.complete(
-        f"Document: s3://{BUCKET}/{doc['key']} (etag {doc['etag']})\\n\\n{document_text(doc)}\\n\\n"
+        f"Document: s3://{BUCKET}/{doc['key']} (etag {doc['etag']})\n\n{document_text(doc)}\n\n"
         "Summarize this document in 5 bullet points. Always include parties, dates, "
         "amounts, renewal and termination terms when present.",
         namespace=f"{NAMESPACE}:summary",
@@ -1119,10 +1122,10 @@ def main(question: str) -> None:
             docs = list_documents()
             if not docs:
                 sys.exit(f"No text documents under s3://{BUCKET}/{PREFIX}")
-            summaries = "\\n\\n".join(f"[{d['key']}]\\n{summarize(d)}" for d in docs)
+            summaries = "\n\n".join(f"[{d['key']}]\n{summarize(d)}" for d in docs)
             # LLM Cache, exact-match only: the prompt embeds document content.
             final = client.complete(
-                f"Question: {question}\\n\\nDocument summaries:\\n{summaries}\\n\\n"
+                f"Question: {question}\n\nDocument summaries:\n{summaries}\n\n"
                 "Answer using only these documents and cite the S3 keys you relied on.",
                 namespace=f"{NAMESPACE}:answer",
                 semantic=False,
@@ -1137,7 +1140,7 @@ def main(question: str) -> None:
             sys.exit(f"Rate limit or budget hit ({exc.limit}); retry in {exc.retry_after}s.")
 
         print(final["response"])
-        print(f"\\n{len(docs)} documents | LLM cache: {final['cache']['status']} | "
+        print(f"\n{len(docs)} documents | LLM cache: {final['cache']['status']} | "
               f"cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
 
 
@@ -1152,15 +1155,18 @@ if __name__ == "__main__":
     tagline: "Procurement assistant over Oracle Fusion Cloud ERP - through AOM-governed MCP tool calls to your Oracle ERP MCP server, or the Fusion REST API directly: PO status, the supplier behind it, and that supplier's unpaid invoices.",
     install: "pip install ./couchbase-aom-sdk-*   # both modes\npip install requests                # direct mode only",
     env: [
-      ["AOM_BASE_URL / AOM_API_KEY", "your appliance, and your Agent Identity's key"],
-      ["ORACLE_MCP_SERVER", "governed - AOM Server ID, e.g. `oracle-erp`; unset for direct"],
-      ["ORACLE_PO_TOOL / ORACLE_SUPPLIER_TOOL / ORACLE_INVOICE_TOOL", "governed - tool names from Tool Catalog (defaults `get_purchase_order` / `get_supplier` / `search_invoices`)"],
-      ["ORACLE_PO_ARG / ORACLE_SUPPLIER_ARG", "governed - argument names (defaults `order_number` / `supplier`)"],
-      ["ORACLE_ERP_URL", "direct - `https://acme.fa.us2.oraclecloud.com`"],
-      ["ORACLE_ERP_USER / ORACLE_ERP_PASSWORD", "direct - an integration user"],
-      ["ORACLE_ERP_REST_VERSION", "direct - `11.13.18.05` (default)"],
+      ["AOM_BASE_URL", "https://aom.example.com:8090", "Your AOM operations-manager URL - port 8090 by default. On Helm/Kubernetes installs, where that port isn't exposed, use your dashboard URL instead."],
+      ["AOM_API_KEY", "aom_…", "The Agent Identity key from step 4."],
+      ["AOM_VERIFY_SSL", "true", "`true` once AOM has a trusted certificate; `false` while it's self-signed."],
+      ["ORACLE_MCP_SERVER", "oracle-erp", "Governed: the Server ID from step 2. Leave unset for direct mode."],
+      ["ORACLE_PO_TOOL", "get_purchase_order", "Governed: your PO lookup tool, from Tool Catalog."],
+      ["ORACLE_SUPPLIER_TOOL", "get_supplier", "Governed: your supplier lookup tool."],
+      ["ORACLE_INVOICE_TOOL", "search_invoices", "Governed: your invoice search tool."],
+      ["ORACLE_PO_ARG / ORACLE_SUPPLIER_ARG", "order_number / supplier", "Governed: those tools' argument names."],
+      ["ORACLE_ERP_URL", "https://acme.fa.us2.oraclecloud.com", "Direct: your Fusion Cloud URL."],
+      ["ORACLE_ERP_USER / ORACLE_ERP_PASSWORD", "integration.user / …", "Direct: a read-only integration user."],
+      ["ORACLE_ERP_REST_VERSION", "11.13.18.05", "Direct, optional: your Fusion REST API version."],
     ],
-    note: "Two ways to reach the ERP. Governed (recommended): set `ORACLE_MCP_SERVER` and every PO, supplier and invoice lookup becomes an AOM tool call to your Oracle ERP MCP server, so RBAC, agent scoping, audit logging and guardrails apply and the agent holds no ERP credentials. Direct: leave it unset and the agent calls the Fusion REST API itself - check resource attribute names against your release. The agent is read-only, with TTLs matched to how fast each record changes. To go governed, follow \"Use your own Oracle ERP MCP server\" below.",
     cache: [
       { layer: "Context", what: "Supplier master", key: "supplier:<source>:<name>", ttl: "6 h" },
       { layer: "Context", what: "PO header", key: "po:<source>:<order number>", ttl: "5 min" },
@@ -1252,8 +1258,9 @@ reach the ERP:
   guardrails); the MCP server holds the ERP credentials:
 
     pip install ./couchbase-aom-sdk-*      # from Tools -> Developer SDK
-    export AOM_BASE_URL=https://localhost:8090
+    export AOM_BASE_URL=https://aom.example.com:8090
     export AOM_API_KEY=aom_...                        # your Agent Identity's key
+    export AOM_VERIFY_SSL=true                        # false while AOM's cert is self-signed
     export ORACLE_MCP_SERVER=oracle-erp               # the Server ID you registered
     export ORACLE_PO_TOOL=get_purchase_order          # tool names as shown in Tool Catalog
     export ORACLE_SUPPLIER_TOOL=get_supplier
@@ -1312,7 +1319,7 @@ SUPPLIER_FIELDS = ("Supplier", "SupplierNumber", "Status", "TaxpayerCountry")
 INVOICE_FIELDS = ("InvoiceNumber", "InvoiceAmount", "InvoiceCurrency", "TermsDate", "DueDate", "PaidStatus")
 
 client = AOMClient(
-    base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
+    base_url=os.environ["AOM_BASE_URL"],
     api_key=os.environ["AOM_API_KEY"],
     verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     agent_id="oracle-erp-procurement-agent",
@@ -1370,12 +1377,12 @@ def quote(value: str) -> str:
 
 def extract_po_number(question: str) -> str:
     # Cheap path first; fall back to the model only when there's no obvious number.
-    match = re.search(r"\\b\\d{5,}\\b", question)
+    match = re.search(r"\b\d{5,}\b", question)
     if match:
         return match.group(0)
     # LLM Cache, exact-match: the answer depends on literal text in the question.
     resp = client.complete(
-        f"Extract the purchase order number from this request. Reply with only the number, or NONE.\\n\\n{question}",
+        f"Extract the purchase order number from this request. Reply with only the number, or NONE.\n\n{question}",
         namespace=f"{NAMESPACE}:extract",
         semantic=False,
     )
@@ -1445,19 +1452,19 @@ def main(question: str) -> None:
             status = field(po, "Status", default="Unknown")
             status_note = explain_status(status)
 
-            invoice_lines = "\\n".join(
+            invoice_lines = "\n".join(
                 f"- {field(i, 'InvoiceNumber')}: {field(i, 'InvoiceAmount')} {field(i, 'InvoiceCurrency', default='')} "
                 f"due {field(i, 'TermsDate', 'DueDate', default='n/a')}"
                 for i in invoices
             ) or "none"
             # LLM Cache, exact-match only: the prompt carries live ERP records.
             final = client.complete(
-                f"Question: {question}\\n"
+                f"Question: {question}\n"
                 f"PO {po_number}: status {status}, total {field(po, 'Total')} {field(po, 'CurrencyCode', default='')}, "
-                f"buyer {field(po, 'Buyer')}, created {field(po, 'CreationDate')}.\\n"
-                f"Status meaning: {status_note}\\n"
-                f"Supplier: {supplier_name} (number {field(vendor, 'SupplierNumber', default='n/a')}).\\n"
-                f"Unpaid invoices from this supplier:\\n{invoice_lines}\\n"
+                f"buyer {field(po, 'Buyer')}, created {field(po, 'CreationDate')}.\n"
+                f"Status meaning: {status_note}\n"
+                f"Supplier: {supplier_name} (number {field(vendor, 'SupplierNumber', default='n/a')}).\n"
+                f"Unpaid invoices from this supplier:\n{invoice_lines}\n"
                 "Answer the question in 3-4 sentences.",
                 namespace=f"{NAMESPACE}:answer",
                 semantic=False,
@@ -1474,7 +1481,7 @@ def main(question: str) -> None:
             sys.exit(f"Rate limit or budget hit ({exc.limit}); retry in {exc.retry_after}s.")
 
         print(final["response"])
-        print(f"\\nLLM cache: {final['cache']['status']} | cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
+        print(f"\nLLM cache: {final['cache']['status']} | cost \${final['cost_usd']:.5f} | trace {run.trace_id}")
 
 
 if __name__ == "__main__":
