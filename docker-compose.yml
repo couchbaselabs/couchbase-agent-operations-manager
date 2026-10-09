@@ -332,7 +332,9 @@ services:
       # HTTP still exists inside the container (nginx.conf.template
       # redirects it to HTTPS); publish it too - e.g. add "80:80" here -
       # if you want that redirect reachable from the host as well.
-      - "443:443"
+      # Something else on this machine already on 443? Set UI_HTTPS_PORT
+      # (e.g. UI_HTTPS_PORT=8443 in .env) and browse to https://localhost:8443.
+      - "${UI_HTTPS_PORT:-443}:443"
     environment:
       OPERATIONS_MANAGER_UPSTREAM: operations-manager:8090
       # Must match operations-manager's own TLS state (see DISABLE_TLS
