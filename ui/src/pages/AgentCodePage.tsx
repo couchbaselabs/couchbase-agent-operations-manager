@@ -207,7 +207,7 @@ export function AgentCodePage() {
       </div>
 
       <div className="helper-banner helper-banner-neutral">
-        <div className="helper-banner-heading">The pattern every example follows</div>
+        <div className="helper-banner-heading">Agent Operations Manager - Agent Data Flow and Connections</div>
         Data-source reads go through <code>client.cached_context()</code> with a key and TTL matched to how fast that
         data changes, so a repeat lookup is a Couchbase KV get. Model calls go through <code>client.complete()</code>:
         semantic matching where paraphrases should share an answer (question → SQL), <code>semantic=False</code> where
