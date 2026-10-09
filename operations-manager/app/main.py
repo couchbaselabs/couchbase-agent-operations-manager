@@ -18,6 +18,7 @@ background monitor that re-scans the catalog on a timer - see
 app/hijack_detection.py).
 """
 import asyncio
+import datetime as _dt_mod
 import base64
 import binascii
 import concurrent.futures
@@ -42,6 +43,7 @@ from app import (
     approvals,
     catalog_ingest,
     context_cache,
+    data_dumps,
     embedding_models,
     evals,
     governance,
@@ -184,6 +186,13 @@ AGENT_PATH_PREFIXES = (
 
 
 KNOWLEDGE_INGEST_TIMEOUT_SECONDS = int(os.getenv("KNOWLEDGE_INGEST_TIMEOUT_SECONDS", "600"))
+# Data dumps (app/data_dumps.py): rows parsed per upload, before the
+# per-document chunk cap applies.
+KNOWLEDGE_MAX_DUMP_ROWS = int(os.getenv("KNOWLEDGE_MAX_DUMP_ROWS", "100000"))
+# Document expiry: how often expired documents are deleted. Retrieval hides
+# an expired chunk the moment it expires regardless; this only reclaims it.
+KNOWLEDGE_EXPIRY_SWEEP_SECONDS = int(os.getenv("KNOWLEDGE_EXPIRY_SWEEP_SECONDS", "300"))
+KNOWLEDGE_MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
 
 
 async def _with_deadline(request: Request, call_next, timeout: int):
@@ -758,6 +767,7 @@ async def couchbase_startup():
     await _startup_step("load imported embedding models", load_custom_embedding_models())
     await _startup_step("load knowledge sets", load_knowledge_sets())
     await _startup_step("load RAG applications", load_rag_apps())
+    spawn(knowledge_expiry_sweeper_loop())
 
     if EVAL_SEED_STARTER_DATASET:
         await _startup_step("seed starter eval dataset", seed_starter_dataset())
@@ -4785,6 +4795,19 @@ class KnowledgeIngestRequest(BaseModel):
     # Which knowledge set (and so which embedding model and index) this
     # document goes into. See app/knowledge_sets.py.
     set_id: str = "default"
+    # A warehouse table export instead of a document - see app/data_dumps.py.
+    # {"source": "snowflake"|"databricks"|"bigquery"|"other", "table_name",
+    #  "header": true|false|null (auto), "column_names": [...]}
+    dump: dict | None = None
+    # Expiry: either a lifetime from now or an absolute time; neither = never.
+    ttl_seconds: int | None = None
+    expires_at: str | None = None
+
+
+class KnowledgeExpiryRequest(BaseModel):
+    # Both empty clears the expiry.
+    ttl_seconds: int | None = None
+    expires_at: str | None = None
 
 
 class KnowledgeSearchRequest(BaseModel):
@@ -4816,6 +4839,10 @@ async def list_knowledge(request: Request):
         "chunk_overlap": KNOWLEDGE_CHUNK_OVERLAP,
         "max_upload_mb": KNOWLEDGE_MAX_UPLOAD_MB,
         "supported_extensions": list(knowledge.SUPPORTED_EXTENSIONS),
+        "dump_extensions": list(data_dumps.DUMP_EXTENSIONS),
+        "dump_sources": [{"id": k, "label": v} for k, v in data_dumps.SOURCES.items()],
+        "max_dump_rows": KNOWLEDGE_MAX_DUMP_ROWS,
+        "expiry_sweep_seconds": KNOWLEDGE_EXPIRY_SWEEP_SECONDS,
     }
 
 
@@ -4839,6 +4866,7 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
                    "indexed, embedded and permanently invisible.",
         )
     kset = get_knowledge_set(req.set_id)
+    expires_at = resolve_document_expiry(req.ttl_seconds, req.expires_at)
 
     if len(req.content.encode("utf-8")) > KNOWLEDGE_MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Document is larger than the {KNOWLEDGE_MAX_UPLOAD_MB}MB limit")
@@ -4853,18 +4881,66 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
     else:
         raise HTTPException(status_code=400, detail="encoding must be 'text' or 'base64'")
 
-    try:
-        # PDF parsing is CPU-bound and can take seconds on a large file -
-        # off the event loop, like embedding.
-        text, text_format = await asyncio.to_thread(knowledge.extract_text, raw, req.filename or req.title)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    dump_meta = None
+    if req.dump is not None:
+        # A warehouse export: parsed as a table and chunked by row, with the
+        # column header repeated in every chunk (see app/data_dumps.py).
+        source = str(req.dump.get("source") or "other").lower()
+        if source not in data_dumps.SOURCES:
+            raise HTTPException(status_code=400, detail=f"Unknown dump source '{source}'")
+        header = req.dump.get("header")
+        if header not in (True, False, None):
+            raise HTTPException(status_code=400, detail="dump.header must be true, false or null (auto-detect)")
+        column_names = req.dump.get("column_names") or []
+        if not isinstance(column_names, list):
+            raise HTTPException(status_code=400, detail="dump.column_names must be a list")
+        raw_bytes = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        try:
+            parsed = await asyncio.to_thread(
+                data_dumps.parse_dump, raw_bytes, req.filename or req.title,
+                header=header, column_names=[str(c) for c in column_names], max_rows=KNOWLEDGE_MAX_DUMP_ROWS,
+            )
+        except data_dumps.DumpError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        table_name = str(req.dump.get("table_name") or req.title or req.filename or "table").strip()[:200]
+        chunks, rows_indexed = data_dumps.chunk_table(
+            parsed, source=source, table_name=table_name,
+            chunk_chars=KNOWLEDGE_CHUNK_CHARS, max_chunks=knowledge.MAX_CHUNKS_PER_DOCUMENT,
+        )
+        text = "\n\n".join(chunks)
+        text_format = f"{parsed['format']} dump"
+        notes = list(parsed["notes"])
+        if rows_indexed < parsed["total_rows"]:
+            notes.append(
+                f"Indexed {rows_indexed:,} of {parsed['total_rows']:,} rows - the rest exceed this document's "
+                f"limit. Split the export, or filter it to the rows agents need."
+            )
+        dump_meta = {
+            "source": source,
+            "source_label": data_dumps.SOURCES[source],
+            "table_name": table_name,
+            "format": parsed["format"],
+            "files": parsed["files"],
+            "columns": parsed["columns"][:100],
+            "column_count": len(parsed["columns"]),
+            "total_rows": parsed["total_rows"],
+            "rows_indexed": rows_indexed,
+            "truncated": rows_indexed < parsed["total_rows"],
+            "notes": notes,
+        }
+    else:
+        try:
+            # PDF parsing is CPU-bound and can take seconds on a large file -
+            # off the event loop, like embedding.
+            text, text_format = await asyncio.to_thread(knowledge.extract_text, raw, req.filename or req.title)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    text = knowledge.normalize_text(text)
-    if not text:
-        raise HTTPException(status_code=400, detail="Nothing readable in that document once it was parsed")
+        text = knowledge.normalize_text(text)
+        if not text:
+            raise HTTPException(status_code=400, detail="Nothing readable in that document once it was parsed")
 
-    chunks = knowledge.chunk_text(text, KNOWLEDGE_CHUNK_CHARS, KNOWLEDGE_CHUNK_OVERLAP)
+        chunks = knowledge.chunk_text(text, KNOWLEDGE_CHUNK_CHARS, KNOWLEDGE_CHUNK_OVERLAP)
     if not chunks:
         raise HTTPException(status_code=400, detail="That document produced no chunks")
 
@@ -4890,6 +4966,10 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
             if kset["set_id"] != knowledge_sets.DEFAULT_SET_ID:
                 chunk_doc[kset["vector_field"]] = chunk_doc.pop("embedding")
                 chunk_doc["set_id"] = kset["set_id"]
+            if expires_at:
+                # On every chunk, so retrieval can hide an expired chunk on its
+                # own without a lookup of the parent document.
+                chunk_doc["expires_at"] = expires_at
             await store.upsert_knowledge_chunk(chunk_doc)
     except BaseException:
         # A failure or a request timeout part-way through would otherwise
@@ -4906,6 +4986,9 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
     )
     doc["set_id"] = kset["set_id"]
     doc["embedding_model"] = kset["model_id"]
+    doc["expires_at"] = expires_at
+    if dump_meta:
+        doc["dump"] = dump_meta
     await store.upsert_knowledge_document(doc)
     bump_knowledge_generation()
 
@@ -5674,7 +5757,13 @@ async def rag_query(
     if use_context_cache:
         cached = await context_get(ContextGetRequest(key=cache_key, namespace=namespace), inner, authorization)
         if cached.get("hit") and isinstance(cached.get("value"), list):
-            chunks, retrieval_status = cached["value"], "hit"
+            now = rag_apps.now_iso()
+            # A cached retrieval can outlive a document's expiry; if any of its
+            # chunks has expired, search again rather than serve it.
+            if all(not c.get("expires_at") or c["expires_at"] > now for c in cached["value"]):
+                chunks, retrieval_status = cached["value"], "hit"
+            else:
+                retrieval_status = "miss"
         else:
             retrieval_status = "miss"
 
@@ -6068,3 +6157,81 @@ async def delete_imported_embedding_model(model_id: str, request: Request):
     embedding_models.unload_local(model.get("source") or model_id)
     await save_custom_embedding_models()
     return {"deleted": True, "model_id": model_id}
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base document expiry
+# ---------------------------------------------------------------------------
+def resolve_document_expiry(ttl_seconds: int | None, expires_at: str | None) -> str | None:
+    """Turn a lifetime or an absolute time into the stored ISO-8601 UTC
+    expiry, or None for "never". Raises 400 for anything in the past or
+    unreasonably far out."""
+    if ttl_seconds is not None and expires_at:
+        raise HTTPException(status_code=400, detail="Give ttl_seconds or expires_at, not both")
+    now = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+    if ttl_seconds is not None:
+        if ttl_seconds < 60 or ttl_seconds > KNOWLEDGE_MAX_TTL_SECONDS:
+            raise HTTPException(status_code=400, detail="ttl_seconds must be between 60 and 10 years")
+        when = now + _dt_mod.timedelta(seconds=int(ttl_seconds))
+    elif expires_at:
+        try:
+            when = _dt_mod.datetime.fromisoformat(str(expires_at).strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="expires_at must be an ISO-8601 date or time") from exc
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt_mod.timezone.utc)
+        if when <= now:
+            raise HTTPException(status_code=400, detail="expires_at must be in the future")
+        if (when - now).total_seconds() > KNOWLEDGE_MAX_TTL_SECONDS:
+            raise HTTPException(status_code=400, detail="expires_at is more than 10 years out")
+    else:
+        return None
+    return when.astimezone(_dt_mod.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@app.put("/v1/knowledge/{document_id}/expiry")
+async def set_knowledge_expiry(document_id: str, req: KnowledgeExpiryRequest, request: Request):
+    """Set, change or clear one document's expiry. Rewrites the field on the
+    document and every chunk, so retrieval sees the new time immediately."""
+    user = require_admin(request)
+    doc = await store.get_knowledge_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No such document")
+    expires_at = resolve_document_expiry(req.ttl_seconds, req.expires_at)
+    updated = await store.update_knowledge_expiry(document_id, expires_at)
+    bump_knowledge_generation()
+    await store.log_access(
+        action="knowledge_expiry", role=user.get("role"), subject_label=user.get("username"),
+        query=None, tool_id=None, server_id=None, decision="ALLOW",
+        reason=f"'{document_id}' expiry {'set to ' + expires_at if expires_at else 'cleared'} ({updated} record(s))",
+        latency_ms=0,
+    )
+    doc["expires_at"] = expires_at
+    return {"document": doc}
+
+
+async def sweep_expired_knowledge() -> list[str]:
+    now = rag_apps.now_iso()
+    expired = await store.list_expired_knowledge_documents(now)
+    for document_id in expired:
+        removed = await store.delete_knowledge_document(document_id)
+        await store.log_access(
+            action="knowledge_expire", role="system", subject_label="knowledge-expiry",
+            query=None, tool_id=None, server_id=None, decision="DENY",
+            reason=f"document '{document_id}' expired and was deleted ({removed} record(s))", latency_ms=0,
+        )
+    if expired:
+        bump_knowledge_generation()
+        logger.info("Knowledge expiry: deleted %d expired document(s)", len(expired))
+    return expired
+
+
+async def knowledge_expiry_sweeper_loop():
+    while True:
+        await asyncio.sleep(max(30, KNOWLEDGE_EXPIRY_SWEEP_SECONDS))
+        if not store.connected:
+            continue
+        try:
+            await sweep_expired_knowledge()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Knowledge expiry sweep failed: %s", exc)

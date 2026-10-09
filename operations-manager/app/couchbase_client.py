@@ -2594,6 +2594,49 @@ class CouchbaseStore:
             logger.warning("delete_knowledge_document(%s) failed: %s", document_id, exc)
             return 0
 
+    async def update_knowledge_expiry(self, document_id: str, expires_at: str | None) -> int:
+        """Set (or clear, with None) `expires_at` on a document and all of its
+        chunks. Returns the number of records changed."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["knowledge_collection"]
+        if expires_at:
+            q = (f"UPDATE `{bucket}`.`{scope}`.`{coll}` k SET k.expires_at = $expires_at "
+                 f"WHERE k.document_id = $document_id RETURNING META(k).id")
+            params = {"document_id": document_id, "expires_at": expires_at}
+        else:
+            q = (f"UPDATE `{bucket}`.`{scope}`.`{coll}` k UNSET k.expires_at "
+                 f"WHERE k.document_id = $document_id RETURNING META(k).id")
+            params = {"document_id": document_id}
+
+        def _run():
+            return len(list(self.cluster.query(q, QueryOptions(named_parameters=params, metrics=False)).rows()))
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("update_knowledge_expiry(%s) failed: %s", document_id, exc)
+            return 0
+
+    async def list_expired_knowledge_documents(self, now_iso: str, limit: int = 500) -> list[str]:
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["knowledge_collection"]
+
+        def _run():
+            q = (
+                f"SELECT RAW d.document_id FROM `{bucket}`.`{scope}`.`{coll}` d "
+                f'WHERE d.doc_type = "knowledge_document" AND d.expires_at IS VALUED '
+                f"AND d.expires_at <= $now LIMIT $limit"
+            )
+            return list(self.cluster.query(
+                q, QueryOptions(named_parameters={"now": now_iso, "limit": limit}, metrics=False)
+            ).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_expired_knowledge_documents failed: %s", exc)
+            return []
+
     async def count_knowledge_chunks(self) -> int:
         return await self._count_where(COUCHBASE_CONFIG["knowledge_collection"], "knowledge_chunk")
 
@@ -2638,9 +2681,14 @@ class CouchbaseStore:
             return []
 
         results = []
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         for row in rows:
             chunk = await asyncio.to_thread(self._get_knowledge_chunk_sync, row["id"])
             if not chunk:
+                continue
+            # Expired but not yet swept: never returned, however well it
+            # matches - the sweeper only reclaims the storage.
+            if chunk.get("expires_at") and chunk["expires_at"] <= now_iso:
                 continue
             # Re-check the role against the stored document rather than
             # trusting the index row. The pre-filter is the fast path; this
@@ -2656,6 +2704,7 @@ class CouchbaseStore:
                 "content": chunk.get("content"),
                 "score": row.get("score"),
                 "set_id": chunk.get("set_id") or "default",
+                "expires_at": chunk.get("expires_at"),
             })
         return results
 

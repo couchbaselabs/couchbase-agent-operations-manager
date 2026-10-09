@@ -932,6 +932,22 @@ export interface KnowledgeDocument {
   updated_at: string;
   set_id?: string;
   embedding_model?: string;
+  expires_at?: string | null;
+  dump?: KnowledgeDumpInfo;
+}
+
+export interface KnowledgeDumpInfo {
+  source: string;
+  source_label: string;
+  table_name: string;
+  format: string;
+  files: number;
+  columns: string[];
+  column_count: number;
+  total_rows: number;
+  rows_indexed: number;
+  truncated: boolean;
+  notes: string[];
 }
 
 export interface EmbeddingModelOption {
@@ -985,6 +1001,10 @@ export interface KnowledgeResponse {
   chunk_overlap: number;
   max_upload_mb: number;
   supported_extensions: string[];
+  dump_extensions: string[];
+  dump_sources: Array<{ id: string; label: string }>;
+  max_dump_rows: number;
+  expiry_sweep_seconds: number;
 }
 
 export interface KnowledgeChunkResult {

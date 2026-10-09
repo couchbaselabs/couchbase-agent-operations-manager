@@ -19,3 +19,7 @@ cryptography==50.0.2
 # Optional at runtime: knowledge-base PDF extraction degrades to a clear
 # error when it is missing, rather than indexing an empty document.
 pypdf==6.19.0
+# Knowledge Base data dumps (app/data_dumps.py): Parquet exports from
+# Databricks/Spark, BigQuery and Snowflake, and BigQuery Avro exports.
+pyarrow==26.0.0
+fastavro==1.13.1

@@ -3,6 +3,66 @@ import { api } from "../api/client";
 import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeResponse } from "../api/types";
 
 const NEW_SET = "__new__";
+
+// Expiry choices for a new document, and for changing one later.
+const EXPIRY_OPTIONS: Array<{ value: string; label: string; seconds?: number }> = [
+  { value: "never", label: "Never" },
+  { value: "1d", label: "1 day", seconds: 86400 },
+  { value: "7d", label: "7 days", seconds: 7 * 86400 },
+  { value: "30d", label: "30 days", seconds: 30 * 86400 },
+  { value: "90d", label: "90 days", seconds: 90 * 86400 },
+  { value: "365d", label: "1 year", seconds: 365 * 86400 },
+  { value: "date", label: "On a date..." },
+];
+
+// How to produce a file this page can read, per warehouse. Shown next to
+// the dump upload so nobody has to look up export syntax mid-task.
+const EXPORT_HELP: Record<string, { title: string; code: string; note: string }> = {
+  snowflake: {
+    title: "Export from Snowflake",
+    code: `COPY INTO @~/orders_export/
+  FROM sales.public.orders
+  FILE_FORMAT = (TYPE = CSV COMPRESSION = GZIP FIELD_OPTIONALLY_ENCLOSED_BY = '"')
+  HEADER = TRUE;
+-- then, from SnowSQL:
+GET @~/orders_export/ file:///tmp/orders_export/;`,
+    note: "Upload the .csv.gz (or zip several unload files together). Without HEADER = TRUE there's no header row - set Header row to No and list the columns. TYPE = PARQUET works too.",
+  },
+  databricks: {
+    title: "Export from Databricks",
+    code: `(spark.table("main.sales.orders")
+   .coalesce(1)
+   .write.mode("overwrite")
+   .parquet("/Volumes/main/default/exports/orders"))`,
+    note: "Download the part-*.parquet file, or zip the whole output folder - _SUCCESS and .crc files are skipped. Use .option('header', True).csv(...) for CSV. Don't zip a Delta table folder: its data files can include removed rows.",
+  },
+  bigquery: {
+    title: "Export from BigQuery",
+    code: `EXPORT DATA OPTIONS (
+  uri = 'gs://my-bucket/orders/*.parquet',
+  format = 'PARQUET',
+  overwrite = true
+) AS SELECT * FROM shop.orders;
+-- or, from a shell:
+-- bq extract --destination_format=NEWLINE_DELIMITED_JSON --compression=GZIP shop.orders gs://my-bucket/orders-*.json.gz`,
+    note: "Download the files from Cloud Storage; zip multiple shards together. Parquet, Avro, newline-delimited JSON and CSV (gzip or not) are all accepted.",
+  },
+  other: {
+    title: "Other sources",
+    code: "",
+    note: "Any CSV/TSV, newline-delimited JSON, Parquet or Avro export works - gzip-compressed or zipped.",
+  },
+};
+
+function expiryLabel(expiresAt?: string | null) {
+  if (!expiresAt) return "Never";
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return "Expired - deleting";
+  const days = ms / 86400000;
+  const when = expiresAt.replace("T", " ").replace(":00Z", " UTC");
+  if (days < 1) return `in ${Math.max(1, Math.round(ms / 3600000))}h · ${when}`;
+  return `in ${Math.round(days)}d · ${when}`;
+}
 const IMPORT_MODEL = "__import__";
 
 function modelOptionLabel(m: EmbeddingModelOption) {
@@ -59,6 +119,13 @@ export function KnowledgePage() {
   const [allowedRoles, setAllowedRoles] = useState<string[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [pastedText, setPastedText] = useState("");
+  const [addMode, setAddMode] = useState<"document" | "dump">("document");
+  const [dumpSource, setDumpSource] = useState("snowflake");
+  const [tableName, setTableName] = useState("");
+  const [headerMode, setHeaderMode] = useState<"auto" | "yes" | "no">("auto");
+  const [columnNames, setColumnNames] = useState("");
+  const [expiryChoice, setExpiryChoice] = useState("never");
+  const [expiryDate, setExpiryDate] = useState("");
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
@@ -149,6 +216,51 @@ export function KnowledgePage() {
       let encoding: "text" | "base64" = "text";
       let filename = "";
 
+      const expiryOpt = EXPIRY_OPTIONS.find((o) => o.value === expiryChoice);
+      const expiry: { ttl_seconds?: number; expires_at?: string } =
+        expiryChoice === "date" ? { expires_at: expiryDate } : expiryOpt?.seconds ? { ttl_seconds: expiryOpt.seconds } : {};
+      if (expiryChoice === "date" && !expiryDate) throw new Error("Pick the date this document expires");
+
+      if (addMode === "dump") {
+        if (!file) throw new Error("Pick the export file to import");
+        // Always sent as bytes: dumps are often gzip, zip, Parquet or Avro.
+        const res = await api.ingestKnowledge({
+          title: title || tableName || file.name,
+          content: await readAsBase64(file),
+          encoding: "base64",
+          filename: file.name,
+          source: file.name,
+          allowed_roles: allowedRoles,
+          set_id: setId,
+          ...expiry,
+          dump: {
+            source: dumpSource,
+            table_name: tableName || undefined,
+            header: headerMode === "auto" ? null : headerMode === "yes",
+            column_names:
+              headerMode === "no" && columnNames.trim()
+                ? columnNames.split(",").map((c) => c.trim()).filter(Boolean)
+                : undefined,
+          },
+        });
+        const dump = res.document.dump;
+        setNotice(
+          `Imported ${dump?.source_label} table "${dump?.table_name}" - ${dump?.rows_indexed.toLocaleString()} of ` +
+            `${dump?.total_rows.toLocaleString()} row(s) across ${dump?.column_count} column(s) into ` +
+            `${res.document.chunk_count} chunk(s)` +
+            (res.document.expires_at ? `, expiring ${res.document.expires_at.replace("T", " ").replace("Z", " UTC")}` : "") +
+            "." +
+            (dump?.notes?.length ? " " + dump.notes.join(" ") : "")
+        );
+        setTitle("");
+        setTableName("");
+        setColumnNames("");
+        setFile(null);
+        if (fileInput.current) fileInput.current.value = "";
+        await load();
+        return;
+      }
+
       if (file) {
         filename = file.name;
         if (isTextFile(file.name)) {
@@ -172,6 +284,7 @@ export function KnowledgePage() {
         source: file ? file.name : "pasted",
         allowed_roles: allowedRoles,
         set_id: setId,
+        ...expiry,
       });
       setNotice(
         `Ingested "${res.document.title}" - ${res.document.chunk_count} chunk(s) from ` +
@@ -187,6 +300,28 @@ export function KnowledgePage() {
       setError(e.message || "Ingestion failed");
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function handleChangeExpiry(documentId: string, choice: string) {
+    const opt = EXPIRY_OPTIONS.find((o) => o.value === choice);
+    let expiry: { ttl_seconds?: number; expires_at?: string } = {};
+    if (choice === "date") {
+      const date = prompt("Expire on which date? (YYYY-MM-DD, UTC)");
+      if (!date) return;
+      expiry = { expires_at: date };
+    } else if (opt?.seconds) {
+      expiry = { ttl_seconds: opt.seconds };
+    }
+    setBusyId(`exp:${documentId}`);
+    setError(null);
+    try {
+      await api.setKnowledgeExpiry(documentId, expiry);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not change the expiry");
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -609,35 +744,175 @@ export function KnowledgePage() {
               </div>
             )}
 
-            <div className="two-col">
-              <div className="field">
-                <label>Title</label>
-                <input
-                  type="text"
-                  value={title}
-                  placeholder="e.g. Refund policy 2026"
-                  onChange={(e) => setTitle(e.target.value)}
-                />
-                <div className="field-hint">Rides along with every chunk, so a chunk that never repeats the subject is still findable by it.</div>
-              </div>
-              <div className="field">
-                <label>File</label>
-                <input
-                  ref={fileInput}
-                  type="file"
-                  accept={data.supported_extensions.join(",")}
-                  onChange={(e) => setFile(e.target.files?.[0] || null)}
-                />
-                <div className="field-hint">Or leave this empty and paste text below.</div>
+            <div className="field">
+              <label>What are you adding?</label>
+              <div className="flex-row" style={{ gap: 18 }}>
+                <div className="checkbox-row" style={{ margin: 0 }}>
+                  <input
+                    type="radio"
+                    id="mode-doc"
+                    checked={addMode === "document"}
+                    onChange={() => {
+                      setAddMode("document");
+                      setFile(null);
+                      if (fileInput.current) fileInput.current.value = "";
+                    }}
+                  />
+                  <label htmlFor="mode-doc" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                    A document (text, Markdown, PDF, HTML...)
+                  </label>
+                </div>
+                <div className="checkbox-row" style={{ margin: 0 }}>
+                  <input
+                    type="radio"
+                    id="mode-dump"
+                    checked={addMode === "dump"}
+                    onChange={() => {
+                      setAddMode("dump");
+                      setFile(null);
+                      if (fileInput.current) fileInput.current.value = "";
+                    }}
+                  />
+                  <label htmlFor="mode-dump" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                    A data dump (Snowflake, Databricks or BigQuery table export)
+                  </label>
+                </div>
               </div>
             </div>
 
-            {!file && (
-              <div className="field">
-                <label>Or paste text</label>
-                <textarea rows={5} value={pastedText} onChange={(e) => setPastedText(e.target.value)} />
-              </div>
+            {addMode === "dump" ? (
+              <>
+                <div className="two-col">
+                  <div className="field">
+                    <label>Source</label>
+                    <select value={dumpSource} onChange={(e) => setDumpSource(e.target.value)}>
+                      {data.dump_sources.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>Export file</label>
+                    <input
+                      ref={fileInput}
+                      type="file"
+                      accept={data.dump_extensions.join(",")}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] || null;
+                        setFile(f);
+                        if (f && !tableName) setTableName(f.name.replace(/(\.(gz|zip|csv|tsv|json|jsonl|ndjson|parquet|avro|snappy))+$/i, ""));
+                      }}
+                    />
+                    <div className="field-hint">
+                      CSV/TSV, newline-delimited JSON, Parquet or Avro - gzip-compressed, or several files zipped
+                      together. Up to {data.max_upload_mb} MB and {data.max_dump_rows.toLocaleString()} rows.
+                    </div>
+                  </div>
+                </div>
+                <div className="two-col">
+                  <div className="field">
+                    <label>Table name</label>
+                    <input
+                      type="text"
+                      value={tableName}
+                      placeholder="e.g. SALES.PUBLIC.ORDERS"
+                      onChange={(e) => setTableName(e.target.value)}
+                    />
+                    <div className="field-hint">Repeated in every chunk, so a retrieved row always says what table it came from.</div>
+                  </div>
+                  <div className="field">
+                    <label>Header row (CSV/TSV)</label>
+                    <select value={headerMode} onChange={(e) => setHeaderMode(e.target.value as "auto" | "yes" | "no")}>
+                      <option value="auto">Auto-detect</option>
+                      <option value="yes">First row is the header</option>
+                      <option value="no">No header row</option>
+                    </select>
+                    {headerMode === "no" && (
+                      <input
+                        type="text"
+                        style={{ marginTop: 8 }}
+                        value={columnNames}
+                        placeholder="Column names, comma-separated (optional)"
+                        onChange={(e) => setColumnNames(e.target.value)}
+                      />
+                    )}
+                    <div className="field-hint">
+                      Ignored for JSON, Parquet and Avro, which carry their own column names.
+                    </div>
+                  </div>
+                </div>
+                {EXPORT_HELP[dumpSource] && (
+                  <details className="export-help">
+                    <summary>{EXPORT_HELP[dumpSource].title}</summary>
+                    {EXPORT_HELP[dumpSource].code && (
+                      <pre className="json-block agent-code-block" style={{ margin: "8px 0" }}>
+                        {EXPORT_HELP[dumpSource].code}
+                      </pre>
+                    )}
+                    <div className="field-hint">{EXPORT_HELP[dumpSource].note}</div>
+                  </details>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="two-col">
+                  <div className="field">
+                    <label>Title</label>
+                    <input
+                      type="text"
+                      value={title}
+                      placeholder="e.g. Refund policy 2026"
+                      onChange={(e) => setTitle(e.target.value)}
+                    />
+                    <div className="field-hint">Rides along with every chunk, so a chunk that never repeats the subject is still findable by it.</div>
+                  </div>
+                  <div className="field">
+                    <label>File</label>
+                    <input
+                      ref={fileInput}
+                      type="file"
+                      accept={data.supported_extensions.join(",")}
+                      onChange={(e) => setFile(e.target.files?.[0] || null)}
+                    />
+                    <div className="field-hint">Or leave this empty and paste text below.</div>
+                  </div>
+                </div>
+
+                {!file && (
+                  <div className="field">
+                    <label>Or paste text</label>
+                    <textarea rows={5} value={pastedText} onChange={(e) => setPastedText(e.target.value)} />
+                  </div>
+                )}
+              </>
             )}
+
+            <div className="two-col">
+              <div className="field">
+                <label>Expires</label>
+                <select value={expiryChoice} onChange={(e) => setExpiryChoice(e.target.value)}>
+                  {EXPIRY_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.value === "never" ? "Never (keep until deleted)" : o.label}
+                    </option>
+                  ))}
+                </select>
+                {expiryChoice === "date" && (
+                  <input
+                    type="date"
+                    style={{ marginTop: 8 }}
+                    value={expiryDate}
+                    onChange={(e) => setExpiryDate(e.target.value)}
+                  />
+                )}
+                <div className="field-hint">
+                  An expired document stops being retrieved the moment it expires (RAG answers included) and is
+                  deleted within {Math.round(data.expiry_sweep_seconds / 60)} minutes. Change it any time below.
+                </div>
+              </div>
+            </div>
 
             <div className="field">
               <label>Which roles may retrieve this</label>
@@ -663,9 +938,15 @@ export function KnowledgePage() {
             <button
               className="btn btn-primary"
               type="submit"
-              disabled={uploading || allowedRoles.length === 0 || setId === NEW_SET}
+              disabled={uploading || allowedRoles.length === 0 || setId === NEW_SET || (addMode === "dump" && !file)}
             >
-              {uploading ? "Chunking and embedding..." : "Ingest document"}
+              {uploading
+                ? addMode === "dump"
+                  ? "Parsing rows and embedding..."
+                  : "Chunking and embedding..."
+                : addMode === "dump"
+                  ? "Import data dump"
+                  : "Ingest document"}
             </button>
           </form>
 
@@ -887,6 +1168,7 @@ export function KnowledgePage() {
                       <th style={{ textAlign: "right" }}>Chunks</th>
                       <th style={{ textAlign: "right" }}>Characters</th>
                       <th>Added</th>
+                      <th>Expires</th>
                       <th></th>
                     </tr>
                   </thead>
@@ -896,6 +1178,13 @@ export function KnowledgePage() {
                         <td>
                           <div style={{ fontWeight: 600 }}>{d.title}</div>
                           <div className="cell-muted cell-mono" style={{ fontSize: 12 }}>{d.source}</div>
+                          {d.dump && (
+                            <div className="cell-muted" style={{ fontSize: 12 }}>
+                              {d.dump.source_label} dump · {d.dump.table_name} · {d.dump.rows_indexed.toLocaleString()}
+                              {d.dump.truncated ? ` of ${d.dump.total_rows.toLocaleString()}` : ""} rows ·{" "}
+                              {d.dump.column_count} columns
+                            </div>
+                          )}
                         </td>
                         <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>
                           {data.sets.find((s) => s.set_id === (d.set_id || "default"))?.name || d.set_id || "default"}
@@ -908,6 +1197,22 @@ export function KnowledgePage() {
                         </td>
                         <td className="cell-muted cell-mono">
                           {d.created_at?.replace("T", " ").replace("Z", "")}
+                        </td>
+                        <td className="cell-muted" style={{ fontSize: 12, minWidth: 150 }}>
+                          <div>{expiryLabel(d.expires_at)}</div>
+                          <select
+                            className="expiry-select"
+                            value=""
+                            disabled={busyId === `exp:${d.document_id}`}
+                            onChange={(e) => e.target.value && handleChangeExpiry(d.document_id, e.target.value)}
+                          >
+                            <option value="">Change...</option>
+                            {EXPIRY_OPTIONS.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.value === "never" ? "Never expire" : o.value === "date" ? "On a date..." : `In ${o.label}`}
+                              </option>
+                            ))}
+                          </select>
                         </td>
                         <td>
                           <button

@@ -1127,3 +1127,25 @@ table.data-table {
   margin-bottom: 14px;
   background: var(--card-bg);
 }
+
+/* -------------------------------------------- data dumps + expiry (Knowledge Base) */
+.export-help {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin-bottom: 14px;
+  background: var(--card-bg-alt);
+}
+
+.export-help summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.expiry-select {
+  margin-top: 4px;
+  font-size: 12px;
+  padding: 2px 6px;
+  height: auto;
+}

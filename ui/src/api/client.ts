@@ -404,6 +404,9 @@ export const api = {
     allowed_roles: string[];
     metadata?: Record<string, string>;
     set_id?: string;
+    ttl_seconds?: number;
+    expires_at?: string;
+    dump?: { source: string; table_name?: string; header?: boolean | null; column_names?: string[] };
   }) =>
     request<{ document: KnowledgeDocument }>("/v1/knowledge", {
       method: "POST",
@@ -433,6 +436,11 @@ export const api = {
   deleteKnowledgeSet: (setId: string) =>
     request<{ deleted: boolean; set_id: string }>(`/v1/knowledge/sets/${encodeURIComponent(setId)}`, {
       method: "DELETE",
+    }),
+  setKnowledgeExpiry: (documentId: string, expiry: { ttl_seconds?: number; expires_at?: string }) =>
+    request<{ document: KnowledgeDocument }>(`/v1/knowledge/${encodeURIComponent(documentId)}/expiry`, {
+      method: "PUT",
+      body: JSON.stringify(expiry),
     }),
   deleteKnowledge: (documentId: string) =>
     request<{ deleted: boolean; document_id: string; documents_removed: number }>(

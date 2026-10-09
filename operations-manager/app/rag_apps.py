@@ -213,6 +213,7 @@ def select_chunks(app: dict, results: list[dict]) -> list[dict]:
             "chunk_index": r.get("chunk_index"),
             "content": r.get("content"),
             "score": score,
+            "expires_at": r.get("expires_at"),
         })
         if len(chosen) >= int(app.get("top_k") or 5):
             break
