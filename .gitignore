@@ -1,0 +1,21 @@
+# Machine-specific corporate proxy root CA(s) exported by
+# scripts/setup-corporate-ca.sh into each Docker build context. Never commit
+# these: they are your organization's trust anchors, not part of the product.
+certs/*.crt
+certs/*.pem
+*/certs/*.crt
+*/certs/*.pem
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Build output and dependencies
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# OS noise
+.DS_Store
