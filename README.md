@@ -151,6 +151,7 @@ every request.
 cp .env.example .env
 # optional: add ANTHROPIC_API_KEY, OPENAI_API_KEY and/or GEMINI_API_KEY to .env
 # (without them, LLM caching answers misses from a labelled stub - see below)
+./scripts/setup-corporate-ca.sh
 docker compose up --build
 ```
 
