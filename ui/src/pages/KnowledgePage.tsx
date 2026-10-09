@@ -1,6 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { KnowledgeChunkResult, KnowledgeResponse } from "../api/types";
+import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeResponse } from "../api/types";
+
+const NEW_SET = "__new__";
+const IMPORT_MODEL = "__import__";
+
+function modelOptionLabel(m: EmbeddingModelOption) {
+  if (m.custom && m.status !== "ready") {
+    return `${m.label} · ${m.status === "pending" ? "downloading and verifying..." : "failed verification"}`;
+  }
+  const bits = [`${m.dims} dims`];
+  if (m.size) bits.push(m.size);
+  if (m.multilingual) bits.push("multilingual");
+  return `${m.label} · ${bits.join(" · ")}${m.is_default ? " · AOM default" : ""}${
+    m.available ? "" : ` · needs ${m.requires}`
+  }`;
+}
 
 const API_KEY_STORAGE_KEY = "aom.knowledge.api-key";
 
@@ -47,6 +62,24 @@ export function KnowledgePage() {
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
+  const [models, setModels] = useState<EmbeddingModelOption[]>([]);
+  const [setId, setSetId] = useState("");
+  const [newSetName, setNewSetName] = useState("");
+  const [newSetModel, setNewSetModel] = useState("");
+  const [newSetDescription, setNewSetDescription] = useState("");
+  const [creatingSet, setCreatingSet] = useState(false);
+  const [searchSetId, setSearchSetId] = useState("default");
+
+  const [importKind, setImportKind] = useState<"huggingface" | "openai_compatible">("huggingface");
+  const [importName, setImportName] = useState("");
+  const [importLabel, setImportLabel] = useState("");
+  const [importBaseUrl, setImportBaseUrl] = useState("");
+  const [importApiKey, setImportApiKey] = useState("");
+  const [importQueryPrefix, setImportQueryPrefix] = useState("");
+  const [importDocPrefix, setImportDocPrefix] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [awaitingModel, setAwaitingModel] = useState<string | null>(null);
+
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE_KEY) || "");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<KnowledgeChunkResult[] | null>(null);
@@ -56,7 +89,10 @@ export function KnowledgePage() {
   const load = useCallback(async () => {
     setError(null);
     try {
-      setData(await api.knowledge());
+      const [kb, catalog] = await Promise.all([api.knowledge(), api.embeddingModels().catch(() => null)]);
+      setData(kb);
+      if (catalog) setModels(catalog.models);
+      setSetId((current) => (current && current !== NEW_SET ? current : current || kb.default_set_id));
     } catch (e: any) {
       setError(e.message || "Failed to load the knowledge base");
     }
@@ -65,6 +101,31 @@ export function KnowledgePage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // An imported Hugging Face model downloads and verifies in the background;
+  // poll until it's ready (or failed), then select it for the new set.
+  const pendingImports = models.some((m) => m.custom && m.status === "pending");
+  useEffect(() => {
+    if (!pendingImports) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const catalog = await api.embeddingModels();
+        setModels(catalog.models);
+        const waited = awaitingModel && catalog.models.find((m) => m.id === awaitingModel);
+        if (waited && waited.status === "ready") {
+          setNewSetModel(waited.id);
+          setNotice(`Imported model "${waited.label}" is ready (${waited.dims} dimensions).`);
+          setAwaitingModel(null);
+        } else if (waited && waited.status === "error") {
+          setError(`Imported model "${waited.label}" failed verification: ${waited.error}`);
+          setAwaitingModel(null);
+        }
+      } catch {
+        // Next tick tries again.
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [pendingImports, awaitingModel]);
 
   useEffect(() => {
     try {
@@ -110,10 +171,12 @@ export function KnowledgePage() {
         filename,
         source: file ? file.name : "pasted",
         allowed_roles: allowedRoles,
+        set_id: setId,
       });
       setNotice(
         `Ingested "${res.document.title}" - ${res.document.chunk_count} chunk(s) from ` +
-          `${res.document.char_count.toLocaleString()} characters, readable by ${res.document.allowed_roles.join(", ")}.`
+          `${res.document.char_count.toLocaleString()} characters, readable by ${res.document.allowed_roles.join(", ")}, ` +
+          `embedded with ${res.document.embedding_model} into set "${res.document.set_id}".`
       );
       setTitle("");
       setPastedText("");
@@ -141,13 +204,114 @@ export function KnowledgePage() {
     }
   }
 
+  async function handleCreateSet() {
+    setCreatingSet(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.createKnowledgeSet({
+        name: newSetName,
+        model_id: newSetModel,
+        description: newSetDescription,
+      });
+      const local = res.set.provider === "local";
+      setNotice(
+        `Created knowledge set "${res.set.name}" on ${res.set.model_label} (${res.set.dims} dimensions) with its own ` +
+          `vector index.` +
+          (local && !models.find((m) => m.id === res.set.model_id)?.is_default
+            ? " The model is downloading in the background - the first upload may wait for it to finish."
+            : "")
+      );
+      setNewSetName("");
+      setNewSetModel("");
+      setNewSetDescription("");
+      setSetId(res.set.set_id);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not create the knowledge set");
+    } finally {
+      setCreatingSet(false);
+    }
+  }
+
+  async function handleImportModel() {
+    setImporting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.importEmbeddingModel({
+        kind: importKind,
+        model_name: importName,
+        label: importLabel,
+        base_url: importKind === "openai_compatible" ? importBaseUrl : undefined,
+        api_key: importKind === "openai_compatible" && importApiKey ? importApiKey : undefined,
+        query_prefix: importQueryPrefix,
+        doc_prefix: importDocPrefix,
+      });
+      const catalog = await api.embeddingModels();
+      setModels(catalog.models);
+      if (res.model.status === "ready") {
+        setNewSetModel(res.model.id);
+        setNotice(`Imported "${res.model.label}" (${res.model.dims} dimensions) - it's selected for the new set.`);
+      } else {
+        setNewSetModel("");
+        setAwaitingModel(res.model.id);
+        setNotice(
+          `Importing "${res.model.label}" - AOM is downloading it and measuring its dimensions. ` +
+            "It'll be selected here automatically when it's ready; large models can take a few minutes."
+        );
+      }
+      setImportName("");
+      setImportLabel("");
+      setImportBaseUrl("");
+      setImportApiKey("");
+      setImportQueryPrefix("");
+      setImportDocPrefix("");
+    } catch (e: any) {
+      setError(e.message || "Import failed");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function handleDeleteModel(id: string, label: string) {
+    if (!confirm(`Remove the imported model "${label}"?`)) return;
+    setBusyId(`model:${id}`);
+    setError(null);
+    try {
+      await api.deleteEmbeddingModel(id);
+      if (newSetModel === id) setNewSetModel("");
+      setModels((await api.embeddingModels()).models);
+    } catch (e: any) {
+      setError(e.message || "Remove failed");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleDeleteSet(id: string, name: string) {
+    if (!confirm(`Delete the empty knowledge set "${name}" and its vector index?`)) return;
+    setBusyId(`set:${id}`);
+    setError(null);
+    try {
+      await api.deleteKnowledgeSet(id);
+      if (setId === id) setSetId(data?.default_set_id || "default");
+      if (searchSetId === id) setSearchSetId("default");
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Delete failed");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
     setSearching(true);
     setError(null);
     setResults(null);
     try {
-      const res = await api.searchKnowledge(apiKey, query, 5);
+      const res = await api.searchKnowledge(apiKey, query, 5, searchSetId);
       setResults(res.results);
       setSearchRole(res.role);
     } catch (e: any) {
@@ -211,6 +375,242 @@ export function KnowledgePage() {
           <form className="panel section-gap" onSubmit={handleUpload} style={{ marginBottom: 24 }}>
             <div className="two-col">
               <div className="field">
+                <label>Knowledge set</label>
+                <select value={setId} onChange={(e) => setSetId(e.target.value)}>
+                  {data.sets.map((s) => (
+                    <option key={s.set_id} value={s.set_id}>
+                      {s.name} - {s.model_label} ({s.dims} dims)
+                    </option>
+                  ))}
+                  <option value={NEW_SET}>+ Create a new knowledge set with a different embedding model...</option>
+                </select>
+                <div className="field-hint">
+                  A set fixes the embedding model: every document in it is embedded with that model and searched
+                  through the set&rsquo;s own vector index, because vectors from different models can&rsquo;t be
+                  compared.
+                </div>
+              </div>
+              <div className="field">
+                <label>Embedding model</label>
+                {setId === NEW_SET ? (
+                  <div className="field-hint" style={{ marginTop: 8 }}>Choose one for the new set below.</div>
+                ) : (
+                  (() => {
+                    const current = data.sets.find((s) => s.set_id === setId);
+                    const model = models.find((m) => m.id === current?.model_id);
+                    return current ? (
+                      <div className="set-model-summary">
+                        <div style={{ fontWeight: 600 }}>{current.model_label}</div>
+                        <div className="cell-muted" style={{ fontSize: 12.5 }}>
+                          {current.provider_label} · {current.dims} dimensions
+                          {model?.size ? ` · ${model.size}` : ""} · {current.document_count} document(s)
+                        </div>
+                        {model?.notes && (
+                          <div className="cell-muted" style={{ fontSize: 12.5 }}>
+                            {model.notes}
+                          </div>
+                        )}
+                        {!current.available && (
+                          <div className="error-note" style={{ marginTop: 6 }}>
+                            This set&rsquo;s provider key isn&rsquo;t configured on the operations manager.
+                          </div>
+                        )}
+                      </div>
+                    ) : null;
+                  })()
+                )}
+              </div>
+            </div>
+
+            {setId === NEW_SET && (
+              <div className="new-set-panel">
+                <div className="two-col">
+                  <div className="field">
+                    <label>Set name</label>
+                    <input
+                      type="text"
+                      value={newSetName}
+                      placeholder="e.g. Contracts (Voyage)"
+                      onChange={(e) => setNewSetName(e.target.value)}
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Embedding model</label>
+                    <select value={newSetModel} onChange={(e) => setNewSetModel(e.target.value)}>
+                      <option value="">Choose one of {models.length} models...</option>
+                      {Array.from(new Set(models.map((m) => m.provider_label))).map((group) => (
+                        <optgroup key={group} label={group}>
+                          {models
+                            .filter((m) => m.provider_label === group)
+                            .map((m) => (
+                              <option key={m.id} value={m.id} disabled={!m.available}>
+                                {modelOptionLabel(m)}
+                              </option>
+                            ))}
+                        </optgroup>
+                      ))}
+                      <option value={IMPORT_MODEL}>+ Import your own model...</option>
+                    </select>
+                    {(() => {
+                      const m = models.find((x) => x.id === newSetModel);
+                      if (newSetModel === IMPORT_MODEL) {
+                        return <div className="field-hint">Describe the model below and import it.</div>;
+                      }
+                      if (!m) {
+                        return (
+                          <div className="field-hint">
+                            Local models run inside AOM and download once on first use; hosted models need their
+                            provider&rsquo;s API key on the operations manager.
+                          </div>
+                        );
+                      }
+                      return (
+                        <div className="field-hint">
+                          {m.notes} {m.provider === "local"
+                            ? "Runs on the operations manager's CPU; downloads from Hugging Face on first use."
+                            : `Calls ${m.provider_label}'s API with ${m.requires}.`}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+                {newSetModel === IMPORT_MODEL && (
+                  <div className="import-model-panel">
+                    <div className="card-title" style={{ fontSize: 13.5, marginBottom: 10 }}>
+                      Import your own embedding model
+                    </div>
+                    <div className="checkbox-row">
+                      <input
+                        type="radio"
+                        id="imp-hf"
+                        checked={importKind === "huggingface"}
+                        onChange={() => setImportKind("huggingface")}
+                      />
+                      <label htmlFor="imp-hf" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                        Hugging Face sentence-transformers model - runs inside AOM
+                      </label>
+                    </div>
+                    <div className="checkbox-row" style={{ marginBottom: 12 }}>
+                      <input
+                        type="radio"
+                        id="imp-oai"
+                        checked={importKind === "openai_compatible"}
+                        onChange={() => setImportKind("openai_compatible")}
+                      />
+                      <label htmlFor="imp-oai" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                        OpenAI-compatible embeddings endpoint - Ollama, vLLM, TEI, LiteLLM, an internal gateway
+                      </label>
+                    </div>
+                    <div className="two-col">
+                      <div className="field">
+                        <label>{importKind === "huggingface" ? "Model ID or local path" : "Model name"}</label>
+                        <input
+                          type="text"
+                          value={importName}
+                          placeholder={
+                            importKind === "huggingface" ? "e.g. my-org/domain-embedder or /models/my-embedder" : "e.g. nomic-embed-text"
+                          }
+                          onChange={(e) => setImportName(e.target.value)}
+                        />
+                        <div className="field-hint">
+                          {importKind === "huggingface"
+                            ? "Downloaded from Hugging Face on import (or loaded from an absolute path already on the operations manager). Models that need trust_remote_code are refused."
+                            : "The model name the endpoint expects."}
+                        </div>
+                      </div>
+                      <div className="field">
+                        <label>Display name (optional)</label>
+                        <input
+                          type="text"
+                          value={importLabel}
+                          placeholder="Shown in this dropdown"
+                          onChange={(e) => setImportLabel(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    {importKind === "openai_compatible" && (
+                      <div className="two-col">
+                        <div className="field">
+                          <label>Base URL</label>
+                          <input
+                            type="text"
+                            value={importBaseUrl}
+                            placeholder="e.g. http://ollama.internal:11434/v1"
+                            onChange={(e) => setImportBaseUrl(e.target.value)}
+                          />
+                          <div className="field-hint">AOM calls &lt;base URL&gt;/embeddings from the operations manager.</div>
+                        </div>
+                        <div className="field">
+                          <label>API key (optional)</label>
+                          <input
+                            type="password"
+                            value={importApiKey}
+                            placeholder="Sent as a Bearer token"
+                            onChange={(e) => setImportApiKey(e.target.value)}
+                          />
+                          <div className="field-hint">Encrypted at rest; never shown again.</div>
+                        </div>
+                      </div>
+                    )}
+                    <div className="two-col">
+                      <div className="field">
+                        <label>Query prefix (optional)</label>
+                        <input
+                          type="text"
+                          value={importQueryPrefix}
+                          placeholder='e.g. "query: "'
+                          onChange={(e) => setImportQueryPrefix(e.target.value)}
+                        />
+                      </div>
+                      <div className="field">
+                        <label>Document prefix (optional)</label>
+                        <input
+                          type="text"
+                          value={importDocPrefix}
+                          placeholder='e.g. "passage: "'
+                          onChange={(e) => setImportDocPrefix(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    <div className="field-hint" style={{ marginBottom: 10 }}>
+                      Only if the model&rsquo;s card says queries and documents need different prefixes. AOM measures
+                      the vector dimension itself on import.
+                    </div>
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      disabled={
+                        importing || !importName.trim() || (importKind === "openai_compatible" && !importBaseUrl.trim())
+                      }
+                      onClick={handleImportModel}
+                    >
+                      {importing ? "Importing..." : "Import model"}
+                    </button>
+                  </div>
+                )}
+
+                <div className="field">
+                  <label>Description (optional)</label>
+                  <input
+                    type="text"
+                    value={newSetDescription}
+                    placeholder="What belongs in this set"
+                    onChange={(e) => setNewSetDescription(e.target.value)}
+                  />
+                </div>
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  disabled={creatingSet || !newSetName.trim() || !newSetModel || newSetModel === IMPORT_MODEL}
+                  onClick={handleCreateSet}
+                >
+                  {creatingSet ? "Creating set and vector index..." : "Create knowledge set"}
+                </button>
+              </div>
+            )}
+
+            <div className="two-col">
+              <div className="field">
                 <label>Title</label>
                 <input
                   type="text"
@@ -260,7 +660,11 @@ export function KnowledgePage() {
               </div>
             </div>
 
-            <button className="btn btn-primary" type="submit" disabled={uploading || allowedRoles.length === 0}>
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={uploading || allowedRoles.length === 0 || setId === NEW_SET}
+            >
               {uploading ? "Chunking and embedding..." : "Ingest document"}
             </button>
           </form>
@@ -289,6 +693,14 @@ export function KnowledgePage() {
                   placeholder="what is our refund window?"
                   onChange={(e) => setQuery(e.target.value)}
                 />
+                <label style={{ marginTop: 10 }}>Knowledge set</label>
+                <select value={searchSetId} onChange={(e) => setSearchSetId(e.target.value)}>
+                  {data.sets.map((s) => (
+                    <option key={s.set_id} value={s.set_id}>
+                      {s.name} - {s.model_label}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
             <button className="btn btn-secondary" type="submit" disabled={searching || !apiKey || !query}>
@@ -321,6 +733,142 @@ export function KnowledgePage() {
             )}
           </form>
 
+          <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Knowledge sets</h2>
+          <div className="card" style={{ marginBottom: 24 }}>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Set</th>
+                    <th>Embedding model</th>
+                    <th style={{ textAlign: "right" }}>Dims</th>
+                    <th style={{ textAlign: "right" }}>Documents</th>
+                    <th style={{ textAlign: "right" }}>Chunks</th>
+                    <th>Vector index</th>
+                    <th>RAG apps</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.sets.map((s) => (
+                    <tr key={s.set_id}>
+                      <td>
+                        <div style={{ fontWeight: 600 }}>{s.name}</div>
+                        <div className="cell-muted cell-mono" style={{ fontSize: 12 }}>
+                          {s.set_id}
+                        </div>
+                      </td>
+                      <td>
+                        <div>{s.model_label}</div>
+                        <div className="cell-muted" style={{ fontSize: 12 }}>
+                          {s.provider_label}
+                          {!s.available && " · key not configured"}
+                        </div>
+                      </td>
+                      <td className="cell-mono" style={{ textAlign: "right" }}>{s.dims}</td>
+                      <td className="cell-mono" style={{ textAlign: "right" }}>{s.document_count}</td>
+                      <td className="cell-mono" style={{ textAlign: "right" }}>{s.chunk_count}</td>
+                      <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>{s.index_name}</td>
+                      <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>
+                        {s.rag_apps.length ? s.rag_apps.join(", ") : "-"}
+                      </td>
+                      <td>
+                        {!s.builtin && (
+                          <button
+                            className="btn btn-danger-outline btn-sm"
+                            disabled={busyId === `set:${s.set_id}` || s.document_count > 0 || s.rag_apps.length > 0}
+                            title={
+                              s.document_count > 0 || s.rag_apps.length > 0
+                                ? "Delete its documents and RAG applications first"
+                                : undefined
+                            }
+                            onClick={() => handleDeleteSet(s.set_id, s.name)}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {models.some((m) => m.custom) && (
+            <>
+              <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Imported embedding models</h2>
+              <div className="card" style={{ marginBottom: 24 }}>
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        <th>Source</th>
+                        <th style={{ textAlign: "right" }}>Dims</th>
+                        <th>Status</th>
+                        <th>Used by</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {models
+                        .filter((m) => m.custom)
+                        .map((m) => {
+                          const usedBy = data.sets.filter((s) => s.model_id === m.id).map((s) => s.name);
+                          return (
+                            <tr key={m.id}>
+                              <td>
+                                <div style={{ fontWeight: 600 }}>{m.label}</div>
+                                <div className="cell-muted cell-mono" style={{ fontSize: 12 }}>
+                                  {m.id}
+                                </div>
+                              </td>
+                              <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>
+                                {m.provider === "custom_openai" ? `${m.base_url} · ${m.source}` : m.source}
+                                {m.has_api_key ? " · key on file" : ""}
+                              </td>
+                              <td className="cell-mono" style={{ textAlign: "right" }}>{m.dims ?? "-"}</td>
+                              <td>
+                                <span
+                                  className={
+                                    m.status === "ready"
+                                      ? "badge badge-success"
+                                      : m.status === "error"
+                                        ? "badge badge-danger"
+                                        : "badge badge-medium"
+                                  }
+                                  title={m.error || undefined}
+                                >
+                                  {m.status === "pending" ? "downloading" : m.status}
+                                </span>
+                                {m.status === "error" && m.error && (
+                                  <div className="cell-muted" style={{ fontSize: 11.5, maxWidth: 320 }}>
+                                    {m.error}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="cell-muted" style={{ fontSize: 12 }}>{usedBy.join(", ") || "-"}</td>
+                              <td>
+                                <button
+                                  className="btn btn-danger-outline btn-sm"
+                                  disabled={busyId === `model:${m.id}` || usedBy.length > 0}
+                                  title={usedBy.length ? "Delete the sets using it first" : undefined}
+                                  onClick={() => handleDeleteModel(m.id, m.label)}
+                                >
+                                  Remove
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
+
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Documents</h2>
           {data.documents.length === 0 ? (
             <div className="card empty-state">
@@ -333,6 +881,7 @@ export function KnowledgePage() {
                   <thead>
                     <tr>
                       <th>Title</th>
+                      <th>Set</th>
                       <th>Format</th>
                       <th>Readable by</th>
                       <th style={{ textAlign: "right" }}>Chunks</th>
@@ -347,6 +896,9 @@ export function KnowledgePage() {
                         <td>
                           <div style={{ fontWeight: 600 }}>{d.title}</div>
                           <div className="cell-muted cell-mono" style={{ fontSize: 12 }}>{d.source}</div>
+                        </td>
+                        <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>
+                          {data.sets.find((s) => s.set_id === (d.set_id || "default"))?.name || d.set_id || "default"}
                         </td>
                         <td className="cell-muted">{d.format}</td>
                         <td className="cell-muted cell-mono">{(d.allowed_roles || []).join(", ") || "-"}</td>

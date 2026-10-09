@@ -247,6 +247,14 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Hosted embedding models for Knowledge Base knowledge sets (all
+      # optional; OpenAI and Gemini reuse the keys above). Local models need
+      # none - they download into the hf-cache volume on first use.
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      JINA_API_KEY: ${JINA_API_KEY:-}
+      EMBEDDING_MAX_LOADED_MODELS: ${EMBEDDING_MAX_LOADED_MODELS:-2}
       DATABRICKS_HOST: ${DATABRICKS_HOST:-}
       DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
       DATABRICKS_SERVING_ENDPOINTS: ${DATABRICKS_SERVING_ENDPOINTS:-}

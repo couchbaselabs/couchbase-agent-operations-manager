@@ -20,6 +20,11 @@ import type {
   KnowledgeChunkResult,
   KnowledgeDocument,
   KnowledgeResponse,
+  KnowledgeSet,
+  EmbeddingModelOption,
+  RagApp,
+  RagAppsResponse,
+  RagQueryResponse,
   ConsolidationReport,
   MemoryConfig,
   MemoryEntry,
@@ -398,10 +403,36 @@ export const api = {
     source?: string;
     allowed_roles: string[];
     metadata?: Record<string, string>;
+    set_id?: string;
   }) =>
     request<{ document: KnowledgeDocument }>("/v1/knowledge", {
       method: "POST",
       body: JSON.stringify(payload),
+    }),
+  embeddingModels: () =>
+    request<{ models: EmbeddingModelOption[]; max_dims: number }>("/v1/knowledge/embedding-models"),
+  importEmbeddingModel: (payload: {
+    kind: "huggingface" | "openai_compatible";
+    model_name: string;
+    label?: string;
+    base_url?: string;
+    api_key?: string;
+    query_prefix?: string;
+    doc_prefix?: string;
+  }) =>
+    request<{ model: EmbeddingModelOption }>("/v1/knowledge/embedding-models", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteEmbeddingModel: (modelId: string) =>
+    request<{ deleted: boolean; model_id: string }>(`/v1/knowledge/embedding-models/${modelId}`, {
+      method: "DELETE",
+    }),
+  createKnowledgeSet: (payload: { name: string; model_id: string; set_id?: string; description?: string }) =>
+    request<{ set: KnowledgeSet }>("/v1/knowledge/sets", { method: "POST", body: JSON.stringify(payload) }),
+  deleteKnowledgeSet: (setId: string) =>
+    request<{ deleted: boolean; set_id: string }>(`/v1/knowledge/sets/${encodeURIComponent(setId)}`, {
+      method: "DELETE",
     }),
   deleteKnowledge: (documentId: string) =>
     request<{ deleted: boolean; document_id: string; documents_removed: number }>(
@@ -494,13 +525,37 @@ export const api = {
       body: JSON.stringify({ user_id: userId || null }),
     }),
 
-  searchKnowledge: (apiKey: string, query: string, topK = 5) =>
-    request<{ role: string; results: KnowledgeChunkResult[]; latency_ms: number }>(
+  // -- RAG applications --------------------------------------------------
+  ragApps: () => request<RagAppsResponse>("/v1/rag/apps"),
+  registerRagApp: (app: Partial<RagApp>, issueKey: boolean) =>
+    request<{ app: RagApp; api_key: string | null; notice: string | null }>("/v1/rag/apps", {
+      method: "POST",
+      body: JSON.stringify({ app, issue_key: issueKey }),
+    }),
+  updateRagApp: (appId: string, app: Partial<RagApp>) =>
+    request<{ app: RagApp }>(`/v1/rag/apps/${encodeURIComponent(appId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ app }),
+    }),
+  deleteRagApp: (appId: string) =>
+    request<{ deleted: boolean; app_id: string; agent_revoked: boolean }>(
+      `/v1/rag/apps/${encodeURIComponent(appId)}`,
+      { method: "DELETE" }
+    ),
+  ragQuery: (apiKey: string, appId: string, question: string, bypassCache = false) =>
+    request<RagQueryResponse>(`/v1/agent/rag/${encodeURIComponent(appId)}/query`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ question, bypass_cache: bypassCache }),
+    }),
+
+  searchKnowledge: (apiKey: string, query: string, topK = 5, setId = "default") =>
+    request<{ role: string; set_id: string; results: KnowledgeChunkResult[]; latency_ms: number }>(
       "/v1/agent/knowledge/search",
       {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ query, top_k: topK }),
+        body: JSON.stringify({ query, top_k: topK, set_id: setId }),
       }
     ),
 };

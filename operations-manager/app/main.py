@@ -42,14 +42,17 @@ from app import (
     approvals,
     catalog_ingest,
     context_cache,
+    embedding_models,
     evals,
     governance,
     guardrails,
     knowledge,
+    knowledge_sets,
     hijack_detection,
     insights,
     llm_cache,
     memory_consolidation,
+    rag_apps,
     mcp_client,
     sdk_packaging,
     server_auth,
@@ -526,6 +529,24 @@ last_context_sweep_at: str | None = None
 CONTEXT_INLINE_EVICTION_INTERVAL_SECONDS = float(os.getenv("CONTEXT_INLINE_EVICTION_INTERVAL_SECONDS", "30"))
 _last_inline_context_eviction: float = 0.0
 
+# RAG Applications (see app/rag_apps.py). Registered apps live in one
+# settings document and are kept in memory for the query hot path, the same
+# load-once convention as the cache policies above. knowledge_generation is
+# part of every cached-retrieval key and is bumped on any Knowledge Base
+# change; seeding it from the clock keeps keys from a previous process run
+# from ever being mistaken for current ones.
+RAG_APPS_SETTINGS_DOC = "settings::rag_apps"
+
+# Knowledge sets (see app/knowledge_sets.py and app/embedding_models.py):
+# one embedding model and one vector index per set. The built-in "default"
+# set is synthesized from EMBEDDING_CONFIG rather than stored, so it always
+# matches the model the appliance actually loaded.
+KNOWLEDGE_SETS_SETTINGS_DOC = "settings::knowledge_sets"
+knowledge_sets_registry: dict = {}
+_set_embedders: dict = {}
+rag_apps_registry: dict = {}
+knowledge_generation: int = int(time.time())
+
 # Local dashboard login (see app/user_auth.py). The LDAP policy is
 # user-editable from Settings -> LDAP Authentication and persisted in
 # Couchbase at settings::ldap, loaded into memory here the same way the LLM
@@ -733,6 +754,10 @@ async def couchbase_startup():
 
     await _startup_step("load context cache config", load_context_config())
     spawn(context_cache_sweeper_loop())
+
+    await _startup_step("load imported embedding models", load_custom_embedding_models())
+    await _startup_step("load knowledge sets", load_knowledge_sets())
+    await _startup_step("load RAG applications", load_rag_apps())
 
     if EVAL_SEED_STARTER_DATASET:
         await _startup_step("seed starter eval dataset", seed_starter_dataset())
@@ -4757,19 +4782,34 @@ class KnowledgeIngestRequest(BaseModel):
     source: str | None = None
     allowed_roles: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+    # Which knowledge set (and so which embedding model and index) this
+    # document goes into. See app/knowledge_sets.py.
+    set_id: str = "default"
 
 
 class KnowledgeSearchRequest(BaseModel):
     query: str
     top_k: int = 5
     document_id: str | None = None
+    set_id: str = "default"
+
+
+class KnowledgeSetRequest(BaseModel):
+    name: str
+    model_id: str
+    set_id: str | None = None
+    description: str = ""
 
 
 @app.get("/v1/knowledge")
 async def list_knowledge(request: Request):
     documents = await store.list_knowledge_documents()
+    for d in documents:
+        d.setdefault("set_id", knowledge_sets.DEFAULT_SET_ID)
     return {
         "documents": documents,
+        "sets": public_knowledge_sets(documents),
+        "default_set_id": knowledge_sets.DEFAULT_SET_ID,
         "chunk_count": await store.count_knowledge_chunks(),
         "roles": list(ROLES),
         "chunk_chars": KNOWLEDGE_CHUNK_CHARS,
@@ -4798,6 +4838,7 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
             detail="Pick at least one role that may retrieve this document - a document no role can read is "
                    "indexed, embedded and permanently invisible.",
         )
+    kset = get_knowledge_set(req.set_id)
 
     if len(req.content.encode("utf-8")) > KNOWLEDGE_MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Document is larger than the {KNOWLEDGE_MAX_UPLOAD_MB}MB limit")
@@ -4830,16 +4871,26 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
     document_id = knowledge.new_document_id(req.title)
     start = time.time()
     try:
-        vectors = await embeddings.embed_many_async(
-            [knowledge.build_embedding_text(req.title, chunk) for chunk in chunks]
-        )
-        for index, (chunk, embedding) in enumerate(zip(chunks, vectors)):
-            await store.upsert_knowledge_chunk(
-                knowledge.build_chunk_doc(
-                    document_id=document_id, document_title=req.title, index=index,
-                    content=chunk, embedding=embedding, allowed_roles=req.allowed_roles,
-                )
+        try:
+            vectors = await embedder_for(kset).embed_documents(
+                [knowledge.build_embedding_text(req.title, chunk) for chunk in chunks]
             )
+        except (RuntimeError, OSError) as exc:
+            # A hosted provider refusing, or a local model that couldn't be
+            # downloaded - the operator's problem to fix, not a server bug.
+            raise HTTPException(
+                status_code=502,
+                detail=f"Embedding with {kset['model_id']} failed: {exc}",
+            ) from exc
+        for index, (chunk, embedding) in enumerate(zip(chunks, vectors)):
+            chunk_doc = knowledge.build_chunk_doc(
+                document_id=document_id, document_title=req.title, index=index,
+                content=chunk, embedding=embedding, allowed_roles=req.allowed_roles,
+            )
+            if kset["set_id"] != knowledge_sets.DEFAULT_SET_ID:
+                chunk_doc[kset["vector_field"]] = chunk_doc.pop("embedding")
+                chunk_doc["set_id"] = kset["set_id"]
+            await store.upsert_knowledge_chunk(chunk_doc)
     except BaseException:
         # A failure or a request timeout part-way through would otherwise
         # leave chunks that retrieval still returns but that belong to no
@@ -4853,7 +4904,10 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
         char_count=len(text), fingerprint=knowledge.content_fingerprint(text),
         uploaded_by=(getattr(request.state, "user", {}) or {}).get("username"), metadata=req.metadata,
     )
+    doc["set_id"] = kset["set_id"]
+    doc["embedding_model"] = kset["model_id"]
     await store.upsert_knowledge_document(doc)
+    bump_knowledge_generation()
 
     logger.info(
         "Ingested knowledge document '%s' (%d chunk(s), %d chars) in %dms",
@@ -4868,6 +4922,7 @@ async def delete_knowledge(document_id: str, request: Request):
     removed = await store.delete_knowledge_document(document_id)
     if not removed:
         raise HTTPException(status_code=404, detail="No such document")
+    bump_knowledge_generation()
     return {"deleted": True, "document_id": document_id, "documents_removed": removed}
 
 
@@ -4886,12 +4941,21 @@ async def search_knowledge_route(
     if not store.connected or embeddings is None:
         raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
 
+    kset = get_knowledge_set(req.set_id)
     ctx = trace_context(request)
     start = time.time()
-    vector = await embeddings.embed_async(req.query)
+    try:
+        vector = await embedder_for(kset).embed_query(req.query)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=502, detail=f"Embedding with {kset['model_id']} failed: {exc}") from exc
     results = await store.search_knowledge(
-        role, vector, top_k=max(1, min(req.top_k, 25)), document_id=req.document_id
+        role, vector, top_k=max(1, min(req.top_k, 25)), document_id=req.document_id,
+        index_name=kset["index_name"], vector_field=kset["vector_field"],
     )
+    # Each set has its own index, so this only ever drops something if an
+    # index were misconfigured - the same belt-and-braces re-check the role
+    # gets above.
+    results = [r for r in results if r.get("set_id", knowledge_sets.DEFAULT_SET_ID) == kset["set_id"]]
     latency_ms = int((time.time() - start) * 1000)
 
     await store.log_access(
@@ -4904,6 +4968,8 @@ async def search_knowledge_route(
         ctx, kind="internal", name="knowledge retrieval", started=start, role=role, subject=subject,
         attributes={
             "aom.operation": "knowledge.search",
+            "aom.knowledge_set": kset["set_id"],
+            "aom.embedding_model": kset["model_id"],
             "aom.query": redact_text_for_storage(req.query),
             "aom.result_count": len(results),
             "aom.document_ids": sorted({r.get("document_id") for r in results if r.get("document_id")}),
@@ -4911,6 +4977,7 @@ async def search_knowledge_route(
     )
     return {
         "role": role,
+        "set_id": kset["set_id"],
         "results": results,
         "latency_ms": latency_ms,
         "trace": {"trace_id": ctx["trace_id"]},
@@ -5399,3 +5466,605 @@ async def test_agent_oidc(req: AgentOidcTestRequest, request: Request):
         "role": (identity or {}).get("role"),
         "subject": (identity or {}).get("claims_subject"),
     }
+
+
+# ---------------------------------------------------------------------------
+# RAG Applications (see app/rag_apps.py)
+# ---------------------------------------------------------------------------
+class RagAppRequest(BaseModel):
+    # Raw dict, validated by rag_apps.normalize_app - same "the form is a
+    # convenience, this is the boundary" convention as the other policies.
+    app: dict
+    # Registration only: issue the app its own Agent Identity (role = the
+    # first allowed role) and return its key once.
+    issue_key: bool = True
+
+
+class RagQueryRequest(BaseModel):
+    question: str
+    # Narrow (never widen) the app's own top_k for one call.
+    top_k: int | None = None
+    # Skip both caches for one call - e.g. to compare against a fresh answer.
+    bypass_cache: bool = False
+
+
+async def load_rag_apps():
+    global rag_apps_registry
+    stored = await store.get_setting(RAG_APPS_SETTINGS_DOC)
+    apps = {}
+    for app_id, raw in ((stored or {}).get("apps") or {}).items():
+        try:
+            apps[app_id] = rag_apps.normalize_app(raw, set(ROLES), existing=raw)
+        except ValueError as exc:
+            logger.warning("Skipping invalid stored RAG application '%s': %s", app_id, exc)
+    rag_apps_registry = apps
+    logger.info("RAG applications loaded (%d registered)", len(apps))
+
+
+async def save_rag_apps():
+    await store.upsert_setting(
+        RAG_APPS_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "rag_apps", "apps": rag_apps_registry, "updated_at": rag_apps.now_iso()},
+    )
+
+
+def bump_knowledge_generation():
+    """Any Knowledge Base change makes every cached RAG retrieval unreachable
+    (the generation is part of the Context Cache key), so an app never serves
+    chunks from a document that was deleted or misses one that was added."""
+    global knowledge_generation
+    knowledge_generation += 1
+
+
+def _with_trace_headers(request: Request, trace_id: str, agent_id: str | None) -> Request:
+    """A copy of `request` carrying an explicit trace ID, so the retrieval,
+    cache and LLM calls a RAG query makes internally all land in one trace
+    instead of each minting its own."""
+    drop = {tracing.TRACE_ID_HEADER.encode(), tracing.AGENT_ID_HEADER.encode()}
+    headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() not in drop]
+    headers.append((tracing.TRACE_ID_HEADER.encode(), trace_id.encode()))
+    if agent_id:
+        headers.append((tracing.AGENT_ID_HEADER.encode(), agent_id.encode()))
+    scope = dict(request.scope)
+    scope["headers"] = headers
+    return Request(scope, request.receive)
+
+
+@app.get("/v1/rag/apps")
+async def list_rag_apps(request: Request):
+    apps = sorted(rag_apps_registry.values(), key=lambda a: a.get("created_at") or "", reverse=True)
+    llm_events, context_events = await asyncio.gather(
+        store.recent_llm_events(limit=2000), store.recent_context_events(limit=2000)
+    )
+    activity = rag_apps.activity_by_app([a["app_id"] for a in apps], llm_events, context_events)
+    return {
+        "apps": [dict(a, activity=activity.get(a["app_id"])) for a in apps],
+        "roles": list(ROLES),
+        "knowledge_generation": knowledge_generation,
+        "activity_window_events": 2000,
+    }
+
+
+@app.post("/v1/rag/apps")
+async def register_rag_app(req: RagAppRequest, request: Request):
+    user = require_admin(request)
+    try:
+        app_doc = rag_apps.normalize_app(req.app, set(ROLES))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if app_doc["app_id"] in rag_apps_registry:
+        raise HTTPException(status_code=409, detail=f"RAG application '{app_doc['app_id']}' already exists")
+    provider = app_doc.get("provider")
+    if provider and provider not in llm_cache.PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'")
+    if provider and app_doc.get("model") and app_doc["model"] not in llm_cache.PROVIDERS[provider]["models"]:
+        raise HTTPException(status_code=400, detail=f"Model '{app_doc['model']}' is not offered by provider '{provider}'")
+
+    get_knowledge_set(app_doc["set_id"])
+    app_doc["created_at"] = app_doc["updated_at"] = rag_apps.now_iso()
+    app_doc["created_by"] = user.get("username")
+
+    api_key = None
+    if req.issue_key:
+        issued = await create_agent(
+            CreateAgentRequest(
+                name=f"RAG app: {app_doc['name']}",
+                role=app_doc["allowed_roles"][0],
+                owner=app_doc["owner"],
+                description=f"Issued for RAG application '{app_doc['app_id']}'.",
+            ),
+            request,
+        )
+        api_key = issued["api_key"]
+        app_doc["agent_id"] = issued["agent"].get("agent_id")
+
+    rag_apps_registry[app_doc["app_id"]] = app_doc
+    await save_rag_apps()
+    logger.info("RAG application '%s' registered by %s", app_doc["app_id"], user.get("username"))
+    return {
+        "app": app_doc,
+        "api_key": api_key,
+        "notice": "This key is shown once and stored only as a hash. Save it now; it cannot be retrieved."
+        if api_key else None,
+    }
+
+
+@app.put("/v1/rag/apps/{app_id}")
+async def update_rag_app(app_id: str, req: RagAppRequest, request: Request):
+    require_admin(request)
+    existing = rag_apps_registry.get(app_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="No such RAG application")
+    try:
+        app_doc = rag_apps.normalize_app(req.app, set(ROLES), existing=existing)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_knowledge_set(app_doc["set_id"])
+    app_doc["updated_at"] = rag_apps.now_iso()
+    rag_apps_registry[app_id] = app_doc
+    await save_rag_apps()
+    return {"app": app_doc}
+
+
+@app.delete("/v1/rag/apps/{app_id}")
+async def delete_rag_app(app_id: str, request: Request):
+    """Remove an application and revoke the Agent Identity it was issued, so
+    its key stops working on the next request rather than lingering."""
+    require_admin(request)
+    existing = rag_apps_registry.pop(app_id, None)
+    if not existing:
+        raise HTTPException(status_code=404, detail="No such RAG application")
+    await save_rag_apps()
+    revoked = False
+    if existing.get("agent_id"):
+        try:
+            await revoke_agent(existing["agent_id"], request)
+            revoked = True
+        except HTTPException as exc:
+            logger.warning("RAG app '%s' deleted; its agent %s could not be revoked: %s",
+                           app_id, existing["agent_id"], exc.detail)
+    return {"deleted": True, "app_id": app_id, "agent_revoked": revoked}
+
+
+@app.post("/v1/agent/rag/{app_id}/query")
+async def rag_query(
+    app_id: str,
+    req: RagQueryRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Answer a question from the Knowledge Base for one registered RAG
+    application: role-filtered retrieval (Context Cache in front of it),
+    then a generation through the same governed, cached path as
+    /v1/llm/complete - guardrails, budgets, LLM Cache and tracing included."""
+    role, subject = await authenticate(authorization, request)
+    rag_app = rag_apps_registry.get(app_id)
+    if not rag_app:
+        raise HTTPException(status_code=404, detail=f"No RAG application '{app_id}'")
+    if not rag_app.get("enabled"):
+        raise HTTPException(status_code=403, detail=f"RAG application '{app_id}' is disabled")
+    if role not in rag_app["allowed_roles"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Role '{role}' may not query RAG application '{app_id}'",
+        )
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    if len(question) > 4000:
+        raise HTTPException(status_code=400, detail="question is longer than 4000 characters")
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+
+    ctx = trace_context(request)
+    inner = _with_trace_headers(request, ctx["trace_id"], ctx.get("agent_id") or f"rag:{app_id}")
+    started = time.time()
+    effective = dict(rag_app)
+    if req.top_k:
+        effective["top_k"] = max(1, min(int(req.top_k), int(rag_app["top_k"])))
+
+    # ---- 1. retrieval, behind the Context Cache --------------------------
+    namespace = rag_apps.context_namespace(app_id)
+    cache_key = rag_apps.retrieval_cache_key(
+        app_id, role, question, knowledge_generation, rag_app.get("set_id") or knowledge_sets.DEFAULT_SET_ID
+    )
+    use_context_cache = not req.bypass_cache and int(rag_app.get("retrieval_ttl_seconds") or 0) > 0
+    retrieval_status = "bypass"
+    chunks = None
+    if use_context_cache:
+        cached = await context_get(ContextGetRequest(key=cache_key, namespace=namespace), inner, authorization)
+        if cached.get("hit") and isinstance(cached.get("value"), list):
+            chunks, retrieval_status = cached["value"], "hit"
+        else:
+            retrieval_status = "miss"
+
+    retrieval_started = time.time()
+    if chunks is None:
+        # A document scope narrows the role-filtered results after the
+        # search, so ask for more candidates than will be kept.
+        single_doc = rag_app["document_ids"][0] if len(rag_app["document_ids"]) == 1 else None
+        fetch_k = effective["top_k"] * (4 if rag_app["document_ids"] and not single_doc else 1)
+        found = await search_knowledge_route(
+            KnowledgeSearchRequest(
+                query=question, top_k=min(25, fetch_k), document_id=single_doc,
+                set_id=rag_app.get("set_id") or knowledge_sets.DEFAULT_SET_ID,
+            ),
+            inner, authorization,
+        )
+        chunks = rag_apps.select_chunks(effective, found.get("results") or [])
+        if use_context_cache:
+            await context_set(
+                ContextSetRequest(
+                    key=cache_key, value=chunks, namespace=namespace,
+                    ttl_seconds=int(rag_app["retrieval_ttl_seconds"]),
+                    source_latency_ms=int((time.time() - retrieval_started) * 1000),
+                ),
+                inner, authorization,
+            )
+    retrieval_ms = int((time.time() - retrieval_started) * 1000)
+
+    # ---- 2. generation, through the governed LLM path --------------------
+    llm_result = None
+    if chunks:
+        llm_result = await llm_complete(
+            LLMCompleteRequest(
+                prompt=rag_apps.build_prompt(rag_app, question, chunks),
+                provider=rag_app.get("provider"),
+                model=rag_app.get("model"),
+                namespace=rag_apps.llm_namespace(app_id, chunks),
+                semantic=None if rag_app.get("semantic_cache") else False,
+                bypass_cache=req.bypass_cache,
+            ),
+            inner, authorization,
+        )
+        answer = llm_result.get("response", "")
+    else:
+        answer = rag_app["no_answer_text"]
+
+    latency_ms = int((time.time() - started) * 1000)
+    llm_cache_status = (llm_result or {}).get("cache", {}).get("status") if llm_result else "skipped"
+    await record_span(
+        ctx, kind="internal", name=f"rag: {app_id}", started=started, role=role, subject=subject,
+        attributes={
+            "aom.operation": "rag.query",
+            "aom.rag_app": app_id,
+            "aom.query": redact_text_for_storage(question[:2000]),
+            "aom.retrieval_cache": retrieval_status,
+            "aom.result_count": len(chunks),
+            "aom.document_ids": sorted({c.get("document_id") for c in chunks if c.get("document_id")}),
+            "aom.cache_status": llm_cache_status,
+            "aom.cost_usd": (llm_result or {}).get("cost_usd", 0.0),
+        },
+    )
+    return {
+        "app_id": app_id,
+        "role": role,
+        "answer": answer,
+        "sources": rag_apps.public_sources(chunks),
+        "retrieval": {"cache": retrieval_status, "chunks": len(chunks), "latency_ms": retrieval_ms},
+        "llm": None if not llm_result else {
+            "cache": llm_result.get("cache"),
+            "provider": llm_result.get("provider"),
+            "model": llm_result.get("model"),
+            "usage": llm_result.get("usage"),
+            "cost_usd": llm_result.get("cost_usd"),
+            "tokens_saved": llm_result.get("tokens_saved"),
+            "cost_saved_usd": llm_result.get("cost_saved_usd"),
+            "stub": llm_result.get("stub"),
+        },
+        "latency_ms": latency_ms,
+        "trace": {"trace_id": ctx["trace_id"]},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Knowledge sets and selectable embedding models (see app/knowledge_sets.py)
+# ---------------------------------------------------------------------------
+def _default_knowledge_set() -> dict:
+    model = embedding_models.resolve(EMBEDDING_CONFIG["model_name"])
+    return knowledge_sets.default_set(
+        model["id"] if model else EMBEDDING_CONFIG["model_name"],
+        int(EMBEDDING_CONFIG["vector_dim"]),
+        COUCHBASE_CONFIG["knowledge_index"],
+    )
+
+
+def all_knowledge_sets() -> dict:
+    return {knowledge_sets.DEFAULT_SET_ID: _default_knowledge_set(), **knowledge_sets_registry}
+
+
+def get_knowledge_set(set_id: str | None) -> dict:
+    kset = all_knowledge_sets().get(set_id or knowledge_sets.DEFAULT_SET_ID)
+    if not kset:
+        raise HTTPException(status_code=404, detail=f"No knowledge set '{set_id}'")
+    return kset
+
+
+def embedder_for(kset: dict) -> embedding_models.SetEmbedder:
+    """One embedder per set, created on first use. The default set reuses
+    the appliance's already-loaded model; an unknown model ID (the default
+    configured as something outside the catalog) falls back to it too."""
+    cached = _set_embedders.get(kset["set_id"])
+    if cached is not None and cached.model["id"] == (embedding_models.resolve(kset["model_id"]) or {}).get("id"):
+        return cached
+    if not embedding_models.resolve(kset["model_id"]):
+        if kset["set_id"] != knowledge_sets.DEFAULT_SET_ID:
+            raise HTTPException(status_code=500, detail=f"Knowledge set '{kset['set_id']}' has an unknown model")
+
+        class _Default:
+            model = {"id": kset["model_id"]}
+
+            async def embed_documents(self, texts):
+                return await embeddings.embed_many_async(texts)
+
+            async def embed_query(self, text):
+                return await embeddings.embed_async(text)
+
+        return _Default()  # type: ignore[return-value]
+    embedder = embedding_models.SetEmbedder(
+        kset["model_id"], default_embeddings=embeddings, default_model_id=EMBEDDING_CONFIG["model_name"],
+    )
+    _set_embedders[kset["set_id"]] = embedder
+    return embedder
+
+
+def public_knowledge_sets(documents: list[dict] | None = None) -> list[dict]:
+    counts: dict[str, dict] = {}
+    for d in documents or []:
+        c = counts.setdefault(knowledge_sets.chunk_set_id(d), {"documents": 0, "chunks": 0})
+        c["documents"] += 1
+        c["chunks"] += int(d.get("chunk_count") or 0)
+    out = []
+    for s in all_knowledge_sets().values():
+        model = embedding_models.resolve(s["model_id"]) or {}
+        provider = model.get("provider", "local")
+        out.append({
+            **s,
+            "model_label": model.get("label", s["model_id"]),
+            "provider": provider,
+            "provider_label": embedding_models.PROVIDERS.get(provider, (provider, ""))[0],
+            "available": embedding_models.is_available(model) if model else True,
+            "document_count": counts.get(s["set_id"], {}).get("documents", 0),
+            "chunk_count": counts.get(s["set_id"], {}).get("chunks", 0),
+            "rag_apps": sorted(a for a, app in rag_apps_registry.items()
+                               if (app.get("set_id") or knowledge_sets.DEFAULT_SET_ID) == s["set_id"]),
+        })
+    return sorted(out, key=lambda s: (not s["builtin"], s.get("created_at") or ""))
+
+
+async def load_knowledge_sets():
+    global knowledge_sets_registry
+    stored = await store.get_setting(KNOWLEDGE_SETS_SETTINGS_DOC)
+    sets = {}
+    for set_id, s in ((stored or {}).get("sets") or {}).items():
+        if set_id == knowledge_sets.DEFAULT_SET_ID or not embedding_models.resolve(s.get("model_id", "")):
+            logger.warning("Skipping invalid stored knowledge set '%s'", set_id)
+            continue
+        sets[set_id] = s
+    knowledge_sets_registry = sets
+    # Idempotent: recreates a set's index if the cluster lost it (a restore,
+    # a fresh Search node), and is a no-op otherwise.
+    for s in sets.values():
+        await store.ensure_knowledge_index(s["index_name"], s["vector_field"], s["dims"])
+    logger.info("Knowledge sets loaded (%d besides the default)", len(sets))
+
+
+async def save_knowledge_sets():
+    await store.upsert_setting(
+        KNOWLEDGE_SETS_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "knowledge_sets", "sets": knowledge_sets_registry,
+         "updated_at": rag_apps.now_iso()},
+    )
+
+
+@app.get("/v1/knowledge/embedding-models")
+async def list_embedding_models(request: Request):
+    return {
+        "models": embedding_models.public_catalog(default_model=EMBEDDING_CONFIG["model_name"]),
+        "providers": [
+            {"id": p, "label": label, "requires": env or None}
+            for p, (label, env) in embedding_models.PROVIDERS.items()
+        ],
+        "max_dims": embedding_models.MAX_DIMS,
+    }
+
+
+@app.post("/v1/knowledge/sets")
+async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
+    """Create a knowledge set: pick its embedding model, and AOM creates the
+    set's own Couchbase vector index sized to that model. A hosted model is
+    test-called first so a missing or wrong key fails here, not on the
+    first upload."""
+    user = require_admin(request)
+    model = embedding_models.resolve(req.model_id)
+    if not model:
+        raise HTTPException(status_code=400, detail=f"Unknown embedding model '{req.model_id}'")
+    if model.get("custom") and model.get("status") == "pending":
+        raise HTTPException(status_code=409, detail=f"{model['label']} is still downloading - try again once it shows as ready")
+    if model.get("custom") and model.get("status") == "error":
+        raise HTTPException(status_code=400, detail=f"{model['label']} failed verification: {model.get('error')}")
+    if not model.get("dims") or model["dims"] > embedding_models.MAX_DIMS:
+        raise HTTPException(status_code=400, detail=f"{model['label']} doesn't fit the {embedding_models.MAX_DIMS}-dimension vector limit")
+    if not embedding_models.is_available(model):
+        env = embedding_models.PROVIDERS[model["provider"]][1]
+        raise HTTPException(status_code=400, detail=f"{model['label']} needs {env} set on the operations manager")
+    try:
+        kset = knowledge_sets.new_set(
+            name=req.name, set_id=req.set_id, model=model, base_index_name=COUCHBASE_CONFIG["knowledge_index"],
+            description=req.description, created_by=user.get("username"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if kset["set_id"] in all_knowledge_sets():
+        raise HTTPException(status_code=409, detail=f"Knowledge set '{kset['set_id']}' already exists")
+
+    embedder = embedding_models.SetEmbedder(
+        kset["model_id"], default_embeddings=embeddings, default_model_id=EMBEDDING_CONFIG["model_name"],
+    )
+    if model["provider"] not in ("local", "custom_hf"):
+        try:
+            await embedder.embed_query("connection test")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"{model['label']} test call failed: {exc}") from exc
+
+    if not await store.ensure_knowledge_index(kset["index_name"], kset["vector_field"], kset["dims"]):
+        raise HTTPException(status_code=502, detail=f"Could not create vector index '{kset['index_name']}' in Couchbase")
+
+    knowledge_sets_registry[kset["set_id"]] = kset
+    _set_embedders[kset["set_id"]] = embedder
+    await save_knowledge_sets()
+    if model["provider"] in ("local", "custom_hf"):
+        # Download and load the weights now, in the background, so the first
+        # upload isn't the request that waits for them.
+        async def _warm():
+            try:
+                await embedder.embed_query("warm up")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Warming local embedding model '%s' failed: %s", model["id"], exc)
+        spawn(_warm())
+    logger.info("Knowledge set '%s' created on %s by %s", kset["set_id"], model["id"], user.get("username"))
+    return {"set": next(s for s in public_knowledge_sets() if s["set_id"] == kset["set_id"])}
+
+
+@app.delete("/v1/knowledge/sets/{set_id}")
+async def delete_knowledge_set(set_id: str, request: Request):
+    require_admin(request)
+    if set_id == knowledge_sets.DEFAULT_SET_ID:
+        raise HTTPException(status_code=400, detail="The default knowledge set can't be deleted")
+    kset = knowledge_sets_registry.get(set_id)
+    if not kset:
+        raise HTTPException(status_code=404, detail=f"No knowledge set '{set_id}'")
+    docs = [d for d in await store.list_knowledge_documents(limit=1000) if d.get("set_id") == set_id]
+    if docs:
+        raise HTTPException(status_code=409, detail=f"Delete this set's {len(docs)} document(s) first")
+    users = [a for a, app in rag_apps_registry.items() if app.get("set_id") == set_id]
+    if users:
+        raise HTTPException(status_code=409, detail=f"RAG application(s) {users} use this set - move or delete them first")
+    await store.delete_knowledge_index(kset["index_name"])
+    knowledge_sets_registry.pop(set_id, None)
+    _set_embedders.pop(set_id, None)
+    await save_knowledge_sets()
+    bump_knowledge_generation()
+    return {"deleted": True, "set_id": set_id}
+
+
+# -- Imported (custom) embedding models ----------------------------------------
+CUSTOM_EMBEDDING_MODELS_SETTINGS_DOC = "settings::custom_embedding_models"
+
+
+class ImportEmbeddingModelRequest(BaseModel):
+    # "huggingface": a sentence-transformers model by Hugging Face ID (or an
+    # absolute path to one already on the operations manager's disk).
+    # "openai_compatible": any endpoint speaking OpenAI's /embeddings API -
+    # Ollama, vLLM, TEI, LiteLLM, an internal gateway.
+    kind: str
+    model_name: str
+    label: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    query_prefix: str = ""
+    doc_prefix: str = ""
+
+
+async def load_custom_embedding_models():
+    stored = await store.get_setting(CUSTOM_EMBEDDING_MODELS_SETTINGS_DOC)
+    models, secrets = {}, {}
+    for model_id, m in ((stored or {}).get("models") or {}).items():
+        enc = m.pop("api_key_enc", None)
+        if enc:
+            try:
+                secrets[model_id] = user_auth.decrypt_secret(enc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not decrypt the API key for imported model '%s': %s", model_id, exc)
+        models[model_id] = m
+    embedding_models.set_custom(models, secrets)
+    # An import interrupted by a restart is finished now.
+    for m in models.values():
+        if m.get("status") == "pending":
+            spawn(_verify_imported_model(m["id"]))
+    logger.info("Imported embedding models loaded (%d)", len(models))
+
+
+async def save_custom_embedding_models():
+    out = {}
+    for model_id, m in embedding_models.CUSTOM.items():
+        doc = dict(m)
+        if model_id in embedding_models.CUSTOM_SECRETS:
+            doc["api_key_enc"] = user_auth.encrypt_secret(embedding_models.CUSTOM_SECRETS[model_id])
+        out[model_id] = doc
+    await store.upsert_setting(
+        CUSTOM_EMBEDDING_MODELS_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "custom_embedding_models", "models": out,
+         "updated_at": rag_apps.now_iso()},
+    )
+
+
+async def _verify_imported_model(model_id: str):
+    """Download (Hugging Face) or call (endpoint) the model once, measure its
+    real dimension, and mark it ready - or record why it can't be used."""
+    model = embedding_models.CUSTOM.get(model_id)
+    if not model:
+        return
+    try:
+        dims = await asyncio.to_thread(embedding_models.probe_dims, model)
+        model.update({"dims": dims, "status": "ready", "error": None})
+        logger.info("Imported embedding model '%s' ready (%d dims)", model_id, dims)
+    except Exception as exc:  # noqa: BLE001
+        model.update({"status": "error", "error": str(exc)[:500]})
+        embedding_models.unload_local(model.get("source") or model_id)
+        logger.warning("Imported embedding model '%s' failed verification: %s", model_id, exc)
+    await save_custom_embedding_models()
+
+
+@app.post("/v1/knowledge/embedding-models")
+async def import_embedding_model(req: ImportEmbeddingModelRequest, request: Request):
+    user = require_admin(request)
+    try:
+        model = embedding_models.custom_model(
+            kind=req.kind, source=req.model_name, label=req.label, base_url=req.base_url,
+            query_prefix=req.query_prefix, doc_prefix=req.doc_prefix, created_by=user.get("username"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if embedding_models.resolve(model["id"]):
+        raise HTTPException(status_code=409, detail=f"A model with ID '{model['id']}' already exists - give it a different name")
+
+    embedding_models.CUSTOM[model["id"]] = model
+    if req.api_key and req.api_key.strip():
+        embedding_models.CUSTOM_SECRETS[model["id"]] = req.api_key.strip()
+
+    if model["provider"] == "custom_openai":
+        # An endpoint answers in seconds, so verify inline and refuse a bad
+        # URL, key or model name now rather than leaving a broken entry.
+        try:
+            dims = await asyncio.to_thread(embedding_models.probe_dims, model)
+        except Exception as exc:  # noqa: BLE001
+            embedding_models.CUSTOM.pop(model["id"], None)
+            embedding_models.CUSTOM_SECRETS.pop(model["id"], None)
+            raise HTTPException(status_code=400, detail=f"Test call to {model['base_url']} failed: {exc}") from exc
+        model.update({"dims": dims, "status": "ready"})
+        await save_custom_embedding_models()
+    else:
+        # A Hugging Face download can take minutes - longer than a dashboard
+        # request may run - so it finishes in the background and the page
+        # polls the model's status.
+        await save_custom_embedding_models()
+        spawn(_verify_imported_model(model["id"]))
+    logger.info("Embedding model '%s' imported by %s (%s)", model["id"], user.get("username"), model["source"])
+    return {"model": next(m for m in embedding_models.public_catalog() if m["id"] == model["id"])}
+
+
+@app.delete("/v1/knowledge/embedding-models/{model_id:path}")
+async def delete_imported_embedding_model(model_id: str, request: Request):
+    require_admin(request)
+    model = embedding_models.CUSTOM.get(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="Only imported models can be removed")
+    users = [s["set_id"] for s in knowledge_sets_registry.values() if s.get("model_id") == model_id]
+    if users:
+        raise HTTPException(status_code=409, detail=f"Knowledge set(s) {users} use this model - delete them first")
+    embedding_models.CUSTOM.pop(model_id, None)
+    embedding_models.CUSTOM_SECRETS.pop(model_id, None)
+    embedding_models.unload_local(model.get("source") or model_id)
+    await save_custom_embedding_models()
+    return {"deleted": True, "model_id": model_id}

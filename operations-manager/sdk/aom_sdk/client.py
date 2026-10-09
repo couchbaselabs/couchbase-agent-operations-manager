@@ -560,6 +560,30 @@ class AOMClient:
             body["document_id"] = document_id
         return self._request("POST", "/v1/agent/knowledge/search", auth=True, json_body=body)["results"]
 
+    # -- RAG applications ----------------------------------------------------
+    def rag_query(
+        self, app_id: str, question: str, *, top_k: Optional[int] = None, bypass_cache: bool = False
+    ) -> dict:
+        """POST /v1/agent/rag/{app_id}/query - ask a registered RAG
+        application (Registry -> RAG Applications in the dashboard) a
+        question. AOM retrieves from the Knowledge Base with your key's role
+        as the filter, serves repeat retrievals from the Context Cache, and
+        generates the answer through the cached, governed LLM path.
+
+            res = client.rag_query("support-faq", "What is our refund window?")
+            print(res["answer"])
+            for s in res["sources"]:
+                print(s["n"], s["document_title"])
+            print(res["retrieval"]["cache"], res["llm"]["cache"]["status"])
+
+        `sources` are numbered to match the [n] citations in the answer.
+        `top_k` can only narrow the app's own setting; `bypass_cache=True`
+        skips both caches for one call."""
+        body: Dict[str, Any] = {"question": question, "bypass_cache": bypass_cache}
+        if top_k is not None:
+            body["top_k"] = top_k
+        return self._request("POST", f"/v1/agent/rag/{app_id}/query", auth=True, json_body=body)
+
     def catalog(self) -> List[dict]:
         """GET /v1/agent/tools - every tool this API key can actually
         invoke: trusted, allowed for its role, and inside the agent's

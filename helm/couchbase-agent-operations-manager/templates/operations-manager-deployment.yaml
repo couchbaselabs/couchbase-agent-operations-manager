@@ -170,6 +170,32 @@ spec:
                 secretKeyRef:
                   name: {{ include "aom.authSecretName" . }}
                   key: GEMINI_API_KEY
+            - name: VOYAGE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: VOYAGE_API_KEY
+                  optional: true
+            - name: COHERE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: COHERE_API_KEY
+                  optional: true
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: MISTRAL_API_KEY
+                  optional: true
+            - name: JINA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: JINA_API_KEY
+                  optional: true
+            - name: EMBEDDING_MAX_LOADED_MODELS
+              value: {{ .Values.operationsManager.embeddingMaxLoadedModels | default 2 | quote }}
             - name: DATABRICKS_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -1072,3 +1072,58 @@ table.data-table {
   margin: 0;
   line-height: 1.55;
 }
+
+/* ------------------------------------------------------ RAG applications */
+.rag-flow {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.rag-flow li {
+  margin-bottom: 4px;
+}
+
+.rag-doc-list {
+  margin: 8px 0 0 24px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px 4px;
+}
+
+.three-col-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 1000px) {
+  .three-col-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* -------------------------------------------- knowledge sets (Knowledge Base) */
+.new-set-panel {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  background: var(--card-bg-alt);
+}
+
+.set-model-summary {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  background: var(--card-bg-alt);
+}
+
+.import-model-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  background: var(--card-bg);
+}

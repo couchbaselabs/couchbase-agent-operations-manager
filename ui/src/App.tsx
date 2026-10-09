@@ -7,6 +7,7 @@ import { TracesPage } from "./pages/TracesPage";
 import { EvalsPage } from "./pages/EvalsPage";
 import { ApprovalsPage } from "./pages/ApprovalsPage";
 import { KnowledgePage } from "./pages/KnowledgePage";
+import { RagApplicationsPage } from "./pages/RagApplicationsPage";
 import { MemoryPage } from "./pages/MemoryPage";
 import { ServersPage } from "./pages/ServersPage";
 import { CatalogPage } from "./pages/CatalogPage";
@@ -79,6 +80,7 @@ export default function App() {
           <Route path="/evals" element={<EvalsPage />} />
           <Route path="/approvals" element={<ApprovalsPage />} />
           <Route path="/knowledge" element={<KnowledgePage />} />
+          <Route path="/rag-applications" element={<RagApplicationsPage />} />
           <Route path="/memory" element={<MemoryPage />} />
           <Route path="/audit-log" element={<AuditLogPage />} />
           <Route path="/agent-tool-audit" element={<AgentToolAuditPage />} />

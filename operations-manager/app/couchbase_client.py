@@ -2424,7 +2424,14 @@ class CouchbaseStore:
     # `knowledge_document` carries the metadata an operator manages, and a
     # `knowledge_chunk` carries the text and the vector retrieval runs over.
 
-    def _knowledge_index_definition(self) -> dict:
+    def _knowledge_index_definition(
+        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None
+    ) -> dict:
+        """The default set's index, or - with all three arguments - one
+        knowledge set's index: same mapping, its own vector field and
+        dimension (see app/knowledge_sets.py)."""
+        index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
+        dims = int(dims or EMBEDDING_CONFIG["vector_dim"])
         bucket = COUCHBASE_CONFIG["bucket"]
         scope = COUCHBASE_CONFIG["scope"]
         collection = COUCHBASE_CONFIG["knowledge_collection"]
@@ -2443,13 +2450,13 @@ class CouchbaseStore:
             # well it matches.
             "allowed_roles": keyword_field("allowed_roles"),
             "document_id": keyword_field("document_id"),
-            "embedding": {
+            vector_field: {
                 "dynamic": False,
                 "enabled": True,
                 "fields": [{
-                    "name": "embedding",
+                    "name": vector_field,
                     "type": "vector",
-                    "dims": EMBEDDING_CONFIG["vector_dim"],
+                    "dims": dims,
                     "similarity": "dot_product",
                     "index": True,
                     "store": True,
@@ -2459,7 +2466,7 @@ class CouchbaseStore:
 
         return {
             "type": "fulltext-index",
-            "name": f"{bucket}.{scope}.{COUCHBASE_CONFIG['knowledge_index']}",
+            "name": f"{bucket}.{scope}.{index_name}",
             "sourceType": "gocbcore",
             "sourceName": bucket,
             "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
@@ -2488,21 +2495,47 @@ class CouchbaseStore:
             "sourceParams": {},
         }
 
-    async def ensure_knowledge_index(self):
-        index_name = COUCHBASE_CONFIG["knowledge_index"]
+    async def ensure_knowledge_index(
+        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None
+    ) -> bool:
+        index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
         try:
-            await asyncio.to_thread(
+            resp = await asyncio.to_thread(
                 lambda: requests.put(
                     self._search_admin_url(index_name),
-                    json=self._knowledge_index_definition(),
+                    json=self._knowledge_index_definition(index_name, vector_field, dims),
                     auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
                     headers={"Content-Type": "application/json"},
                     timeout=30,
                 )
             )
+            # Re-PUTting an unchanged existing index is refused as "exists";
+            # that is the steady state on every restart, not a failure.
+            if resp.status_code >= 400 and "exist" not in (resp.text or "").lower():
+                logger.warning("Knowledge vector index '%s' not created: %s %s",
+                               index_name, resp.status_code, (resp.text or "")[:300])
+                return False
             logger.info("Knowledge vector index '%s' ensured", index_name)
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not ensure knowledge vector index '%s': %s", index_name, exc)
+            return False
+
+    async def delete_knowledge_index(self, index_name: str) -> bool:
+        if index_name == COUCHBASE_CONFIG["knowledge_index"]:
+            raise ValueError("The default knowledge index is never deleted")
+        try:
+            resp = await asyncio.to_thread(
+                lambda: requests.delete(
+                    self._search_admin_url(index_name),
+                    auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
+                    timeout=30,
+                )
+            )
+            return resp.status_code < 400
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not delete knowledge vector index '%s': %s", index_name, exc)
+            return False
 
     async def upsert_knowledge_document(self, doc: dict):
         await asyncio.to_thread(self.knowledge.upsert, f"kdoc::{doc['document_id']}", doc)
@@ -2564,9 +2597,12 @@ class CouchbaseStore:
     async def count_knowledge_chunks(self) -> int:
         return await self._count_where(COUCHBASE_CONFIG["knowledge_collection"], "knowledge_chunk")
 
-    def _run_knowledge_search_sync(self, role: str, vector: list, top_k: int, document_id: str | None) -> list[dict]:
-        index_name = COUCHBASE_CONFIG["knowledge_index"]
-        vector_query = CBVectorQuery.create("embedding", vector, num_candidates=max(top_k * 4, 25))
+    def _run_knowledge_search_sync(
+        self, role: str, vector: list, top_k: int, document_id: str | None,
+        index_name: str | None = None, vector_field: str = "embedding",
+    ) -> list[dict]:
+        index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
+        vector_query = CBVectorQuery.create(vector_field, vector, num_candidates=max(top_k * 4, 25))
         vector_search = CBVectorSearch.from_vector_query(vector_query)
 
         # The same Conjunction pre-filter the tool catalog uses, over the
@@ -2587,13 +2623,15 @@ class CouchbaseStore:
         return [{"id": row.id, "score": row.score, "fields": row.fields or {}} for row in result.rows()]
 
     async def search_knowledge(
-        self, role: str, query_vector: list, top_k: int = 5, document_id: str | None = None
+        self, role: str, query_vector: list, top_k: int = 5, document_id: str | None = None,
+        index_name: str | None = None, vector_field: str = "embedding",
     ) -> list[dict]:
         if not self.connected:
             return []
         try:
             rows = await asyncio.to_thread(
-                self._run_knowledge_search_sync, role, query_vector, top_k, document_id
+                self._run_knowledge_search_sync, role, query_vector, top_k, document_id,
+                index_name, vector_field,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Knowledge vector search failed: %s", exc)
@@ -2617,6 +2655,7 @@ class CouchbaseStore:
                 "chunk_index": chunk.get("chunk_index"),
                 "content": chunk.get("content"),
                 "score": row.get("score"),
+                "set_id": chunk.get("set_id") or "default",
             })
         return results
 

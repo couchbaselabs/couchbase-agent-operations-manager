@@ -930,10 +930,55 @@ export interface KnowledgeDocument {
   metadata: Record<string, string>;
   created_at: string;
   updated_at: string;
+  set_id?: string;
+  embedding_model?: string;
+}
+
+export interface EmbeddingModelOption {
+  id: string;
+  label: string;
+  provider: string;
+  provider_label: string;
+  dims: number;
+  size: string;
+  multilingual: boolean;
+  notes: string;
+  requires: string | null;
+  available: boolean;
+  is_default: boolean;
+  custom: boolean;
+  // Imported models only
+  status?: "pending" | "ready" | "error";
+  error?: string | null;
+  source?: string;
+  base_url?: string | null;
+  has_api_key?: boolean;
+}
+
+export interface KnowledgeSet {
+  set_id: string;
+  name: string;
+  description: string;
+  model_id: string;
+  model_label: string;
+  provider: string;
+  provider_label: string;
+  available: boolean;
+  dims: number;
+  index_name: string;
+  vector_field: string;
+  builtin: boolean;
+  document_count: number;
+  chunk_count: number;
+  rag_apps: string[];
+  created_at: string | null;
+  created_by: string | null;
 }
 
 export interface KnowledgeResponse {
   documents: KnowledgeDocument[];
+  sets: KnowledgeSet[];
+  default_set_id: string;
   chunk_count: number;
   roles: string[];
   chunk_chars: number;
@@ -1078,4 +1123,76 @@ export interface AgentOidcConfigResponse {
   problems: string[];
   roles: string[];
   algorithms: string[];
+}
+
+// -- RAG Applications (app/rag_apps.py) --------------------------------------
+export interface RagAppActivity {
+  queries: number;
+  llm_hits: number;
+  tokens_saved: number;
+  cost_saved_usd: number;
+  cost_usd: number;
+  retrievals: number;
+  retrieval_hits: number;
+  last_query_at: string | null;
+}
+
+export interface RagApp {
+  app_id: string;
+  name: string;
+  description: string;
+  owner: string;
+  enabled: boolean;
+  allowed_roles: string[];
+  set_id: string;
+  document_ids: string[];
+  top_k: number;
+  min_score: number;
+  retrieval_ttl_seconds: number;
+  provider: string | null;
+  model: string | null;
+  semantic_cache: boolean;
+  system_prompt: string;
+  no_answer_text: string;
+  agent_id: string | null;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  activity?: RagAppActivity | null;
+}
+
+export interface RagAppsResponse {
+  apps: RagApp[];
+  roles: string[];
+  knowledge_generation: number;
+  activity_window_events: number;
+}
+
+export interface RagSource {
+  n: number;
+  document_id: string;
+  document_title: string;
+  chunk_index: number;
+  score: number | null;
+  preview: string;
+}
+
+export interface RagQueryResponse {
+  app_id: string;
+  role: string;
+  answer: string;
+  sources: RagSource[];
+  retrieval: { cache: "hit" | "miss" | "bypass"; chunks: number; latency_ms: number };
+  llm: null | {
+    cache: { status: string; similarity: number | null; reason?: string | null };
+    provider: string;
+    model: string;
+    usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+    cost_usd: number;
+    tokens_saved: number;
+    cost_saved_usd: number;
+    stub: boolean;
+  };
+  latency_ms: number;
+  trace: { trace_id: string };
 }

@@ -36,10 +36,11 @@ const NAV_SECTIONS: NavSection[] = [
   {
     label: "Registry",
     items: [
+      { to: "/memory", icon: "◉", text: "Agent Memory" },
       { to: "/servers", icon: "⌘", text: "MCP Servers" },
       { to: "/catalog", icon: "≡", text: "Tool Catalog" },
       { to: "/knowledge", icon: "❐", text: "Knowledge Base" },
-      { to: "/memory", icon: "◉", text: "Agent Memory" },
+      { to: "/rag-applications", icon: "❖", text: "RAG Applications" },
     ],
   },
   {
