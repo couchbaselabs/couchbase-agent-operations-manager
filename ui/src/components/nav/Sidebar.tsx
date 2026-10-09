@@ -65,7 +65,8 @@ const NAV_SECTIONS: NavSection[] = [
     label: "Tools",
     items: [
       { to: "/agent-tool-audit", icon: "▸", text: "Agent Tool Audit" },
-      { to: "/developer-sdk", icon: "⤓", text: "Developer SDK" },
+      { to: "/developer-sdk", icon: "⤓", text: "Developer SDK", exact: true },
+      { to: "/developer-sdk/agent-code", icon: "⌥", text: "Agent Code" },
       // Same-origin Swagger UI, proxied from operations-manager - see the
       // comment above the /docs location in ui/nginx.conf.template.
       { to: "/docs", icon: "▤", text: "API Documentation", external: true },

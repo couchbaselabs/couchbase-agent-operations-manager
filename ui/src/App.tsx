@@ -19,6 +19,7 @@ import { InsightsPage } from "./pages/InsightsPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { AgentToolAuditPage } from "./pages/AgentToolAuditPage";
 import { DeveloperSdkPage } from "./pages/DeveloperSdkPage";
+import { AgentCodePage } from "./pages/AgentCodePage";
 import { SettingsAccountsPage } from "./pages/SettingsAccountsPage";
 import { SettingsLdapPage } from "./pages/SettingsLdapPage";
 import { SettingsHttpsCertificatePage } from "./pages/SettingsHttpsCertificatePage";
@@ -82,6 +83,7 @@ export default function App() {
           <Route path="/audit-log" element={<AuditLogPage />} />
           <Route path="/agent-tool-audit" element={<AgentToolAuditPage />} />
           <Route path="/developer-sdk" element={<DeveloperSdkPage />} />
+          <Route path="/developer-sdk/agent-code" element={<AgentCodePage />} />
           <Route
             path="/settings/accounts"
             element={
