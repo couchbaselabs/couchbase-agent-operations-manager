@@ -1,6 +1,61 @@
 import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { AGENT_EXAMPLES, type AgentExample } from "./agentCodeExamples";
+import { AGENT_EXAMPLES, type AgentExample, type AgentSetup } from "./agentCodeExamples";
+
+// Renders `backtick` spans in example copy as <code>, so the data file can
+// stay plain strings.
+function Inline({ text }: { text: string }) {
+  return (
+    <>
+      {text.split("`").map((part, i) => (i % 2 === 1 ? <code key={i}>{part}</code> : <span key={i}>{part}</span>))}
+    </>
+  );
+}
+
+function SetupSection({ setup }: { setup: AgentSetup }) {
+  return (
+    <div className="card section-gap">
+      <div className="card-title">{setup.title}</div>
+      <p className="cell-muted" style={{ marginBottom: 6 }}>
+        <Inline text={setup.intro} />
+      </p>
+      <ol className="setup-steps">
+        {setup.steps.map((step) => (
+          <li key={step.title}>
+            <div className="setup-step-title">{step.title}</div>
+            <p className="cell-muted">
+              <Inline text={step.body} />
+            </p>
+            {step.fields && (
+              <div className="table-wrap" style={{ marginTop: 8 }}>
+                <table className="data-table">
+                  <tbody>
+                    {step.fields.map(([name, value]) => (
+                      <tr key={name}>
+                        <td style={{ whiteSpace: "nowrap", fontWeight: 600, width: 1 }}>{name}</td>
+                        <td className="cell-muted">
+                          <Inline text={value} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {step.code && (
+              <div style={{ position: "relative", marginTop: 8 }}>
+                <pre className="json-block agent-code-block" style={{ maxHeight: "none" }}>{step.code}</pre>
+                <div style={{ position: "absolute", top: 8, right: 8 }}>
+                  <CopyButton text={step.code} />
+                </div>
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
 
 function downloadFile(filename: string, contents: string) {
   const url = URL.createObjectURL(new Blob([contents], { type: "text/x-python" }));
@@ -58,7 +113,7 @@ function AgentExampleView({ example }: { example: AgentExample }) {
           </div>
         </div>
         <div className="helper-banner helper-banner-neutral" style={{ marginTop: 14, marginBottom: 0 }}>
-          {example.note}
+          <Inline text={example.note} />
         </div>
       </div>
 
@@ -73,7 +128,9 @@ function AgentExampleView({ example }: { example: AgentExample }) {
                 {example.env.map(([name, value]) => (
                   <tr key={name}>
                     <td className="cell-mono" style={{ whiteSpace: "nowrap" }}>{name}</td>
-                    <td className="cell-muted">{value}</td>
+                    <td className="cell-muted">
+                      <Inline text={value} />
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -109,6 +166,8 @@ function AgentExampleView({ example }: { example: AgentExample }) {
           </div>
         </div>
       </div>
+
+      {example.setup && <SetupSection setup={example.setup} />}
 
       <div className="card section-gap">
         <div className="flex-between" style={{ marginBottom: 10 }}>

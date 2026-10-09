@@ -1043,3 +1043,32 @@ table.data-table {
   word-break: normal;
   overflow-x: auto;
 }
+
+.setup-steps {
+  margin: 14px 0 0;
+  padding-left: 22px;
+}
+
+.setup-steps > li {
+  padding: 4px 0 16px 4px;
+}
+
+.setup-steps > li + li {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.setup-steps > li::marker {
+  font-weight: 700;
+  color: var(--red);
+}
+
+.setup-step-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.setup-steps p {
+  margin: 0;
+  line-height: 1.55;
+}
