@@ -1,0 +1,23 @@
+# Prometheus configuration for the Docker Compose `monitoring` profile
+# (docker compose --profile monitoring up). Scrapes operations-manager's
+# GET /metrics over its self-signed HTTPS. See MONITORING.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: aom
+    scheme: https
+    tls_config:
+      # operations-manager serves a self-signed certificate by default.
+      # Swap for ca_file once a real certificate is installed.
+      insecure_skip_verify: true
+    # Uncomment when METRICS_TOKEN is set on operations-manager:
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/metrics-token
+    static_configs:
+      - targets: ["operations-manager:8090"]

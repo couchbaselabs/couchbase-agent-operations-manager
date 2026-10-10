@@ -1,0 +1,15 @@
+{{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
+# The private CA that signed the external Couchbase cluster's certificate
+# (couchbase.external.tlsCaCert). A CA certificate is public by design, so
+# a ConfigMap, not a Secret. Mounted read-only at /etc/couchbase-ca/ca.pem
+# into couchbase-init and operations-manager.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aom.couchbaseCaConfigMapName" . }}
+  labels:
+    {{- include "aom.labels" . | nindent 4 }}
+data:
+  ca.pem: |
+    {{- .Values.couchbase.external.tlsCaCert | nindent 4 }}
+{{- end }}

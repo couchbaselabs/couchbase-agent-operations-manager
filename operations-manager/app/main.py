@@ -54,6 +54,7 @@ from app import (
     insights,
     llm_cache,
     memory_consolidation,
+    metrics,
     rag_apps,
     mcp_client,
     sdk_packaging,
@@ -372,6 +373,29 @@ async def agent_request_limits(request: Request, call_next):
 
 
 @app.middleware("http")
+async def prometheus_metrics(request: Request, call_next):
+    """Request count, latency and in-flight gauge for every route, labelled
+    by the route *template* (/v1/servers/{server_id}, not the concrete
+    path) so IDs never turn into unbounded label cardinality. The scrape
+    itself and health probes are excluded so they don't dominate the
+    numbers. See app/metrics.py."""
+    if not metrics.ENABLED or request.url.path in ("/metrics", "/api/health"):
+        return await call_next(request)
+    done = metrics.in_flight()
+    timer = metrics.Timer()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        done()
+        route = request.scope.get("route")
+        template = getattr(route, "path", None) or ("/" + request.url.path.strip("/").split("/")[0] if request.url.path != "/" else "/")
+        metrics.record_http(request.method, template, status, timer.elapsed())
+
+
+@app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -399,6 +423,9 @@ async def security_headers(request: Request, call_next):
 # policy, Settings) and requires a valid session.
 UNPROTECTED_PATH_PREFIXES = (
     "/api/health",
+    # Prometheus scrape target - guarded by its own optional METRICS_TOKEN
+    # bearer check in the route (app/metrics.py), never by a browser session.
+    "/metrics",
     "/v1/auth/login",
     "/v1/auth/logout",
     "/v1/auth/bootstrap",
@@ -637,6 +664,8 @@ async def _startup_step(label: str, awaitable) -> bool:
 @app.on_event("startup")
 async def startup():
     global embeddings, ready
+
+    metrics.set_build_info(app.version, APPLIANCE_NAME)
 
     # Replace asyncio's default executor before anything schedules work on
     # it. Every Couchbase call in this app is an `asyncio.to_thread(...)`,
@@ -2074,6 +2103,21 @@ def _require_store() -> None:
             status_code=503,
             detail="The appliance cannot reach Couchbase yet and is retrying - try again shortly.",
         )
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_scrape(request: Request):
+    """Prometheus exposition. Optional bearer auth via METRICS_TOKEN; 404
+    when the exporter is disabled so a scraper sees "not here" rather than
+    an empty page. See MONITORING.md."""
+    if not metrics.ENABLED:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    if metrics.METRICS_TOKEN:
+        header = request.headers.get("authorization", "")
+        if header != f"Bearer {metrics.METRICS_TOKEN}":
+            raise HTTPException(status_code=401, detail="Metrics token required")
+    body, content_type = metrics.exposition()
+    return Response(content=body, media_type=content_type)
 
 
 @app.get("/api/health")

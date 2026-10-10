@@ -1,0 +1,16 @@
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+# Alerting rules for the appliance. GENERATED from
+# monitoring/prometheus/aom-alerts.yml by scripts/sync-monitoring-assets.py -
+# edit that file, not this one. Requires the monitoring.coreos.com CRDs.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "aom.fullname" . }}-alerts
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+{{ .Files.Get "monitoring/aom-alerts.yml" | indent 2 }}
+{{- end }}

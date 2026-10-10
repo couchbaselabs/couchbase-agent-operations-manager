@@ -1,0 +1,38 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+# Prometheus Operator scrape target for operations-manager's /metrics.
+# Requires the monitoring.coreos.com CRDs (kube-prometheus-stack installs
+# them); see metrics.serviceMonitor in values.yaml and MONITORING.md.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "aom.fullname" . }}-operations-manager
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "aom.componentSelectorLabels" (merge (dict "component" "operations-manager") .) | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: {{ ternary "http" "https" .Values.operationsManager.tls.disabled }}
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+      {{- if not .Values.operationsManager.tls.disabled }}
+      tlsConfig:
+        {{- toYaml .Values.metrics.serviceMonitor.tlsConfig | nindent 8 }}
+      {{- end }}
+      {{- if .Values.metrics.token }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "aom.authSecretName" . }}
+          key: METRICS_TOKEN
+      {{- end }}
+{{- end }}

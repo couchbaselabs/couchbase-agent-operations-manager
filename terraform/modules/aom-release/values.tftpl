@@ -1,0 +1,96 @@
+# Rendered by terraform/modules/aom-release/main.tf - every key here exists
+# in helm/couchbase-agent-operations-manager/values.yaml.
+global:
+  imageRegistry: ${image_registry}
+
+couchbase:
+  enabled: ${couchbase_mode == "bundled"}
+%{ if couchbase_mode == "bundled" ~}
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits:   { cpu: "2",  memory: ${couchbase_memory_limit} }
+  ramQuotaMB:
+    data: 2048
+    index: 512
+    fts: 512
+    bucket: 1024
+  persistence:
+    size: ${couchbase_storage_size}
+    storageClassName: ${storage_class}
+%{ else ~}
+  external:
+    kind: ${couchbase_mode}
+    host: ${ext.host}
+    tls: ${ext.tls}
+    tlsInsecure: ${ext.tls_insecure}
+%{ if ext.tls_ca_pem != "" ~}
+    tlsCaCert: |
+      ${indent(6, ext.tls_ca_pem)}
+%{ endif ~}
+    provision:
+      enabled: ${ext.provision}
+      username: ${ext.provision_username}
+      password: ${ext.provision_password}
+%{ endif ~}
+
+operationsManager:
+  image:
+    tag: ${image_tag}
+  couchbase:
+%{ if couchbase_mode != "bundled" ~}
+    connectionString: ${ext.tls ? "couchbases" : "couchbase"}://${ext.host}
+    searchHost: ${ext.host}
+    bucket: ${ext.bucket}
+    scope: ${ext.scope}
+%{ endif ~}
+    username: ${couchbase_username}
+    password: ${couchbase_password}
+  auth:
+    secretKey: ${auth_secret_key}
+  providerApiKeys:
+    anthropic: ${keys.anthropic}
+    openai: ${keys.openai}
+    gemini: ${keys.gemini}
+    databricks: ${keys.databricks}
+    voyage: ${keys.voyage}
+    cohere: ${keys.cohere}
+    mistral: ${keys.mistral}
+    jina: ${keys.jina}
+  hfCache:
+    persistence:
+      storageClassName: ${storage_class}
+  resources:
+    requests: { cpu: "1",  memory: 3Gi }
+    limits:   { cpu: "2",  memory: 6Gi }
+
+ui:
+  image:
+    tag: ${image_tag}
+  service:
+    type: LoadBalancer
+    annotations:
+%{ for k, v in ui_service_annotations ~}
+      ${k}: "${v}"
+%{ endfor ~}
+
+sampleMcpServers:
+  image:
+    tag: ${image_tag}
+
+metrics:
+  enabled: true
+  token: ${monitoring.metrics_token}
+  serviceMonitor:
+    enabled: ${monitoring.install_stack || monitoring.service_monitor}
+    labels:
+%{ if monitoring_release_label != "" ~}
+      release: ${monitoring_release_label}
+%{ endif ~}
+  prometheusRule:
+    enabled: ${monitoring.install_stack || monitoring.service_monitor}
+    labels:
+%{ if monitoring_release_label != "" ~}
+      release: ${monitoring_release_label}
+%{ endif ~}
+  grafanaDashboard:
+    enabled: ${monitoring.install_stack}

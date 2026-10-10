@@ -58,80 +58,121 @@ prints connection instructions (`NOTES.txt`) once it completes.
 couchbase.persistence.size=...` etc. up front if you want more than the
 20Gi/5Gi defaults for Couchbase data / the embedding-model cache.
 
-## Using an external Couchbase Enterprise server
+## Monitoring
+
+`operations-manager` serves Prometheus metrics on `/metrics`; the chart can
+annotate its Service for scraping (default), render a `ServiceMonitor`,
+`PrometheusRule` and a Grafana dashboard ConfigMap for kube-prometheus-stack
+(`metrics.*` in `values.yaml`). See [MONITORING.md](../../MONITORING.md).
+`terraform/` can install the whole stack next to the chart.
+
+## Using an external Couchbase Enterprise server or Capella
 
 By default this chart deploys and fully manages its own Couchbase Server
 StatefulSet - `couchbase-init-job.yaml` runs the same cluster init/RAM
 quota/bucket/scope/collection/index provisioning as `couchbase-init/init.sh`
-does in Docker Compose, as a post-install/post-upgrade hook. To point
-operations-manager at a Couchbase Enterprise server you already run and
-manage yourself instead:
+does in Docker Compose, as a post-install/post-upgrade hook. To point the
+appliance at a Couchbase Server Enterprise cluster or a Capella database you
+already run instead, set `couchbase.enabled=false` and describe the server
+under `couchbase.external` and `operationsManager.couchbase`.
 
-**First, prepare the cluster.** Create the bucket and scope, a dedicated
-RBAC user with the roles operations-manager needs, and open the ports it
-uses, as described in the main README's
-[Preparing an external cluster](../../README.md#preparing-an-external-cluster).
-All of that applies here unchanged.
+**The `couchbase-init` Job still runs** in external mode
+(`couchbase.external.provision.enabled`, default true), but in a
+provisioning-only form that does nothing cluster-wide: it never runs
+cluster init or touches RAM quotas, and everything it creates is inside the
+appliance's own bucket, with `IF NOT EXISTS`, on first boot and again on
+every `helm upgrade`:
 
-Then keep the credentials and API keys in a values file that stays out of
-git, rather than passing them with `--set` (see
+| Step | Enterprise (`kind: enterprise`) | Capella (`kind: capella`) |
+|---|---|---|
+| Preflight: Enterprise Edition, Data + Index + Query + Search present | yes | yes (Search must be enabled on the database) |
+| Create the bucket (`operationsManager.couchbase.bucket`) | if missing - needs an admin credential, see `provision.username` | never possible from the cluster API: create it in Capella first (`terraform/capella` does this) - the Job fails with a pointer if it's absent |
+| Scope, collections | yes, via the Query service | yes |
+| Primary + secondary GSI indexes | yes | yes |
+| `settings::provisioned` marker document (what ran, when) | yes | yes |
+
+The Search/vector indexes are created by operations-manager itself at
+startup, as before, and its startup also re-creates any collection or
+index the Job didn't (`couchbase_client.py`'s `_ensure_collections` /
+`SECONDARY_INDEXES`), so the two paths agree.
+
+Keep the credentials in a values file that stays out of git (see
 [Keeping secrets off the command line](#keeping-secrets-off-the-command-line)):
 
 ```yaml
 # secrets.values.yaml - add this file to .gitignore
 operationsManager:
   couchbase:
-    username: <your-username>
-    password: <your-password>
-  providerApiKeys:
-    anthropic: <sk-ant-...>   # optional - see LLM provider API keys
-    openai: <sk-...>          # optional
-    gemini: <AIza...>         # optional
+    username: aom            # least-privilege user from the main README, or a Capella database credential
+    password: <password>
+couchbase:
+  external:
+    provision:
+      username: Administrator   # enterprise only: an admin that may create the bucket
+      password: <admin-password>
 ```
+
+Self-managed Enterprise cluster:
 
 ```bash
 helm install agent-ops ./helm/couchbase-agent-operations-manager \
   -f secrets.values.yaml \
   --set couchbase.enabled=false \
+  --set couchbase.external.kind=enterprise \
   --set operationsManager.couchbase.connectionString=couchbases://cb.example.internal \
   --set operationsManager.couchbase.searchHost=cb.example.internal \
-  --set operationsManager.couchbase.bucket=<your-bucket> \
-  --set operationsManager.couchbase.scope=<your-scope> \
+  --set-file couchbase.external.tlsCaCert=corp-ca.pem \
   --namespace agent-ops --create-namespace
 ```
 
-- `couchbase.enabled=false` skips the bundled StatefulSet, its headless
-  Service, and the `couchbase-init` Job entirely - none of them get
-  created. That Job's cluster-init/RAM-quota steps are cluster-wide
-  operations, fine to run against a Couchbase node this chart owns
-  outright and not something you want run against a cluster other
-  workloads share, so external mode doesn't run it at all rather than
-  trying to make it "safe" for someone else's cluster.
-- Nothing is lost by skipping that Job: operations-manager's startup
-  creates every collection, primary index, secondary GSI index and
-  Search/vector index itself (see
-  `operations-manager/app/couchbase_client.py`). It does so best-effort,
-  so if the RBAC user is missing a role you'll see `Could not create
-  collection` / `Could not ensure index` warnings in the Pod log rather
-  than a crash - check `kubectl logs` on first install.
-- `operationsManager.couchbase.username` defaults to `Administrator`, so
-  set it to your dedicated user. The chart refuses to render (`helm
-  install` fails up front) if `couchbase.enabled=false` and no password is
-  set.
-- `connectionString` needs whatever scheme your server actually requires
-  - `couchbases://` (TLS) is typical for a real external Enterprise
-    cluster, unlike the bundled StatefulSet's plain `couchbase://`.
-- operations-manager's startup `initContainer` still waits for that
-  bucket/scope to actually exist before the main container starts,
-  whether Couchbase is the bundled StatefulSet or your external server -
-  only *what* it waits on changes. It polls over plain HTTP on port 8091,
-  so that port must be reachable from the cluster even if your
-  connection string uses `couchbases://`. If the Pod sits in `Init`
-  against an external cluster, check 8091 reachability, the bucket/scope
-  names and the RBAC user, in that order.
+Capella:
+
+```bash
+helm install agent-ops ./helm/couchbase-agent-operations-manager \
+  -f secrets.values.yaml \
+  --set couchbase.enabled=false \
+  --set couchbase.external.kind=capella \
+  --set operationsManager.couchbase.connectionString=couchbases://cb.abcd1234.cloud.couchbase.com \
+  --set operationsManager.couchbase.searchHost=cb.abcd1234.cloud.couchbase.com \
+  --namespace agent-ops --create-namespace
+```
+
+Notes:
+
+- `couchbase.external.tls` defaults to true: the Job and the
+  operations-manager initContainer talk to `https://<host>:18091` and
+  `:18093`, and operations-manager's Search admin calls move to
+  `https://<host>:18094` (`COUCHBASE_SEARCH_SCHEME`/`COUCHBASE_SEARCH_PORT`
+  are set for you). The ports that must be reachable from the cluster are
+  therefore **11207, 18091, 18093 and 18094** - on Capella that means the
+  node pool's egress IP on the database's allowlist, or a private endpoint.
+- `tlsCaCert` is for a private/corporate CA; leave it empty for Capella.
+  `tlsInsecure: true` disables verification and is for a lab only.
+- `provision.username/password` is the credential the Job uses. On
+  enterprise, creating the bucket needs `cluster_admin` or `bucket_admin`,
+  so give the Job an admin here and keep `operationsManager.couchbase.*` on
+  the least-privilege user from the main README's
+  [Preparing an external cluster](../../README.md#preparing-an-external-cluster).
+  On Capella, one Read/Write database credential does everything - leave
+  `provision.*` empty.
+- A failed Job fails the install: `kubectl logs job/<release>-couchbase-init`
+  names the step and the object. The usual first-boot failures are, in
+  order, the allowlist/firewall (the Job times out reaching `:18093`
+  after three minutes), a missing Capella bucket, and the Search service
+  not enabled on the target.
+- `couchbase.external.provision.enabled=false` turns the Job off entirely
+  and restores the previous behaviour: you prepare the bucket and scope
+  yourself and operations-manager creates the rest at startup.
+- The `wait-for-dependencies` initContainer waits for the bucket and scope
+  to exist on the external server before starting the main container, now
+  over the same scheme and trust settings as the Job.
 
 Switch back to the bundled StatefulSet at any time with
 `--set couchbase.enabled=true` (and unset the `operationsManager.couchbase.connectionString`/`searchHost` overrides) on a `helm upgrade`.
+
+To provision the cloud infrastructure around this chart - EKS, AKS or GKE,
+the registries, and Capella buckets/credentials/allowlist - see
+[`terraform/README.md`](../../terraform/README.md).
 
 ## LLM provider API keys
 

@@ -136,3 +136,57 @@ own Search/FTS requests) rather than the SDK connection string.
 {{- define "aom.uiServiceName" -}}
 {{- printf "%s-ui" (include "aom.fullname" .) -}}
 {{- end -}}
+
+{{- /*
+Whether the couchbase-init Job (and its ConfigMap) render: always for the
+bundled Couchbase, and in external mode only when
+couchbase.external.provision.enabled is true.
+*/ -}}
+{{- define "aom.couchbaseInitEnabled" -}}
+{{- if .Values.couchbase.enabled -}}
+true
+{{- else if .Values.couchbase.external.provision.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /* True when the external cluster is reached over TLS. */ -}}
+{{- define "aom.couchbaseExternalTls" -}}
+{{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tls -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /* Hostname used for REST calls (management/query/search) in external mode. */ -}}
+{{- define "aom.couchbaseExternalHost" -}}
+{{- default .Values.operationsManager.couchbase.searchHost .Values.couchbase.external.host -}}
+{{- end -}}
+
+{{- /*
+Base URL of the management REST API as the initContainers poll it: plain
+8091 on the bundled service, https 18091 (or http 8091) on an external one.
+*/ -}}
+{{- define "aom.couchbaseMgmtUrl" -}}
+{{- if .Values.couchbase.enabled -}}
+http://{{ include "aom.couchbaseServiceName" . }}:8091
+{{- else if .Values.couchbase.external.tls -}}
+https://{{ include "aom.couchbaseExternalHost" . }}:18091
+{{- else -}}
+http://{{ include "aom.couchbaseExternalHost" . }}:8091
+{{- end -}}
+{{- end -}}
+
+{{- /* curl flags for TLS trust against the external cluster. */ -}}
+{{- define "aom.couchbaseCurlTlsFlags" -}}
+{{- if include "aom.couchbaseExternalTls" . -}}
+{{- if .Values.couchbase.external.tlsCaCert -}}
+--cacert /etc/couchbase-ca/ca.pem
+{{- else if .Values.couchbase.external.tlsInsecure -}}
+--insecure
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "aom.couchbaseCaConfigMapName" -}}
+{{- printf "%s-couchbase-ca" (include "aom.fullname" .) -}}
+{{- end -}}

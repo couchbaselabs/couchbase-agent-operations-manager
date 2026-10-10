@@ -26,11 +26,74 @@
 
 command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y curl) || (yum install -y curl) || true
 
-CB_HOST=couchbase
+# ---------------------------------------------------------------------------
+# Which server, and how to reach it.
+#
+# Bundled mode (the default, COUCHBASE_EXTERNAL unset/false): the Couchbase
+# container this appliance owns outright - plain http on 8091/8093, and this
+# script initializes the cluster, sets its RAM quotas and creates its bucket.
+#
+# External mode (COUCHBASE_EXTERNAL=true): a Couchbase Server Enterprise
+# cluster (COUCHBASE_EXTERNAL_KIND=enterprise) or a Capella database
+# (COUCHBASE_EXTERNAL_KIND=capella) that somebody else runs. This script then
+# does ONLY what the appliance needs inside its own bucket, on first boot and
+# idempotently on every later run:
+#   - never cluster-init, never touch cluster-wide RAM quotas
+#   - enterprise: create the bucket if it is missing (with the quota and
+#     eviction policy below), but never resize or re-policy an existing one -
+#     after creation, sizing belongs to whoever runs the cluster
+#   - capella: buckets can only be created through the Capella UI/API, so
+#     the bucket must already exist (fail loudly with a pointer if not)
+#   - scope, collections, primary + secondary indexes: created with
+#     IF NOT EXISTS through the Query service, which works identically on
+#     Enterprise and Capella with an ordinary database credential
+#   - write a settings::provisioned marker into the bucket so "what did AOM
+#     provision here, and when?" is one document away
+# External clusters normally speak TLS only, so COUCHBASE_TLS defaults to
+# true there (https on 18091/18093). COUCHBASE_TLS_CA_FILE points at a PEM
+# bundle for a private CA; COUCHBASE_TLS_VERIFY=false is the lab-only escape
+# hatch for an untrusted self-signed certificate. Capella needs neither.
+# ---------------------------------------------------------------------------
+CB_EXTERNAL="${COUCHBASE_EXTERNAL:-false}"
+CB_EXTERNAL_KIND="${COUCHBASE_EXTERNAL_KIND:-enterprise}"
+CB_HOST="${COUCHBASE_HOST:-couchbase}"
 CB_USER="${COUCHBASE_USERNAME:-Administrator}"
 CB_PASS="${COUCHBASE_PASSWORD:-CouchbaseDemo123!}"
 CB_BUCKET="${COUCHBASE_BUCKET:-agent_operations}"
 CB_SCOPE="${COUCHBASE_SCOPE:-agent_operations}"
+
+if [ "${CB_EXTERNAL}" = "true" ]; then
+  CB_TLS="${COUCHBASE_TLS:-true}"
+else
+  CB_TLS="${COUCHBASE_TLS:-false}"
+fi
+CB_TLS_CA_FILE="${COUCHBASE_TLS_CA_FILE:-}"
+CB_TLS_VERIFY="${COUCHBASE_TLS_VERIFY:-true}"
+CURL="curl -s"
+CB_CLI_TLS=""
+if [ "${CB_TLS}" = "true" ]; then
+  CB_MGMT="https://${CB_HOST}:18091"
+  CB_QUERY="https://${CB_HOST}:18093"
+  CB_CLI_HOST="https://${CB_HOST}:18091"
+  if [ -n "${CB_TLS_CA_FILE}" ]; then
+    CURL="${CURL} --cacert ${CB_TLS_CA_FILE}"
+    CB_CLI_TLS="--cacert ${CB_TLS_CA_FILE}"
+  elif [ "${CB_TLS_VERIFY}" = "false" ]; then
+    CURL="${CURL} --insecure"
+    CB_CLI_TLS="--no-ssl-verify"
+  fi
+else
+  CB_MGMT="${CB_MGMT}"
+  CB_QUERY="${CB_QUERY}"
+  CB_CLI_HOST="${CB_HOST}"
+fi
+
+# Runs one N1QL statement and prints the raw JSON response. The Query service
+# answers HTTP 200 even on failure (the error is in an "errors" array), so
+# callers grep the output rather than trusting the exit status.
+n1ql() {
+  ${CURL} -u "${CB_USER}:${CB_PASS}" "${CB_QUERY}/query/service" --data-urlencode "statement=$1"
+}
 
 # RAM quotas, in MB. These are the ceiling on how much this appliance can
 # hold before the data service starts refusing writes, so they are sized for
@@ -62,13 +125,62 @@ CB_RAM_BUCKET="${COUCHBASE_BUCKET_RAMSIZE:-1024}"
 # RAM. Set to valueOnly to keep the previous behaviour.
 CB_EVICTION_POLICY="${COUCHBASE_BUCKET_EVICTION_POLICY:-fullEviction}"
 
-echo "[couchbase-init] Waiting for Couchbase Server web console..."
-until curl -s -o /dev/null http://${CB_HOST}:8091/pools; do
-  sleep 2
-done
+if [ "${CB_EXTERNAL}" = "true" ]; then
+  # An external server that never answers is a configuration or network
+  # problem (allowlist, firewall, wrong host), not something to wait on
+  # forever: give it a few minutes, then fail with a message that says so.
+  echo "[couchbase-init] External ${CB_EXTERNAL_KIND} server: waiting for the Query service at ${CB_QUERY}..."
+  ATTEMPTS=0
+  until ${CURL} -o /dev/null -u "${CB_USER}:${CB_PASS}" "${CB_QUERY}/admin/ping"; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    if [ "${ATTEMPTS}" -ge 90 ]; then
+      echo "[couchbase-init] ERROR: ${CB_QUERY} did not answer in 3 minutes."
+      echo "[couchbase-init]   Check that ${CB_HOST} is reachable from this cluster (Capella IP allowlist /"
+      echo "[couchbase-init]   private endpoint, security group or firewall for 18091-18094 and 11207),"
+      echo "[couchbase-init]   that COUCHBASE_TLS/COUCHBASE_TLS_CA_FILE match the server, and the credentials."
+      exit 1
+    fi
+    sleep 2
+  done
+  # /admin/ping answers without credentials; a real statement is the test.
+  AUTH_OUTPUT=$(n1ql "SELECT 1 AS ok")
+  if ! echo "${AUTH_OUTPUT}" | grep -q '"ok"'; then
+    echo "[couchbase-init] ERROR: the Query service rejected the credentials for '${CB_USER}': ${AUTH_OUTPUT}"
+    exit 1
+  fi
 
+  # Preflight: Enterprise Edition >= 7.6 with Data, Index, Query and Search
+  # all present - the vector-typed Search index field this appliance relies
+  # on needs all of that. The management REST is not always reachable from
+  # outside (Capella exposes it, but an on-prem cluster may only open the
+  # SDK ports), so a preflight that cannot run is reported, not fatal.
+  POOL_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" "${CB_MGMT}/pools/default" 2>/dev/null)
+  if echo "${POOL_OUTPUT}" | grep -q '"nodes"'; then
+    CB_VERSION=$(echo "${POOL_OUTPUT}" | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    echo "[couchbase-init] Server version: ${CB_VERSION:-unknown}"
+    if echo "${POOL_OUTPUT}" | grep -q 'community'; then
+      echo "[couchbase-init] ERROR: Community Edition detected - Enterprise Edition is required (vector Search)."
+      exit 1
+    fi
+    for SVC in kv index n1ql fts; do
+      if ! echo "${POOL_OUTPUT}" | grep -q "\"${SVC}\""; then
+        echo "[couchbase-init] ERROR: the cluster has no node running the '${SVC}' service - Data, Index, Query and Search are all required."
+        exit 1
+      fi
+    done
+  else
+    echo "[couchbase-init] Management REST at ${CB_MGMT} not reachable with these credentials - skipping the edition/services preflight."
+  fi
+else
+  echo "[couchbase-init] Waiting for Couchbase Server web console..."
+  until ${CURL} -o /dev/null ${CB_MGMT}/pools; do
+    sleep 2
+  done
+fi
+
+if [ "${CB_EXTERNAL}" != "true" ]; then
 echo "[couchbase-init] Initializing cluster (skips gracefully if already initialized)..."
-CLUSTER_INIT_OUTPUT=$(couchbase-cli cluster-init -c ${CB_HOST} \
+CLUSTER_INIT_OUTPUT=$(couchbase-cli cluster-init -c ${CB_CLI_HOST} ${CB_CLI_TLS} \
   --cluster-username "${CB_USER}" \
   --cluster-password "${CB_PASS}" \
   --cluster-ramsize ${CB_RAM_DATA} \
@@ -84,7 +196,7 @@ else
 fi
 
 echo "[couchbase-init] Waiting for the cluster to accept authenticated requests..."
-until curl -s -o /dev/null -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8091/pools/default; do
+until ${CURL} -o /dev/null -u "${CB_USER}:${CB_PASS}" ${CB_MGMT}/pools/default; do
   sleep 2
 done
 
@@ -96,7 +208,7 @@ done
 # then ignored, because a sizing change that cannot be applied is never a
 # reason to fail provisioning.
 echo "[couchbase-init] Ensuring cluster RAM quotas (data=${CB_RAM_DATA}MB index=${CB_RAM_INDEX}MB fts=${CB_RAM_FTS}MB)..."
-CLUSTER_RAM_OUTPUT=$(couchbase-cli setting-cluster -c ${CB_HOST} -u "${CB_USER}" -p "${CB_PASS}" \
+CLUSTER_RAM_OUTPUT=$(couchbase-cli setting-cluster -c ${CB_CLI_HOST} ${CB_CLI_TLS} -u "${CB_USER}" -p "${CB_PASS}" \
   --cluster-ramsize ${CB_RAM_DATA} \
   --cluster-index-ramsize ${CB_RAM_INDEX} \
   --cluster-fts-ramsize ${CB_RAM_FTS} 2>&1)
@@ -106,8 +218,24 @@ else
   echo "[couchbase-init] setting-cluster (continuing anyway): ${CLUSTER_RAM_OUTPUT}"
 fi
 
+fi  # end bundled-only cluster init + quotas
+
+if [ "${CB_EXTERNAL}" = "true" ] && [ "${CB_EXTERNAL_KIND}" = "capella" ]; then
+  # Capella buckets are created through the Capella UI or management API
+  # (the Terraform in terraform/capella does it) - never through the cluster
+  # REST API this script has access to. Verify it exists and move on.
+  BUCKET_CHECK=$(n1ql "SELECT RAW name FROM system:buckets WHERE name = \"${CB_BUCKET}\"")
+  if echo "${BUCKET_CHECK}" | grep -q "\"${CB_BUCKET}\""; then
+    echo "[couchbase-init] Capella bucket '${CB_BUCKET}' present."
+  else
+    echo "[couchbase-init] ERROR: bucket '${CB_BUCKET}' does not exist on this Capella database."
+    echo "[couchbase-init]   Create it in the Capella UI (or with terraform/capella), give the credential"
+    echo "[couchbase-init]   '${CB_USER}' Read/Write on it, then re-run."
+    exit 1
+  fi
+else
 echo "[couchbase-init] Creating bucket '${CB_BUCKET}' (skips gracefully if it already exists)..."
-BUCKET_CREATE_OUTPUT=$(couchbase-cli bucket-create -c ${CB_HOST} -u "${CB_USER}" -p "${CB_PASS}" \
+BUCKET_CREATE_OUTPUT=$(couchbase-cli bucket-create -c ${CB_CLI_HOST} ${CB_CLI_TLS} -u "${CB_USER}" -p "${CB_PASS}" \
   --bucket ${CB_BUCKET} --bucket-type couchbase --bucket-ramsize ${CB_RAM_BUCKET} \
   --bucket-eviction-policy ${CB_EVICTION_POLICY} 2>&1)
 if echo "${BUCKET_CREATE_OUTPUT}" | grep -qi "already exists"; then
@@ -118,13 +246,16 @@ else
   echo "[couchbase-init] bucket-create: ${BUCKET_CREATE_OUTPUT}"
 fi
 
+fi  # end bucket creation (enterprise + bundled)
+
+if [ "${CB_EXTERNAL}" != "true" ]; then
 # Same reasoning as setting-cluster above: bucket-create reports "already
 # exists" and moves on, so this is the only thing that resizes the bucket of
 # a deployment that has been running since before the quota changed. This is
 # the single step that unwedges a bucket already full enough to be refusing
 # writes.
 echo "[couchbase-init] Ensuring bucket '${CB_BUCKET}' RAM quota (${CB_RAM_BUCKET}MB)..."
-BUCKET_RAM_OUTPUT=$(couchbase-cli bucket-edit -c ${CB_HOST} -u "${CB_USER}" -p "${CB_PASS}" \
+BUCKET_RAM_OUTPUT=$(couchbase-cli bucket-edit -c ${CB_CLI_HOST} ${CB_CLI_TLS} -u "${CB_USER}" -p "${CB_PASS}" \
   --bucket ${CB_BUCKET} --bucket-ramsize ${CB_RAM_BUCKET} 2>&1)
 if echo "${BUCKET_RAM_OUTPUT}" | grep -qi "SUCCESS"; then
   echo "[couchbase-init] Bucket RAM quota applied."
@@ -136,15 +267,15 @@ fi
 # re-assert it the same way as the RAM quota. Changing it restarts the
 # bucket (a short warm-up, once) - which is why this only runs when the
 # policy actually differs.
-CURRENT_EVICTION=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET} \
+CURRENT_EVICTION=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_MGMT}/pools/default/buckets/${CB_BUCKET} \
   | grep -o '"evictionPolicy":"[A-Za-z]*"' | cut -d'"' -f4)
 if [ -n "${CURRENT_EVICTION}" ] && [ "${CURRENT_EVICTION}" != "${CB_EVICTION_POLICY}" ]; then
   echo "[couchbase-init] Changing bucket '${CB_BUCKET}' eviction policy ${CURRENT_EVICTION} -> ${CB_EVICTION_POLICY} (the bucket restarts briefly)..."
-  EVICTION_OUTPUT=$(couchbase-cli bucket-edit -c ${CB_HOST} -u "${CB_USER}" -p "${CB_PASS}" \
+  EVICTION_OUTPUT=$(couchbase-cli bucket-edit -c ${CB_CLI_HOST} ${CB_CLI_TLS} -u "${CB_USER}" -p "${CB_PASS}" \
     --bucket ${CB_BUCKET} --bucket-eviction-policy ${CB_EVICTION_POLICY} 2>&1)
   if echo "${EVICTION_OUTPUT}" | grep -qi "SUCCESS"; then
     echo "[couchbase-init] Eviction policy applied - waiting for the bucket to warm up..."
-    until curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET} | grep -q '"status":"healthy"'; do
+    until ${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_MGMT}/pools/default/buckets/${CB_BUCKET} | grep -q '"status":"healthy"'; do
       sleep 3
     done
   else
@@ -152,12 +283,22 @@ if [ -n "${CURRENT_EVICTION}" ] && [ "${CURRENT_EVICTION}" != "${CB_EVICTION_POL
   fi
 fi
 
+fi  # end bundled-only bucket sizing / eviction re-assert
+
 sleep 5
 
 echo "[couchbase-init] Creating scope '${CB_SCOPE}'..."
-curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
-  http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET}/scopes \
+if [ "${CB_EXTERNAL}" = "true" ]; then
+  # Through the Query service rather than the management REST: identical on
+  # Enterprise and Capella, and it needs only scope_admin on the bucket (a
+  # Capella Read/Write credential has it) rather than cluster-level access.
+  SCOPE_OUTPUT=$(n1ql "CREATE SCOPE \`${CB_BUCKET}\`.\`${CB_SCOPE}\` IF NOT EXISTS")
+  echo "${SCOPE_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: CREATE SCOPE: ${SCOPE_OUTPUT}"
+else
+${CURL} -u "${CB_USER}:${CB_PASS}" -X POST \
+  ${CB_MGMT}/pools/default/buckets/${CB_BUCKET}/scopes \
   -d name=${CB_SCOPE} > /dev/null || true
+fi
 
 # servers   - the registered MCP server registry (trust_status, mcp_url, owner)
 # tools     - every tool pulled from a trusted registered server: name,
@@ -210,9 +351,14 @@ curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
 #             the tool catalog uses (see operations-manager/app/knowledge.py)
 for COLLECTION in servers tools identities access_log llm_cache llm_cache_log context_cache context_cache_log settings agent_memory users traces evals counters approvals knowledge; do
   echo "[couchbase-init] Creating collection '${CB_SCOPE}.${COLLECTION}'..."
-  curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
-    http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET}/scopes/${CB_SCOPE}/collections \
+  if [ "${CB_EXTERNAL}" = "true" ]; then
+    COLL_OUTPUT=$(n1ql "CREATE COLLECTION \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\` IF NOT EXISTS")
+    echo "${COLL_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: CREATE COLLECTION ${COLLECTION}: ${COLL_OUTPUT}"
+  else
+  ${CURL} -u "${CB_USER}:${CB_PASS}" -X POST \
+    ${CB_MGMT}/pools/default/buckets/${CB_BUCKET}/scopes/${CB_SCOPE}/collections \
     -d name=${COLLECTION} > /dev/null || true
+  fi
 done
 
 echo "[couchbase-init] Waiting for collections to propagate to the Query service..."
@@ -220,7 +366,7 @@ sleep 8
 
 echo "[couchbase-init] Creating primary indexes for N1QL support..."
 for COLLECTION in servers tools identities access_log llm_cache llm_cache_log context_cache context_cache_log settings agent_memory users traces evals approvals knowledge; do
-  curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  ${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
     -d "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\`" > /dev/null || true
 done
 
@@ -240,7 +386,7 @@ done
 # reserved word in N1QL, so an earlier revision of this script that used
 # it unquoted in the index-key list failed on every single run without
 # ever showing up here.
-IDX_TIMESTAMP_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_TIMESTAMP_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp)")
 echo "${IDX_TIMESTAMP_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_timestamp: ${IDX_TIMESTAMP_OUTPUT}"
 
@@ -255,7 +401,7 @@ echo "${IDX_TIMESTAMP_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WA
 # every dashboard load or 30s auto-refresh, which is what made the page
 # take multiple seconds to load. Listing every referenced field here lets
 # the same query run as a pure index scan instead.
-IDX_AGG_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_AGG_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)")
 echo "${IDX_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_agg: ${IDX_AGG_OUTPUT}"
 
@@ -268,11 +414,11 @@ echo "${IDX_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING:
 # has to KV-fetch every matching document just to read those two fields.
 # `role` must stay backtick-quoted - see the WARNING comment above this
 # block for why.
-IDX_ACCESS_TOPOLOGY_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_ACCESS_TOPOLOGY_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_access_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`access_log\`(timestamp, action, decision, \`role\`, server_id)")
 echo "${IDX_ACCESS_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_access_log_topology: ${IDX_ACCESS_TOPOLOGY_OUTPUT}"
 
-IDX_LLM_TOPOLOGY_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_LLM_TOPOLOGY_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, \`role\`, provider)")
 echo "${IDX_LLM_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_topology: ${IDX_LLM_TOPOLOGY_OUTPUT}"
 
@@ -280,11 +426,11 @@ echo "${IDX_LLM_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init]
 # the Context Cache dashboard's aggregate query - same reasoning as the two
 # llm_cache_log indexes above, see app/couchbase_client.py's
 # recent_context_events()/context_dashboard_aggregate_since().
-IDX_CTX_TIMESTAMP_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_CTX_TIMESTAMP_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_context_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`context_cache_log\`(timestamp)")
 echo "${IDX_CTX_TIMESTAMP_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_context_cache_log_timestamp: ${IDX_CTX_TIMESTAMP_OUTPUT}"
 
-IDX_CTX_AGG_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_CTX_AGG_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_context_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`context_cache_log\`(timestamp, outcome, \`namespace\`, subject, latency_saved_ms, latency_ms, value_bytes)")
 echo "${IDX_CTX_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_context_cache_log_agg: ${IDX_CTX_AGG_OUTPUT}"
 
@@ -307,7 +453,7 @@ for SPEC in \
   IDX_NAME=$(echo "${SPEC}" | cut -d'|' -f1)
   IDX_COLL=$(echo "${SPEC}" | cut -d'|' -f2)
   IDX_FIELD=$(echo "${SPEC}" | cut -d'|' -f3)
-  IDX_RECENT_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  IDX_RECENT_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
     -d "statement=CREATE INDEX IF NOT EXISTS ${IDX_NAME} ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${IDX_COLL}\`(${IDX_FIELD} DESC)")
   echo "${IDX_RECENT_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: ${IDX_NAME}: ${IDX_RECENT_OUTPUT}"
 done
@@ -318,7 +464,7 @@ echo "[couchbase-init] Couchbase provisioning complete."
 # (doc_type="agent_run") newest-first and the detail view reads every span
 # of one trace ordered by start time; both are covered here so neither has
 # to scan a collection that grows a document per span.
-IDX_TRACES_RUNS_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_TRACES_RUNS_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_traces_runs ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`traces\`(doc_type, started_at DESC, \`role\`, status)")
 echo "${IDX_TRACES_RUNS_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_traces_runs: ${IDX_TRACES_RUNS_OUTPUT}"
 
@@ -328,34 +474,34 @@ echo "${IDX_TRACES_RUNS_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] 
 # without this the aggregate falls back to fetching every matching
 # agent_run document from the data service - the same trap idx_llm_cache_log_agg
 # above was added to avoid for the LLM cache dashboard's rollup.
-IDX_TRACES_AGG_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_TRACES_AGG_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_traces_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`traces\`(started_at, \`role\`, error_count, total_tokens, cost_usd, cache_hits, hijack_flags, limit_blocks) WHERE doc_type = 'agent_run'")
 echo "${IDX_TRACES_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_traces_agg: ${IDX_TRACES_AGG_OUTPUT}"
 
-IDX_TRACES_SPANS_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_TRACES_SPANS_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_traces_spans ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`traces\`(trace_id, started_epoch_ms) WHERE doc_type = 'agent_span'")
 echo "${IDX_TRACES_SPANS_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_traces_spans: ${IDX_TRACES_SPANS_OUTPUT}"
 
 # The evaluation regression gate reads "the previous run for this dataset"
 # on every run, which is this index and nothing else.
-IDX_EVAL_RUNS_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_EVAL_RUNS_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_eval_runs ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`evals\`(doc_type, dataset_id, started_at DESC)")
 echo "${IDX_EVAL_RUNS_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_eval_runs: ${IDX_EVAL_RUNS_OUTPUT}"
 
 # The Approvals queue reads pending approvals newest-first, and the agent
 # polling route reads one by document ID (no index needed for that).
-IDX_APPROVALS_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_APPROVALS_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_approvals_queue ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`approvals\`(doc_type, status, requested_at DESC)")
 echo "${IDX_APPROVALS_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_approvals_queue: ${IDX_APPROVALS_OUTPUT}"
 
 # Knowledge document listing, and the delete that removes a document's
 # chunks by document_id. Retrieval itself goes through the FTS vector index
 # the service creates on startup, not through N1QL.
-IDX_KNOWLEDGE_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_KNOWLEDGE_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_knowledge_documents ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`knowledge\`(doc_type, created_at DESC)")
 echo "${IDX_KNOWLEDGE_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_knowledge_documents: ${IDX_KNOWLEDGE_OUTPUT}"
 
-IDX_KNOWLEDGE_DOCID_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_KNOWLEDGE_DOCID_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_knowledge_by_document ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`knowledge\`(document_id)")
 echo "${IDX_KNOWLEDGE_DOCID_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_knowledge_by_document: ${IDX_KNOWLEDGE_DOCID_OUTPUT}"
 
@@ -363,12 +509,23 @@ echo "${IDX_KNOWLEDGE_DOCID_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-in
 # aggregated per user. Keep in sync with SECONDARY_INDEXES in
 # operations-manager/app/couchbase_client.py, which also creates these on
 # startup for bring-your-own clusters.
-IDX_MEMORY_USER_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_MEMORY_USER_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_agent_memory_user ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`agent_memory\`(user_id, created_at DESC, status, session_id, memory_type)")
 echo "${IDX_MEMORY_USER_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_agent_memory_user: ${IDX_MEMORY_USER_OUTPUT}"
-IDX_MEMORY_AGG_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+IDX_MEMORY_AGG_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
   -d "statement=CREATE INDEX IF NOT EXISTS idx_agent_memory_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`agent_memory\`(user_id, status, updated_at, session_id, consolidation_kind)")
 echo "${IDX_MEMORY_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_agent_memory_agg: ${IDX_MEMORY_AGG_OUTPUT}"
+
+if [ "${CB_EXTERNAL}" = "true" ]; then
+  # Leave a record IN the server of what was provisioned and when. Support
+  # asks for this document first; a run that only re-confirms existing
+  # objects still updates last_run_at, so "has the init ever reached this
+  # cluster?" and "did the latest upgrade run?" are both answerable.
+  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  MARKER_OUTPUT=$(n1ql "UPSERT INTO \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`settings\` (KEY, VALUE) VALUES (\"settings::provisioned\", {\"provisioner\": \"couchbase-init\", \"mode\": \"external\", \"kind\": \"${CB_EXTERNAL_KIND}\", \"init_version\": \"${COUCHBASE_INIT_VERSION:-unversioned}\", \"last_run_at\": \"${NOW}\", \"first_run_at\": IFMISSINGORNULL((SELECT RAW s.first_run_at FROM \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`settings\` s USE KEYS \"settings::provisioned\")[0], \"${NOW}\")})")
+  echo "${MARKER_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: settings::provisioned marker: ${MARKER_OUTPUT}"
+  echo "[couchbase-init] External provisioning complete (settings::provisioned updated)."
+fi
 
 # Provisioning is idempotent and safe to re-run, so rather than exiting
 # (which Docker/Docker Desktop shows as a stopped/"unhealthy-looking"

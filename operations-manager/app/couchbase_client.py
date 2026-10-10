@@ -53,7 +53,9 @@ from config import (
     LLM_CACHE_LOG_RETENTION_HOURS,
     QUERY_TIMEOUT_SECONDS,
     TRACE_RETENTION_HOURS,
+    couchbase_requests_verify,
 )
+from app import metrics
 
 logger = logging.getLogger("operations-manager.couchbase")
 
@@ -167,6 +169,7 @@ class CouchbaseStore:
             try:
                 await asyncio.to_thread(self._connect_sync)
                 self.connected = True
+                metrics.set_couchbase_connected(True)
                 logger.info("Connected to Couchbase on attempt %d", attempt)
                 await self.ensure_search_index()
                 await self.ensure_llm_cache_index()
@@ -178,9 +181,16 @@ class CouchbaseStore:
                 await asyncio.sleep(delay_seconds)
         logger.error("Could not connect to Couchbase after %d attempts - running degraded", retries)
         self.connected = False
+        metrics.set_couchbase_connected(False)
 
     def _connect_sync(self):
-        auth = PasswordAuthenticator(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"])
+        auth_kwargs = {}
+        if COUCHBASE_CONFIG["tls_ca_file"]:
+            # A private CA for a couchbases:// cluster - see
+            # COUCHBASE_TLS_CA_FILE in config.py. Capella and publicly-signed
+            # certificates need nothing here.
+            auth_kwargs["cert_path"] = COUCHBASE_CONFIG["tls_ca_file"]
+        auth = PasswordAuthenticator(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"], **auth_kwargs)
         cluster = Cluster(
             COUCHBASE_CONFIG["connection_string"],
             ClusterOptions(
@@ -400,18 +410,19 @@ class CouchbaseStore:
         port = COUCHBASE_CONFIG["search_port"]
         bucket = COUCHBASE_CONFIG["bucket"]
         scope = COUCHBASE_CONFIG["scope"]
-        return f"http://{host}:{port}/api/bucket/{bucket}/scope/{scope}/index/{index_name}"
+        scheme = COUCHBASE_CONFIG["search_scheme"]
+        return f"{scheme}://{host}:{port}/api/bucket/{bucket}/scope/{scope}/index/{index_name}"
 
     async def ensure_search_index(self):
         def _upsert():
             auth = (COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"])
             index_name = COUCHBASE_CONFIG["tools_index"]
             url = self._search_admin_url(index_name)
-            existing = requests.get(url, auth=auth, timeout=10)
+            existing = requests.get(url, auth=auth, timeout=10, verify=couchbase_requests_verify())
             if existing.status_code == 200:
                 logger.info("Search index '%s' already exists", index_name)
                 return
-            resp = requests.put(url, auth=auth, json=self._index_definition(), timeout=15)
+            resp = requests.put(url, auth=auth, json=self._index_definition(), timeout=15, verify=couchbase_requests_verify())
             if resp.status_code in (200, 201):
                 logger.info("Search index '%s' created", index_name)
             else:
@@ -787,6 +798,12 @@ class CouchbaseStore:
             "hijack_severity": hijack_severity,
             "hijack_signals": hijack_signals or [],
         }
+        # Prometheus sees every decision from this one choke point, same as
+        # the Audit Log page and SIEM forwarding (app/metrics.py).
+        metrics.record_gateway_decision(
+            action=action, decision=decision, role=role, server_id=server_id,
+            latency_ms=latency_ms, hijack_flagged=hijack_flagged, hijack_severity=hijack_severity,
+        )
         try:
             await asyncio.to_thread(
                 self.access_log.upsert, doc_id, doc, UpsertOptions(expiry=timedelta(hours=AUDIT_LOG_RETENTION_HOURS))
@@ -976,11 +993,11 @@ class CouchbaseStore:
             auth = (COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"])
             index_name = COUCHBASE_CONFIG["llm_cache_index"]
             url = self._search_admin_url(index_name)
-            existing = requests.get(url, auth=auth, timeout=10)
+            existing = requests.get(url, auth=auth, timeout=10, verify=couchbase_requests_verify())
             if existing.status_code == 200:
                 logger.info("LLM cache search index '%s' already exists", index_name)
                 return
-            resp = requests.put(url, auth=auth, json=self._llm_cache_index_definition(), timeout=15)
+            resp = requests.put(url, auth=auth, json=self._llm_cache_index_definition(), timeout=15, verify=couchbase_requests_verify())
             if resp.status_code in (200, 201):
                 logger.info("LLM cache search index '%s' created", index_name)
             else:
@@ -1062,11 +1079,11 @@ class CouchbaseStore:
             auth = (COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"])
             index_name = COUCHBASE_CONFIG["agent_memory_index"]
             url = self._search_admin_url(index_name)
-            existing = requests.get(url, auth=auth, timeout=10)
+            existing = requests.get(url, auth=auth, timeout=10, verify=couchbase_requests_verify())
             if existing.status_code == 200:
                 logger.info("Agent memory search index '%s' already exists", index_name)
                 return
-            resp = requests.put(url, auth=auth, json=self._agent_memory_index_definition(), timeout=15)
+            resp = requests.put(url, auth=auth, json=self._agent_memory_index_definition(), timeout=15, verify=couchbase_requests_verify())
             if resp.status_code in (200, 201):
                 logger.info("Agent memory search index '%s' created", index_name)
             else:
@@ -1241,6 +1258,7 @@ class CouchbaseStore:
 
     async def log_llm_event(self, doc: dict):
         doc_id = f"llmevt::{int(time.time() * 1000)}::{uuid.uuid4().hex[:8]}"
+        metrics.record_llm_event(doc)
         try:
             await asyncio.to_thread(
                 self.llm_cache_log.upsert,
@@ -1445,6 +1463,7 @@ class CouchbaseStore:
 
     async def log_context_event(self, doc: dict):
         doc_id = f"ctxevt::{int(time.time() * 1000)}::{uuid.uuid4().hex[:8]}"
+        metrics.record_context_event(doc)
         try:
             await asyncio.to_thread(
                 self.context_cache_log.upsert,
@@ -2097,6 +2116,7 @@ class CouchbaseStore:
     # a run row on the Traces list, then its spans on the detail view.
 
     async def write_span(self, span: dict):
+        metrics.record_span(span)
         doc_id = f"span::{span['trace_id']}::{span['span_id']}"
         try:
             await asyncio.to_thread(
@@ -2507,6 +2527,7 @@ class CouchbaseStore:
                     auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
                     headers={"Content-Type": "application/json"},
                     timeout=30,
+                    verify=couchbase_requests_verify(),
                 )
             )
             # Re-PUTting an unchanged existing index is refused as "exists";
@@ -2530,6 +2551,7 @@ class CouchbaseStore:
                     self._search_admin_url(index_name),
                     auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
                     timeout=30,
+                    verify=couchbase_requests_verify(),
                 )
             )
             return resp.status_code < 400

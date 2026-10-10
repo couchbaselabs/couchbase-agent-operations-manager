@@ -19,18 +19,59 @@ global:
 # vector-typed index fields, which Community Edition rejects outright.
 # ---------------------------------------------------------------------
 couchbase:
-  # Set to false to skip the bundled Couchbase StatefulSet and the
-  # couchbase-init provisioning Job entirely, and point operations-manager
-  # at a Couchbase Enterprise server you already run and manage yourself
-  # instead (see operationsManager.couchbase.connectionString/searchHost
-  # below, and "Using an external Couchbase Enterprise server" in this
-  # chart's README). init.sh reasserts cluster-wide data/index/fts RAM
-  # quotas on every run, which is fine for a Couchbase node this chart
-  # owns outright and not something to run against a cluster other
-  # workloads share - that's the whole reason this is a separate toggle
-  # from operationsManager.couchbase.* rather than something inferred
-  # from whether those are set.
+  # Set to false to skip the bundled Couchbase StatefulSet and point
+  # operations-manager at a Couchbase Server Enterprise cluster or a Capella
+  # database you already run instead (see operationsManager.couchbase.* and
+  # couchbase.external below, and "Using an external Couchbase Enterprise
+  # server or Capella" in this chart's README). The couchbase-init Job still
+  # runs in that mode (couchbase.external.provision.enabled) - but in a
+  # provisioning-only form that never touches cluster-wide RAM quotas or
+  # cluster init, which is why bundled vs external is this explicit toggle
+  # rather than something inferred from whether connectionString is set.
   enabled: true
+
+  # Only read when couchbase.enabled is false.
+  external:
+    # enterprise - a self-managed Couchbase Server Enterprise Edition
+    #              cluster (8.0.2+ recommended, 7.6+ required). The Job
+    #              creates the bucket if it is missing.
+    # capella    - a Couchbase Capella database. Buckets are created through
+    #              Capella's UI/API (terraform/capella does this); the Job
+    #              verifies the bucket exists, then provisions inside it.
+    kind: enterprise
+    # Bare hostname of the cluster. Defaults to
+    # operationsManager.couchbase.searchHost, which is the same thing - set
+    # this only if the management/query endpoint differs from the Search one.
+    host: ""
+    # External clusters normally speak TLS only (https on 18091/18093/18094,
+    # couchbases:// on 11207) - leave true. Set false for a lab cluster you
+    # reach on the plain ports.
+    tls: true
+    # PEM bundle of the private/corporate CA that signed the cluster's
+    # certificate, mounted into couchbase-init and operations-manager and
+    # used for every TLS connection to it. Leave empty for Capella and any
+    # publicly-signed certificate (the system trust store is used).
+    tlsCaCert: ""
+    # Lab-only: skip certificate verification entirely for a self-signed
+    # certificate you can't install. Never for production.
+    tlsInsecure: false
+    provision:
+      # Run couchbase-init against the external server on install and on
+      # every upgrade. It is idempotent and scoped to the appliance's own
+      # bucket: scope, collections, primary + secondary indexes and a
+      # settings::provisioned marker (plus the bucket itself, on
+      # enterprise). Set false to prepare the cluster entirely by hand per
+      # README "Preparing an external cluster".
+      enabled: true
+      # Credentials the Job uses, if different from the ones operations-
+      # manager runs with. On enterprise, bucket creation needs
+      # cluster_admin/bucket_admin - give the Job an admin here and keep
+      # operationsManager.couchbase.username on the least-privilege user
+      # from the README. Leave blank to use operationsManager.couchbase.*
+      # (right for Capella, where one Read/Write database credential does
+      # everything). Stored in the same Secret as the other credentials.
+      username: ""
+      password: ""
   image:
     repository: couchbase
     tag: enterprise-7.6.2
@@ -153,12 +194,13 @@ operationsManager:
     # Secret (templates/secret-app.yaml), never rendered into a ConfigMap
     # or Pod spec in plain text.
     password: ""
-    # When couchbase.enabled is false, create this bucket and, inside it,
-    # this scope on your external server yourself first - they're the
-    # only things operations-manager doesn't create on its own (every
-    # collection, primary index, and Search/vector index it needs is
-    # created automatically at startup - see
-    # operations-manager/app/couchbase_client.py).
+    # When couchbase.enabled is false, the couchbase-init Job creates this
+    # bucket (enterprise only - on Capella create it first) and this scope
+    # on your external server on first boot, unless
+    # couchbase.external.provision.enabled is false, in which case create
+    # both yourself. Everything below the scope is created either by the
+    # Job or by operations-manager's own startup (see
+    # operations-manager/app/couchbase_client.py) - both are IF NOT EXISTS.
     bucket: agent_operations
     scope: agent_operations
 
@@ -291,6 +333,11 @@ ui:
     # UI is fully reachable over https on `port` above either way.
     exposeHttp: true
     # httpPort: 80
+    # Cloud load-balancer annotations, e.g. an internal-only LB:
+    #   service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    #   networking.gke.io/load-balancer-type: Internal
+    annotations: {}
   resources:
     requests:
       cpu: 100m
@@ -339,6 +386,59 @@ tls:
       - agent-operations-ui
     days: 825
   existingSecret: ""
+
+# ---------------------------------------------------------------------
+# Monitoring - operations-manager exposes Prometheus metrics on
+# GET /metrics (:8090, same HTTPS listener as the API; see
+# operations-manager/app/metrics.py and MONITORING.md). Everything below
+# is about getting a scraper and a dashboard pointed at it; nothing here
+# installs Prometheus or Grafana themselves (terraform/ can, via
+# kube-prometheus-stack - see terraform/README.md).
+# ---------------------------------------------------------------------
+metrics:
+  # Serve /metrics at all. Off = the route answers 404 and the in-process
+  # counters are no-ops.
+  enabled: true
+  # Optional bearer token the scraper must send (Authorization: Bearer).
+  # Leave empty when :8090 is only reachable inside the cluster, which is
+  # the chart's default (ClusterIP). Stored in the app Secret.
+  token: ""
+  # prometheus.io/* annotations on the operations-manager Service, for
+  # scrapers configured with the classic kubernetes_sd annotation
+  # convention (Prometheus community chart defaults, Datadog, etc.).
+  serviceAnnotations: true
+  # Prometheus Operator / kube-prometheus-stack: a ServiceMonitor that
+  # selects the operations-manager Service. Needs the ServiceMonitor CRD
+  # to exist in the cluster, or the install fails on an unknown kind -
+  # which is why it's off by default.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # Labels the Prometheus instance's serviceMonitorSelector requires -
+    # kube-prometheus-stack's default is {release: <its release name>}.
+    labels: {}
+    # operations-manager serves a self-signed certificate unless you
+    # installed one (Settings -> HTTPS Certificate / tls.existingSecret).
+    tlsConfig:
+      insecureSkipVerify: true
+  # Alerting rules (monitoring/prometheus/aom-alerts.yml) as a
+  # PrometheusRule. Same CRD caveat as serviceMonitor.
+  prometheusRule:
+    enabled: false
+    labels: {}
+  # The appliance Grafana dashboard (monitoring/grafana/dashboards/
+  # aom-overview.json) as a ConfigMap labelled for Grafana's dashboard
+  # sidecar (kube-prometheus-stack enables that sidecar by default).
+  grafanaDashboard:
+    enabled: false
+    # Label the sidecar watches for - kube-prometheus-stack's default.
+    label: grafana_dashboard
+    labelValue: "1"
+    # Set to the Grafana release's namespace if the sidecar only watches
+    # its own; empty = this release's namespace.
+    namespace: ""
+    folderAnnotation: ""
 
 # Disabled by default - ui.service.type: LoadBalancer already gets you a
 # working external endpoint on most clusters. Enable this instead if

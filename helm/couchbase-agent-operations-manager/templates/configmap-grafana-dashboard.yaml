@@ -1,0 +1,21 @@
+{{- if and .Values.metrics.enabled .Values.metrics.grafanaDashboard.enabled }}
+# The appliance Grafana dashboard, labelled for Grafana's dashboard
+# sidecar (kube-prometheus-stack). Dashboard JSON is
+# monitoring/grafana/dashboards/aom-overview.json, copied into the chart
+# by scripts/sync-monitoring-assets.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aom.fullname" . }}-grafana-dashboard
+  namespace: {{ .Values.metrics.grafanaDashboard.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+    {{ .Values.metrics.grafanaDashboard.label }}: {{ .Values.metrics.grafanaDashboard.labelValue | quote }}
+  {{- with .Values.metrics.grafanaDashboard.folderAnnotation }}
+  annotations:
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  aom-overview.json: |-
+{{ .Files.Get "monitoring/aom-overview.json" | indent 4 }}
+{{- end }}

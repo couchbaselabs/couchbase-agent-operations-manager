@@ -4,6 +4,13 @@ metadata:
   name: {{ include "aom.operationsManagerServiceName" . }}
   labels:
     {{- include "aom.componentLabels" (merge (dict "component" "operations-manager") .) | nindent 4 }}
+  {{- if and .Values.metrics.enabled .Values.metrics.serviceAnnotations }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8090"
+    prometheus.io/scheme: {{ ternary "http" "https" .Values.operationsManager.tls.disabled | quote }}
+  {{- end }}
 spec:
   type: ClusterIP
   selector:

@@ -195,6 +195,18 @@ services:
       COUCHBASE_BUCKET: ${COUCHBASE_BUCKET:-agent_operations}
       COUCHBASE_SCOPE: ${COUCHBASE_SCOPE:-agent_operations}
       COUCHBASE_SEARCH_HOST: ${COUCHBASE_SEARCH_HOST:-couchbase}
+      # External TLS-only clusters (Capella, or Enterprise with only the
+      # secure ports open): https/18094 for the Search admin REST, and an
+      # optional private-CA bundle (mount it and point this at the path)
+      # or COUCHBASE_TLS_VERIFY=false for a lab self-signed certificate.
+      COUCHBASE_SEARCH_SCHEME: ${COUCHBASE_SEARCH_SCHEME:-http}
+      COUCHBASE_SEARCH_PORT: ${COUCHBASE_SEARCH_PORT:-8094}
+      COUCHBASE_TLS_CA_FILE: ${COUCHBASE_TLS_CA_FILE:-}
+      COUCHBASE_TLS_VERIFY: ${COUCHBASE_TLS_VERIFY:-true}
+      # Prometheus exporter on GET /metrics (app/metrics.py). Set
+      # METRICS_TOKEN to require a bearer token from the scraper.
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       SAMPLE_MCP_SERVERS_BASE_URL: http://sample-mcp-servers:8100
       API_KEY_SUPPORT_AGENT: ${API_KEY_SUPPORT_AGENT:-demo-support-agent-9f21}
       API_KEY_FINANCE_ANALYST: ${API_KEY_FINANCE_ANALYST:-demo-finance-analyst-7e83}
@@ -349,7 +361,52 @@ services:
       #     - ./ui/tls:/etc/nginx/tls:ro
       - tls-shared:/etc/nginx/tls
 
+  # ---------------------------------------------------------------------
+  # Optional monitoring: Prometheus scraping operations-manager's /metrics
+  # plus Grafana with the appliance dashboard pre-provisioned. Only under
+  # the "monitoring" profile (COMPOSE_PROFILES=local-couchbase,monitoring
+  # in .env, or `docker compose --profile monitoring up`). See MONITORING.md.
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    depends_on:
+      operations-manager:
+        condition: service_healthy
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/aom-alerts.yml:/etc/prometheus/rules/aom-alerts.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      # Set GRAFANA_ADMIN_PASSWORD in .env; the fallback is for a laptop only.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
 volumes:
   couchbase-data:
   hf-cache:
   tls-shared:
+  prometheus-data:
+  grafana-data:

@@ -22,7 +22,7 @@ SRC = ROOT / "couchbase-init" / "init.sh"
 DEST = ROOT / "helm" / "couchbase-agent-operations-manager" / "templates" / "configmap-couchbase-init.yaml"
 TAIL_MARKER = "# Provisioning is idempotent and safe to re-run, so rather than exiting"
 
-HEADER = """{{- if .Values.couchbase.enabled }}
+HEADER = """{{- if include "aom.couchbaseInitEnabled" . }}
 # GENERATED FILE - do not edit by hand. Regenerate from
 # couchbase-init/init.sh with scripts/sync-helm-couchbase-init.py.
 apiVersion: v1
@@ -41,10 +41,13 @@ def main() -> None:
     script = SRC.read_text()
     if "{{" in script or "}}" in script:
         raise SystemExit("init.sh contains '{{' or '}}', which Helm would try to template - escape it first")
-    if "\nCB_HOST=couchbase\n" not in script:
-        raise SystemExit("could not find the CB_HOST=couchbase line in init.sh")
+    host_line = '\nCB_HOST="${COUCHBASE_HOST:-couchbase}"\n'
+    if host_line not in script:
+        raise SystemExit("could not find the CB_HOST line in init.sh")
+    # The chart's bundled Service name becomes the default; the Job sets
+    # COUCHBASE_HOST explicitly in external mode (couchbase.enabled=false).
     script = script.replace(
-        "\nCB_HOST=couchbase\n", '\nCB_HOST={{ include "aom.couchbaseServiceName" . }}\n'
+        host_line, '\nCB_HOST="${COUCHBASE_HOST:-{{ include "aom.couchbaseServiceName" . }}}"\n'
     )
     if TAIL_MARKER not in script:
         raise SystemExit("could not find the Compose-only sentinel tail in init.sh")

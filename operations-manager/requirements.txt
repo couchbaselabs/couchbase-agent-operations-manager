@@ -23,3 +23,6 @@ pypdf==6.19.0
 # Databricks/Spark, BigQuery and Snowflake, and BigQuery Avro exports.
 pyarrow==26.0.0
 fastavro==1.13.1
+# Prometheus exporter for GET /metrics (app/metrics.py) - scraped by
+# Prometheus / Grafana, see MONITORING.md.
+prometheus_client==0.26.0

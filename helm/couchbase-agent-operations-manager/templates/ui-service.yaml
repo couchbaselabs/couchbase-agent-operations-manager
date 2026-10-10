@@ -4,6 +4,10 @@ metadata:
   name: {{ include "aom.uiServiceName" . }}
   labels:
     {{- include "aom.componentLabels" (merge (dict "component" "ui") .) | nindent 4 }}
+  {{- with .Values.ui.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.ui.service.type }}
   selector:

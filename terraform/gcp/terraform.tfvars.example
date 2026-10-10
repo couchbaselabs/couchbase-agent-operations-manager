@@ -1,0 +1,25 @@
+# Copy to terraform.auto.tfvars (gitignored) and fill in.
+project_id         = "my-gcp-project"
+image_tag          = "abc1234"
+couchbase_password = "change-me"           # ignored when couchbase_mode = capella
+auth_secret_key    = "openssl rand -hex 32"
+
+# couchbase_mode = "enterprise"
+# external_couchbase = {
+#   host               = "cb.example.internal"
+#   tls                = true
+#   tls_ca_pem         = file("corp-ca.pem")   # private CA; omit for a public one
+#   provision_username = "Administrator"      # admin used only by the init Job
+#   provision_password = "..."
+# }
+
+# couchbase_mode          = "capella"
+# capella_api_token       = "..."
+# capella_organization_id = "..."
+# capella_project_id      = "..."
+# capella_cluster_id      = "..."
+
+# monitoring = {
+#   install_stack          = true   # kube-prometheus-stack + Grafana with the AOM dashboard
+#   grafana_admin_password = "..."
+# }

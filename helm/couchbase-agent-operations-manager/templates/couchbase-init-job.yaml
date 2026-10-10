@@ -1,4 +1,4 @@
-{{- if .Values.couchbase.enabled }}
+{{- if include "aom.couchbaseInitEnabled" . }}
 # Runs init.sh (configmap-couchbase-init.yaml) to completion once per
 # install/upgrade. Using Helm hooks (rather than a plain Job, which
 # Helm would refuse to re-apply on `helm upgrade` since Jobs are
@@ -32,12 +32,36 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "aom.authSecretName" . }}
-                  key: COUCHBASE_USERNAME
+                  key: COUCHBASE_PROVISION_USERNAME
             - name: COUCHBASE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "aom.authSecretName" . }}
-                  key: COUCHBASE_PASSWORD
+                  key: COUCHBASE_PROVISION_PASSWORD
+            {{- if not .Values.couchbase.enabled }}
+            # External mode (couchbase.enabled=false): init.sh skips cluster
+            # init and quotas and provisions only inside the appliance's own
+            # bucket on the server named here - see couchbase.external in
+            # values.yaml and the header of couchbase-init/init.sh.
+            - name: COUCHBASE_EXTERNAL
+              value: "true"
+            - name: COUCHBASE_EXTERNAL_KIND
+              value: {{ .Values.couchbase.external.kind | quote }}
+            - name: COUCHBASE_HOST
+              value: {{ include "aom.couchbaseExternalHost" . | quote }}
+            - name: COUCHBASE_TLS
+              value: {{ .Values.couchbase.external.tls | quote }}
+            {{- if .Values.couchbase.external.tlsCaCert }}
+            - name: COUCHBASE_TLS_CA_FILE
+              value: /etc/couchbase-ca/ca.pem
+            {{- end }}
+            {{- if .Values.couchbase.external.tlsInsecure }}
+            - name: COUCHBASE_TLS_VERIFY
+              value: "false"
+            {{- end }}
+            - name: COUCHBASE_INIT_VERSION
+              value: {{ printf "%s-%s" .Chart.Version .Chart.AppVersion | quote }}
+            {{- end }}
             - name: COUCHBASE_BUCKET
               value: {{ .Values.operationsManager.couchbase.bucket | quote }}
             - name: COUCHBASE_SCOPE
@@ -60,9 +84,19 @@ spec:
             - name: init-script
               mountPath: /scripts
               readOnly: true
+            {{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
+            - name: couchbase-ca
+              mountPath: /etc/couchbase-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: init-script
           configMap:
             name: {{ include "aom.fullname" . }}-couchbase-init
             defaultMode: 0555
+        {{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
+        - name: couchbase-ca
+          configMap:
+            name: {{ include "aom.couchbaseCaConfigMapName" . }}
+        {{- end }}
 {{- end }}

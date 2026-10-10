@@ -51,12 +51,17 @@ spec:
               # server) when it's false - either way, this still waits for
               # the bucket/scope this appliance needs to actually exist
               # before starting, not just for the process to be up.
-              echo "Waiting for Couchbase web console..."
-              until curl -s -o /dev/null "http://{{ include "aom.couchbaseSearchHost" . }}:8091/pools"; do sleep 2; done
+              # External clusters are polled over https on 18091 with
+              # whatever trust couchbase.external.tlsCaCert/tlsInsecure
+              # provide (aom.couchbaseMgmtUrl / aom.couchbaseCurlTlsFlags).
+              CB="{{ include "aom.couchbaseMgmtUrl" . }}"
+              CURL="curl -s {{ include "aom.couchbaseCurlTlsFlags" . }}"
+              echo "Waiting for Couchbase web console at $CB..."
+              until $CURL -o /dev/null "$CB/pools"; do sleep 2; done
               echo "Waiting for Couchbase to accept authenticated requests..."
-              until curl -s -o /dev/null -u "$COUCHBASE_USERNAME:$COUCHBASE_PASSWORD" "http://{{ include "aom.couchbaseSearchHost" . }}:8091/pools/default"; do sleep 2; done
+              until $CURL -o /dev/null -u "$COUCHBASE_USERNAME:$COUCHBASE_PASSWORD" "$CB/pools/default"; do sleep 2; done
               echo "Waiting for scope '$COUCHBASE_SCOPE' to be provisioned..."
-              until curl -s -u "$COUCHBASE_USERNAME:$COUCHBASE_PASSWORD" "http://{{ include "aom.couchbaseSearchHost" . }}:8091/pools/default/buckets/$COUCHBASE_BUCKET/scopes" | grep -q "\"name\":\"$COUCHBASE_SCOPE\""; do sleep 3; done
+              until $CURL -u "$COUCHBASE_USERNAME:$COUCHBASE_PASSWORD" "$CB/pools/default/buckets/$COUCHBASE_BUCKET/scopes" | grep -q "\"name\":\"$COUCHBASE_SCOPE\""; do sleep 3; done
               {{- if .Values.sampleMcpServers.enabled }}
               echo "Waiting for sample-mcp-servers..."
               until curl -s -o /dev/null "http://{{ include "aom.sampleMcpServersServiceName" . }}:8100/healthz"; do sleep 2; done
@@ -103,6 +108,22 @@ spec:
               value: {{ include "aom.couchbaseConnectionString" . | quote }}
             - name: COUCHBASE_SEARCH_HOST
               value: {{ include "aom.couchbaseSearchHost" . | quote }}
+            {{- if include "aom.couchbaseExternalTls" . }}
+            # TLS-only external cluster: the Search admin REST moves to
+            # https/18094, and the SDK + requests trust the CA below.
+            - name: COUCHBASE_SEARCH_SCHEME
+              value: "https"
+            - name: COUCHBASE_SEARCH_PORT
+              value: "18094"
+            {{- if .Values.couchbase.external.tlsCaCert }}
+            - name: COUCHBASE_TLS_CA_FILE
+              value: /etc/couchbase-ca/ca.pem
+            {{- end }}
+            {{- if .Values.couchbase.external.tlsInsecure }}
+            - name: COUCHBASE_TLS_VERIFY
+              value: "false"
+            {{- end }}
+            {{- end }}
             - name: COUCHBASE_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -155,6 +176,13 @@ spec:
               value: {{ .Values.operationsManager.cors.allowedOrigins | quote }}
             - name: DISABLE_TLS
               value: {{ .Values.operationsManager.tls.disabled | quote }}
+            - name: METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+            - name: METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: METRICS_TOKEN
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -232,6 +260,11 @@ spec:
               mountPath: /home/appuser/.cache/huggingface
             - name: tls
               mountPath: /app/tls
+            {{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
+            - name: couchbase-ca
+              mountPath: /etc/couchbase-ca
+              readOnly: true
+            {{- end }}
               readOnly: true
           # First start downloads the embedding model before the API
           # answers anything, which can take minutes on a slow link; the
@@ -280,3 +313,8 @@ spec:
                 path: server.crt
               - key: tls.key
                 path: server.key
+        {{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
+        - name: couchbase-ca
+          configMap:
+            name: {{ include "aom.couchbaseCaConfigMapName" . }}
+        {{- end }}

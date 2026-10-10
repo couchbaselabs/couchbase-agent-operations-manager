@@ -47,6 +47,7 @@ import jwt
 import requests
 
 from app import user_auth
+from app import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,7 @@ async def dispatch(entry: dict, config: dict) -> None:
 
     async def _run(vendor: str):
         ok, detail = await asyncio.to_thread(send_one, vendor, config[vendor], entry)
+        metrics.record_siem_forward(vendor, ok)
         _last_status[vendor] = {
             "status": "ok" if ok else "error",
             "detail": detail,

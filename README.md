@@ -298,6 +298,16 @@ and Gemini keys in a values file that stays out of git (not on the
 command line with `--set`), and restart the operations-manager
 Deployment after adding or rotating a key.
 
+### Monitoring (Prometheus / Grafana) and Terraform
+
+`operations-manager` exposes Prometheus metrics on `/metrics`;
+`docker compose --profile monitoring up` adds Prometheus + Grafana with the
+appliance dashboard pre-provisioned, and the Helm chart ships
+ServiceMonitor/PrometheusRule/dashboard resources for kube-prometheus-stack.
+See [MONITORING.md](./MONITORING.md). To stand the whole thing up on EKS,
+AKS or GKE - bundled Couchbase, an external Enterprise cluster, or Capella -
+see [terraform/README.md](./terraform/README.md).
+
 ### Using an external Couchbase Enterprise server
 
 By default `docker compose up` runs and fully manages its own bundled
@@ -329,11 +339,14 @@ time by restoring `COMPOSE_PROFILES=local-couchbase`.
 
 #### Preparing an external cluster
 
-These steps apply to both Docker Compose and the Helm chart
-(`couchbase.enabled=false`). In both, the bundled provisioning step
-(`couchbase-init`) is skipped entirely in external mode, and
-operations-manager's own startup creates everything inside the scope
-instead.
+These steps apply to Docker Compose, where the bundled provisioning step
+(`couchbase-init`) is skipped entirely in external mode and
+operations-manager's own startup creates everything inside the scope. On
+the Helm chart (`couchbase.enabled=false`) the `couchbase-init` Job runs a
+provisioning-only pass against the external server on first boot instead -
+it creates the bucket (Enterprise only) and the scope for you, so the
+"you create these" step below is handled; see
+[Using an external Couchbase Enterprise server or Capella](./helm/couchbase-agent-operations-manager/README.md#using-an-external-couchbase-enterprise-server-or-capella).
 
 **Cluster requirements.** Couchbase Server Enterprise Edition with the
 Data, Index, Query and Search services running. Community Edition rejects
@@ -389,18 +402,19 @@ created by hand before the new version starts (the full list is
 `ALL_COLLECTIONS` and `SECONDARY_INDEXES` in `couchbase_client.py`).
 
 **Network access.** The SDK connection follows your connection string
-(`couchbases://` for TLS), but two other calls currently use plain HTTP,
-so these ports must be reachable from operations-manager even on a
-TLS-only cluster:
-
-- **8094** (Search REST API) - creating and checking the Search/vector
-  indexes. The port is `COUCHBASE_SEARCH_PORT` in operations-manager's
-  config; on Helm you can override it through
-  `operationsManager.extraEnv`, but `docker-compose.yml` doesn't pass it
-  through yet, so under Compose it has to be 8094.
-- **8091** (cluster REST API) - Helm only: the operations-manager Pod's
-  `wait-for-dependencies` initContainer polls it until the bucket and
-  scope exist. If only 18091 is open, the Pod stays in `Init` forever.
+(`couchbases://` on 11207 for TLS). The Search admin REST calls that
+create and check the Search/vector indexes default to plain http on
+**8094**; on a TLS-only cluster (Capella, or Enterprise with only the
+secure ports open) set `COUCHBASE_SEARCH_SCHEME=https` and
+`COUCHBASE_SEARCH_PORT=18094` - both are passed through by
+`docker-compose.yml`, and the Helm chart sets them for you whenever
+`couchbase.external.tls` is true. For a private/corporate CA, mount the
+PEM bundle and point `COUCHBASE_TLS_CA_FILE` at it (it is used by both the
+SDK and the REST calls); `COUCHBASE_TLS_VERIFY=false` is the lab-only
+escape hatch for a self-signed certificate. On Helm the
+`wait-for-dependencies` initContainer and the `couchbase-init` Job use the
+same settings and poll `https://<host>:18091`/`:18093`, so the ports to
+open from the cluster are **11207, 18091, 18093 and 18094**.
 
 ## HTTPS / TLS
 

@@ -35,8 +35,31 @@ COUCHBASE_CONFIG = {
     "agent_memory_index": os.getenv("COUCHBASE_AGENT_MEMORY_INDEX", "agent_memory_vector_index"),
     "knowledge_index": os.getenv("COUCHBASE_KNOWLEDGE_INDEX", "knowledge_vector_index"),
     "search_host": os.getenv("COUCHBASE_SEARCH_HOST", "localhost"),
+    # Scheme + port for the Search (FTS) admin REST API. The bundled server
+    # speaks plain http on 8094; an external TLS-only cluster (Capella, or
+    # a self-managed cluster with only the secure ports open) needs
+    # https on 18094 - set COUCHBASE_SEARCH_SCHEME=https and
+    # COUCHBASE_SEARCH_PORT=18094 together.
+    "search_scheme": os.getenv("COUCHBASE_SEARCH_SCHEME", "http"),
     "search_port": int(os.getenv("COUCHBASE_SEARCH_PORT", "8094")),
+    # TLS trust for couchbases:// connections and https Search calls. A
+    # path to a PEM CA bundle (a private/corporate CA that signed your
+    # cluster's certificate) or empty to use the system trust store, which
+    # is right for Capella and any publicly-signed certificate. Set
+    # COUCHBASE_TLS_VERIFY=false only for a lab cluster with a self-signed
+    # certificate you can't install - it disables verification entirely.
+    "tls_ca_file": os.getenv("COUCHBASE_TLS_CA_FILE", ""),
+    "tls_verify": os.getenv("COUCHBASE_TLS_VERIFY", "true").strip().lower() not in ("0", "false", "no"),
 }
+
+
+def couchbase_requests_verify():
+    """`verify=` argument for every `requests` call against the cluster's
+    REST APIs: the CA bundle path when one is configured, False when
+    verification is switched off, True (system trust store) otherwise."""
+    if not COUCHBASE_CONFIG["tls_verify"]:
+        return False
+    return COUCHBASE_CONFIG["tls_ca_file"] or True
 
 # Base URL for the bundled sample MCP tool servers (jira/zendesk/snowflake/
 # shadow-diagnostics). Only used to seed the three *trusted* sample servers

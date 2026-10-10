@@ -1,0 +1,62 @@
+# Alerting rules for the appliance - loaded by the Compose profile's
+# Prometheus and rendered as a PrometheusRule by the Helm chart
+# (metrics.prometheusRule.enabled). Thresholds are deliberately
+# conservative starting points; tune per deployment.
+groups:
+  - name: aom
+    rules:
+      - alert: AOMCouchbaseDisconnected
+        expr: min(aom_couchbase_connected) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "operations-manager has lost its Couchbase connection"
+          description: "The appliance is serving /api/health but every page and agent call that needs Couchbase is failing. Check the Couchbase pod/cluster and the credentials in the app Secret."
+      - alert: AOMHighErrorRate
+        expr: >
+          sum(rate(aom_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(aom_http_requests_total[5m])), 1e-9) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of HTTP requests are failing"
+      - alert: AOMSlowRequests
+        expr: >
+          histogram_quantile(0.95, sum by (le) (rate(aom_http_request_duration_seconds_bucket[5m]))) > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 request latency above 10s"
+          description: "Usually a missing index or an undersized Couchbase quota - see dashboard-performance-fix notes and couchbase-init/init.sh."
+      - alert: AOMHijackFlags
+        expr: sum(increase(aom_hijack_flags_total{severity=~"high|critical"}[15m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Hijack detection flagged a tool response"
+          description: "Open Threat Detection in the dashboard for the flagged call chain."
+      - alert: AOMDenialSpike
+        expr: >
+          sum(rate(aom_gateway_decisions_total{decision="DENY"}[5m]))
+            > 5 * clamp_min(sum(rate(aom_gateway_decisions_total{decision="DENY"}[1h] offset 1h)), 0.01)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Tool-call denials are 5x their hourly baseline"
+      - alert: AOMSiemForwardingFailing
+        expr: >
+          sum by (vendor) (rate(aom_siem_forward_total{status="error"}[10m]))
+            / clamp_min(sum by (vendor) (rate(aom_siem_forward_total[10m])), 1e-9) > 0.5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "SIEM forwarding to {{ $labels.vendor }} is failing"
+      - alert: AOMLlmCacheHitRateLow
+        expr: >
+          sum(rate(aom_llm_cache_events_total{outcome=~"hit.*"}[1h]))
+            / clamp_min(sum(rate(aom_llm_cache_events_total{outcome=~"hit.*|miss"}[1h])), 1e-9) < 0.1
+          and sum(rate(aom_llm_cache_events_total[1h])) > 0.05
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "LLM cache hit rate under 10% for an hour"
+          description: "Either the workload is genuinely unique or the similarity threshold / TTL on the LLM Caching settings page needs a look."
