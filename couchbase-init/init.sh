@@ -83,8 +83,8 @@ if [ "${CB_TLS}" = "true" ]; then
     CB_CLI_TLS="--no-ssl-verify"
   fi
 else
-  CB_MGMT="${CB_MGMT}"
-  CB_QUERY="${CB_QUERY}"
+  CB_MGMT="http://${CB_HOST}:8091"
+  CB_QUERY="http://${CB_HOST}:8093"
   CB_CLI_HOST="${CB_HOST}"
 fi
 
