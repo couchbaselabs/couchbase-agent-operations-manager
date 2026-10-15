@@ -16,15 +16,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHART = ROOT / "helm" / "couchbase-agent-operations-manager"
-COPIES = {
-    ROOT / "monitoring" / "prometheus" / "aom-alerts.yml": CHART / "monitoring" / "aom-alerts.yml",
-    ROOT / "monitoring" / "grafana" / "dashboards" / "aom-overview.json": CHART / "monitoring" / "aom-overview.json",
-}
+# The third copy ships inside the operations-manager image: Settings ->
+# Monitoring's Grafana wizard installs it through Grafana's HTTP API (see
+# operations-manager/app/monitoring.py, dashboard_json).
+COPIES = [
+    (ROOT / "monitoring" / "prometheus" / "aom-alerts.yml", CHART / "monitoring" / "aom-alerts.yml"),
+    (ROOT / "monitoring" / "grafana" / "dashboards" / "aom-overview.json", CHART / "monitoring" / "aom-overview.json"),
+    (ROOT / "monitoring" / "grafana" / "dashboards" / "aom-overview.json",
+     ROOT / "operations-manager" / "app" / "resources" / "grafana-dashboard.json"),
+]
 
 
 def main() -> None:
     (CHART / "monitoring").mkdir(exist_ok=True)
-    for src, dest in COPIES.items():
+    for src, dest in COPIES:
+        dest.parent.mkdir(exist_ok=True)
         if src.suffix == ".json":
             json.loads(src.read_text())  # fail here, not at helm install
         shutil.copyfile(src, dest)

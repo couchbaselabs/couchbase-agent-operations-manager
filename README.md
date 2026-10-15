@@ -134,13 +134,23 @@ Three seed roles, each with its own API key (see `.env.example`):
 - `admin` - everything trusted, including the two high-risk Snowflake admin
   tools (`manage_users`, `manage_warehouse`)
 
-Roles themselves are reviewable, code-owned config in
-`operations-manager/app/rbac_policy.py` - they're the kind of thing a security
-team reviews in a PR, not something added through a UI. **Servers**,
-though, are meant to change without a redeploy: register new ones from the
-Servers page (or `POST /v1/servers`) and their tools get ingested with a
-deny-by-default policy (admin-only, `risk_level: unclassified`) unless you
-assign default allowed roles at registration time, or add a reviewed
+Those three are the **built-in** roles, seeded from
+`operations-manager/app/rbac_policy.py`. Admins add further roles - and edit
+any role's description - from the **Roles & RBAC** page (or
+`POST`/`PUT`/`DELETE /v1/roles`); they are stored in Couchbase
+(`settings::roles`) and take effect immediately, no redeploy. Built-in roles
+can't be deleted (the seeded tool policy, demo agents and sample servers
+reference them, and `admin` is what deny-by-default falls back to); a custom
+role that is still granted on a tool, server or RAG application is refused
+deletion unless you force it, which strips those grants. Every role change
+is written to the Audit Log. A new role starts with **no** tool access -
+grant it through a server's default allowed roles or reviewed per-tool
+policy, and issue it a bearer key from Settings -> Agent Identities.
+
+**Servers** are meant to change without a redeploy too: register new ones
+from the Servers page (or `POST /v1/servers`) and their tools get ingested
+with a deny-by-default policy (admin-only, `risk_level: unclassified`) unless
+you assign default allowed roles at registration time, or add a reviewed
 override to `TOOL_POLICY`. Couchbase's `tools` collection - not the Python
 file - is the actual runtime source of truth the operations manager queries on
 every request.
@@ -507,14 +517,28 @@ over.
   tools ingested, access events), an access-volume chart, an allow/deny/
   error donut, and the highest-severity open findings.
 - **MCP Servers** - the registered server list; register a new one (server
-  ID, label, owner, MCP URL, trust status, default allowed roles) and its
-  catalog is ingested immediately; re-ingest or unregister existing ones.
+  ID, label, owner, platform, MCP URL, trust status, default allowed roles,
+  downstream auth) and its catalog is ingested immediately; re-ingest or
+  unregister existing ones. **Test connection** - on the form before you
+  register, and per row afterwards - probes the endpoint stage by stage
+  (URL, DNS, TCP/TLS, credential, HTTP, MCP handshake) and explains the
+  first stage that fails in plain language: a rejected token, a wrong path,
+  an untrusted certificate, a FastMCP Host-header rejection, a redirect to
+  an SSO login page, and so on. The **Platform** selector carries presets
+  for Snowflake, Databricks and BigQuery managed MCP endpoints (URL shape,
+  host validation, OAuth defaults with token-URL and scope hints); pick
+  *generic* for anything else or for a platform endpoint behind your own
+  proxy. Downstream auth modes: none, bearer, API-key header, HTTP basic,
+  and **OAuth 2.0 client credentials** (token endpoint + client ID/secret +
+  scope/audience; the access token is cached and refreshed before expiry).
 - **Tool Catalog** - every tool actually stored in Couchbase's registry,
   filterable by server/role - the full transparency view of what
   discovery can ever return.
-- **Roles & RBAC** - the three seed roles and how many tools each can
-  reach. API keys live in environment variables, never in the UI or API
-  responses - only a masked `...last4` label is ever shown.
+- **Roles & RBAC** - every role, which tools (grouped by server) each can
+  reach, and - for admins - add a role, edit a description, delete a custom
+  role. See [RBAC model](#rbac-model). API keys live in environment
+  variables or Agent Identities, never in the UI or API responses - only a
+  masked `...last4` label is ever shown.
 - **Threat Detection** - the MCP Tool Hijacking surface: quarantined tools
   with their matched signals and a one-click Release action, recently
   flagged live responses, cross-tool hijack chain findings, and the last
@@ -544,12 +568,40 @@ over.
   directly (no LLM in the loop) to see exactly what the RBAC + vector
   pre-filter returns. Try `shadow-diagnostics::run_diagnostic` as a tool
   ID in the Invoke panel - it's intentionally never registered, so it's
-  denied no matter which role you use.
+  denied no matter which role you use. Below that, admins get
+  **Experiment & regression-test**: run a matrix of queries x roles x
+  `top_k` (plus tool IDs x roles for invoke decisions) in one go and read
+  a per-query table of which roles saw which tool at what rank; lock the
+  discover/invoke result you just observed in as a regression case (the
+  observed answer becomes the expectation); and run a dataset now to see
+  its trend against the previous run - improved / stable / regressed, with
+  the cases that flipped named. Invoke cells check the authorization
+  decision only, so an experiment never calls a downstream system. Cases
+  land in the same datasets as the Evaluations page and run on every
+  catalog change.
+- **RAG Applications** - register an application over the Knowledge Base,
+  try it, and read **Token usage by user**: per caller subject, queries,
+  cache hits and hit rate, tokens spent and saved, cost spent and saved,
+  over the same recent-events window as the per-app activity columns.
 - **Tools -> Developer SDK** - install guide and quickstart for the official
   Python client (`aom_sdk`) - discover/invoke, cached completions, agent
   memory, and MCP tool integration - plus download buttons for the SDK
   itself and for AI-assistant integration skills (Claude/ChatGPT/Gemini).
   See [Developer SDK](#developer-sdk) below.
+- **Settings -> Monitoring** - Prometheus scrape token (hash-only
+  storage), the `/metrics` switch, a `scrape_configs` job to paste, *Check
+  targets* against Prometheus's own API, a Grafana wizard that installs the
+  data source and the AOM dashboard, and Datadog / Dynatrace / New Relic
+  push exporters. See [MONITORING.md](./MONITORING.md).
+- **Settings -> Log Forwarding** - ship the operations manager's own
+  application log (not the audit log - that is SIEM forwarding on the Audit
+  Log page) to Splunk, Elastic, Datadog, Sumo Logic, Graylog (GELF) or any
+  RFC 5424 syslog server, batched and compressed on a background thread with
+  a bounded queue so it never slows the gateway. Minimum level, batch size,
+  flush interval, queue capacity, stack traces and message length are all
+  settable; each destination has a *Send test* button that uses the form as
+  it is, saved or not; a *Delivery by service* table shows received, queued,
+  dropped and sent/failed per destination.
 - **Tools -> API Documentation** - operations-manager's full REST API
   reference (every route, request/response schema, and a try-it-out
   console), generated straight from the code so it can't drift out of
@@ -812,6 +864,41 @@ curl -k -X POST https://localhost:8090/v1/servers \
         "default_allowed_roles": ["admin"]
       }'
 ```
+
+Before registering, `POST /v1/servers/test-connection` with the same
+`mcp_url`/`platform`/`auth`/`auth_secret` (or a saved `server_id`) returns
+`{ok, summary, suggestion, steps[], tools[]}` - the Servers page's *Test
+connection* button is a thin wrapper over it.
+
+A managed data-platform endpoint uses a preset and OAuth - for example a
+Databricks managed MCP server with a service principal:
+
+```json
+{
+  "server_id": "databricks-genie",
+  "label": "Databricks (Genie)",
+  "platform": "databricks",
+  "mcp_url": "https://<workspace>.cloud.databricks.com/api/2.0/mcp/genie/<space-id>",
+  "trust_status": "trusted",
+  "default_allowed_roles": ["finance_analyst"],
+  "auth": {
+    "mode": "oauth",
+    "username": "<service-principal client id>",
+    "token_url": "https://<workspace>.cloud.databricks.com/oidc/v1/token",
+    "scope": "all-apis"
+  },
+  "auth_secret": "<service-principal client secret>"
+}
+```
+
+Snowflake (`platform: snowflake`, token URL
+`https://<account>.snowflakecomputing.com/oauth/token-request`, scope
+`session:role:<ROLE>`) and BigQuery via Google's MCP Toolbox on Cloud Run
+(`platform: bigquery`, token URL `https://oauth2.googleapis.com/token`) work
+the same way; `GET /v1/servers/platforms` lists every preset with its hints.
+A plain bearer token (a Snowflake PAT, a Databricks PAT, a Cloud Run ID
+token) works too with `"mode": "bearer"`. `validate_platform_url` rejects a
+host or path that does not match the preset - choose `generic` to override.
 
 ## Notes
 
