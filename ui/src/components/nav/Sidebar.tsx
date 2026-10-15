@@ -84,8 +84,10 @@ const SETTINGS_SECTION: NavSection = {
   items: [
     { to: "/settings/accounts", icon: "◍", text: "Accounts & Roles" },
     { to: "/settings/agents", icon: "⚿", text: "Agent Identities" },
+    { to: "/settings/monitoring", icon: "◷", text: "Monitoring" },
     { to: "/settings/ldap", icon: "⌁", text: "LDAP Authentication" },
     { to: "/settings/limits", icon: "◔", text: "Limits & Budgets" },
+    { to: "/settings/log-forwarding", icon: "⇶", text: "Log Forwarding" },
     { to: "/settings/guardrails", icon: "⊘", text: "Guardrails & PII" },
     { to: "/settings/https-cert", icon: "⚿", text: "HTTPS Certificate" },
   ],

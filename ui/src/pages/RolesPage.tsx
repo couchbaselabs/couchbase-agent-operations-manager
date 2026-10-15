@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import type { Role, ServerDoc, ToolDoc } from "../api/types";
+import type { Role, RoleUsage, ServerDoc, ToolDoc } from "../api/types";
 import { SeverityBadge, TrustBadge } from "../components/badges/Badges";
+import { useAuth } from "../auth/AuthContext";
+
+const ROLE_ID_PATTERN = "[a-z][a-z0-9_]{1,47}";
 
 /** One vendor/system's slice of a role's accessible tools - the same
  *  grouping the Tool Catalog uses per-server, just scoped to whichever
@@ -14,11 +17,24 @@ interface VendorGroup {
 }
 
 export function RolesPage() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [tools, setTools] = useState<ToolDoc[]>([]);
   const [servers, setServers] = useState<ServerDoc[]>([]);
+  const [usage, setUsage] = useState<Record<string, RoleUsage>>({});
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  // Admin-only role management (add / edit description / delete).
+  const [showForm, setShowForm] = useState(false);
+  const [newId, setNewId] = useState("");
+  const [newDescription, setNewDescription] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDescription, setEditDescription] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -27,10 +43,81 @@ export function RolesPage() {
       setRoles(r.roles);
       setTools(c.tools);
       setServers(s.servers);
+      if (isAdmin) {
+        try {
+          const u = await api.rolesUsage();
+          setUsage(u.usage);
+        } catch {
+          // usage counts are decoration; the page works without them
+        }
+      }
     } catch (e: any) {
       setError(e.message || "Failed to load roles");
     }
-  }, []);
+  }, [isAdmin]);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.createRole(newId.trim().toLowerCase(), newDescription.trim());
+      setNotice(
+        `Role '${newId.trim().toLowerCase()}' created. Grant it on tools (via a server's reviewed tool policy or default roles), ` +
+          "RAG applications, and issue it an API key from Settings → Agent Identities."
+      );
+      setNewId("");
+      setNewDescription("");
+      setShowForm(false);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not create the role");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function startEdit(role: Role) {
+    setEditingId(role.id);
+    setEditDescription(role.description);
+    setNotice(null);
+  }
+
+  async function handleSaveEdit(roleId: string) {
+    setBusyId(roleId);
+    setError(null);
+    try {
+      await api.updateRole(roleId, editDescription.trim());
+      setEditingId(null);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not update the role");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleDelete(role: Role) {
+    const u = usage[role.id];
+    const inUse = u && (u.tools > 0 || u.servers > 0 || u.rag_apps > 0);
+    const msg = inUse
+      ? `'${role.id}' is still granted on ${u.tools} tool(s), ${u.servers} server(s) and ${u.rag_apps} RAG application(s). ` +
+        "Delete it anyway? Those grants will be removed - callers holding this role lose that access immediately."
+      : `Delete role '${role.id}'? Agent identities and API keys issued for it will stop authorizing.`;
+    if (!confirm(msg)) return;
+    setBusyId(role.id);
+    setError(null);
+    try {
+      await api.deleteRole(role.id, !!inUse);
+      setNotice(`Role '${role.id}' deleted.`);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not delete the role");
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   useEffect(() => {
     load();
@@ -72,16 +159,66 @@ export function RolesPage() {
         <div>
           <h1 className="page-title">Roles &amp; RBAC</h1>
           <p className="page-subtitle">
-            Roles are code-reviewed config (operations-manager/app/rbac_policy.py), not something added through this UI -
-            the same way a security team would want role definitions to go through review, not a form.
+            Every discover/invoke is authorized against these roles in Couchbase. Built-in roles are seeded from
+            operations-manager/app/rbac_policy.py; admins add and edit roles here, and every change is written to the
+            Audit Log.
           </p>
         </div>
-        <button className="btn btn-secondary" onClick={load}>
-          Refresh
-        </button>
+        <div className="flex-row" style={{ gap: 8 }}>
+          {isAdmin && (
+            <button className="btn btn-primary" onClick={() => setShowForm((v) => !v)}>
+              {showForm ? "Cancel" : "Add role"}
+            </button>
+          )}
+          <button className="btn btn-secondary" onClick={load}>
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && <div className="error-note">{error}</div>}
+      {notice && <div className="helper-banner helper-banner-neutral">{notice}</div>}
+
+      {isAdmin && showForm && (
+        <form className="panel section-gap" onSubmit={handleCreate} style={{ marginBottom: 22 }}>
+          <div className="two-col">
+            <div className="field">
+              <label>Role ID</label>
+              <input
+                type="text"
+                required
+                pattern={ROLE_ID_PATTERN}
+                placeholder="e.g. data_engineer"
+                value={newId}
+                onChange={(e) => setNewId(e.target.value)}
+              />
+              <div className="field-hint">
+                lowercase letters, digits and underscores; immutable once created - it becomes the value in every
+                tool's allowed_roles and in the audit log.
+              </div>
+            </div>
+            <div className="field">
+              <label>Description</label>
+              <input
+                type="text"
+                required
+                maxLength={300}
+                placeholder="Who holds this role and what it is for"
+                value={newDescription}
+                onChange={(e) => setNewDescription(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="field-hint" style={{ marginBottom: 12 }}>
+            A new role starts with no tool access (deny by default). Grant tools by registering or re-registering a
+            server with it in <em>default allowed roles</em> or a reviewed per-tool policy, allow it on RAG
+            applications, and issue it a bearer key from Settings → Agent Identities.
+          </div>
+          <button className="btn btn-primary" type="submit" disabled={saving || !newId || !newDescription.trim()}>
+            {saving ? "Creating..." : "Create role"}
+          </button>
+        </form>
+      )}
 
       <div className="helper-banner helper-banner-neutral">
         <div className="helper-banner-heading">How it works</div>
@@ -108,12 +245,67 @@ export function RolesPage() {
                 {isCollapsed ? "▸" : "▾"}
               </button>
               <h2 className="catalog-group-title cell-mono">{role.id}</h2>
+              {role.builtin ? (
+                <span className="badge badge-neutral" title="Seeded by rbac_policy.py - editable, not deletable">
+                  built-in
+                </span>
+              ) : (
+                <span className="badge badge-success" title="Added through this page">
+                  custom
+                </span>
+              )}
               <span className="catalog-group-count">
                 {total} tool{total === 1 ? "" : "s"}
+                {usage[role.id]
+                  ? ` · ${usage[role.id].servers} server${usage[role.id].servers === 1 ? "" : "s"} · ${usage[role.id].rag_apps} RAG app${usage[role.id].rag_apps === 1 ? "" : "s"}`
+                  : ""}
               </span>
+              {isAdmin && editingId !== role.id && (
+                <div className="flex-row" style={{ gap: 6, marginLeft: "auto" }}>
+                  <button className="btn btn-secondary btn-sm" type="button" onClick={() => startEdit(role)}>
+                    Edit
+                  </button>
+                  {!role.builtin && (
+                    <button
+                      className="btn btn-danger-outline btn-sm"
+                      type="button"
+                      disabled={busyId === role.id}
+                      onClick={() => handleDelete(role)}
+                    >
+                      Delete
+                    </button>
+                  )}
+                </div>
+              )}
             </header>
 
-            <div className="catalog-group-meta">{role.description}</div>
+            {editingId === role.id ? (
+              <div className="flex-row" style={{ gap: 8, margin: "6px 0 12px 0", alignItems: "center" }}>
+                <input
+                  type="text"
+                  maxLength={300}
+                  style={{ flex: 1 }}
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setEditingId(null);
+                  }}
+                />
+                <button
+                  className="btn btn-primary btn-sm"
+                  type="button"
+                  disabled={busyId === role.id || !editDescription.trim()}
+                  onClick={() => handleSaveEdit(role.id)}
+                >
+                  Save
+                </button>
+                <button className="btn btn-secondary btn-sm" type="button" onClick={() => setEditingId(null)}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="catalog-group-meta">{role.description}</div>
+            )}
 
             {!isCollapsed &&
               (total === 0 ? (

@@ -14,8 +14,11 @@ reach its URL can call it directly and bypass every decision made here.
 Two mechanisms, deliberately separate:
 
   1. **A per-server credential.** What the *server* uses to authenticate
-     *this gateway*: a bearer token, an API key in a named header, or HTTP
-     basic. Stored encrypted at rest with the same Fernet key derived from
+     *this gateway*: a bearer token, an API key in a named header, HTTP
+     basic, or an OAuth 2.0 access token obtained with the client-
+     credentials grant from the server's own token endpoint (the mode
+     Snowflake, Databricks and BigQuery MCP endpoints expect - see
+     PLATFORM_PRESETS). Stored encrypted at rest with the same Fernet key derived from
      AUTH_SECRET_KEY that protects the LDAP bind password and SIEM secrets
      (see user_auth.encrypt_secret), and never returned by any API - the
      Servers page shows only whether one is configured.
@@ -34,21 +37,119 @@ checks it.
 """
 import hashlib
 import hmac
+import logging
+import threading
 import time
+from urllib.parse import urlparse
+
+import requests
 
 from app import user_auth
 from config import AUTH_SECRET_KEY
 
-AUTH_MODES = ("none", "bearer", "header", "basic")
+logger = logging.getLogger("operations-manager.server_auth")
+
+AUTH_MODES = ("none", "bearer", "header", "basic", "oauth")
 
 DEFAULT_AUTH = {
     "mode": "none",
     # Header name for mode="header" (e.g. "X-Api-Key"). Ignored otherwise.
     "header_name": "X-Api-Key",
-    # Username for mode="basic". The password/token half lives in the
-    # encrypted secret, never here.
+    # Username for mode="basic", or the client_id for mode="oauth". The
+    # password/token/client-secret half lives in the encrypted secret,
+    # never here.
     "username": "",
+    # mode="oauth" only: where to exchange client credentials for an access
+    # token, the scopes to request, and an optional audience/resource
+    # parameter some issuers (Databricks, Entra ID for Snowflake) want.
+    "token_url": "",
+    "scope": "",
+    "audience": "",
 }
+
+# Which managed data platform a registered server fronts, if any. Purely
+# advisory metadata plus URL validation and sensible auth defaults - the
+# gateway talks plain Streamable HTTP MCP to all of them.
+PLATFORM_PRESETS: dict[str, dict] = {
+    "generic": {
+        "label": "Generic MCP server",
+        "url_hint": "https://host:port/path/mcp",
+        "hosts": (),
+        "auth_mode": "none",
+        "notes": "Any MCP server that speaks Streamable HTTP.",
+    },
+    "snowflake": {
+        "label": "Snowflake (Cortex Agents / managed MCP)",
+        "url_hint": "https://<account>.snowflakecomputing.com/api/v2/databases/<db>/schemas/<schema>/mcp-servers/<name>",
+        "hosts": ("snowflakecomputing.com", "snowflakecomputing.cn"),
+        "auth_mode": "oauth",
+        "token_url_hint": "https://<account>.snowflakecomputing.com/oauth/token-request",
+        "scope_hint": "session:role:<ROLE>",
+        "notes": "Snowflake-managed MCP servers accept an OAuth access token (Snowflake OAuth or an external IdP) "
+                 "or a programmatic access token as a bearer token.",
+    },
+    "databricks": {
+        "label": "Databricks (managed MCP: Genie, Vector Search, UC functions)",
+        "url_hint": "https://<workspace>.cloud.databricks.com/api/2.0/mcp/<type>/<catalog>/<schema>",
+        "hosts": ("cloud.databricks.com", "azuredatabricks.net", "gcp.databricks.com"),
+        "auth_mode": "oauth",
+        "token_url_hint": "https://<workspace>.cloud.databricks.com/oidc/v1/token",
+        "scope_hint": "all-apis",
+        "notes": "Use a service principal's OAuth M2M client ID/secret (recommended) or a personal access token as a "
+                 "bearer token.",
+    },
+    "bigquery": {
+        "label": "Google BigQuery (MCP Toolbox / Cloud Run)",
+        "url_hint": "https://<toolbox-service>.run.app/mcp",
+        "hosts": ("run.app", "googleapis.com", "cloudfunctions.net"),
+        "auth_mode": "oauth",
+        "token_url_hint": "https://oauth2.googleapis.com/token",
+        "scope_hint": "https://www.googleapis.com/auth/bigquery.readonly",
+        "notes": "A BigQuery MCP server (Google's MCP Toolbox for Databases, or the BigQuery remote MCP preview) behind "
+                 "Cloud Run / IAP expects a Google OAuth access token; a short-lived ID token as a bearer token also "
+                 "works for Cloud Run-authenticated services.",
+    },
+}
+
+PLATFORMS = tuple(PLATFORM_PRESETS)
+
+
+def public_platforms() -> list[dict]:
+    return [{"id": pid, **{k: v for k, v in p.items() if k != "hosts"}, "hosts": list(p["hosts"])} for pid, p in PLATFORM_PRESETS.items()]
+
+
+def normalize_platform(platform: str | None) -> str:
+    p = str(platform or "generic").strip().lower()
+    return p if p in PLATFORM_PRESETS else "generic"
+
+
+def validate_platform_url(platform: str, mcp_url: str) -> str | None:
+    """A readable reason the URL does not look like that platform's MCP
+    endpoint, or None. Advisory: a customer fronting Snowflake through
+    their own proxy is allowed to override by choosing 'generic'."""
+    platform = normalize_platform(platform)
+    preset = PLATFORM_PRESETS[platform]
+    try:
+        parsed = urlparse(mcp_url or "")
+    except Exception:  # noqa: BLE001
+        return "the MCP URL could not be parsed"
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return "the MCP URL must be an absolute http(s) URL"
+    if platform == "generic":
+        return None
+    if parsed.scheme != "https":
+        return f"{preset['label']} endpoints are HTTPS only"
+    host = (parsed.hostname or "").lower()
+    if preset["hosts"] and not any(host == h or host.endswith("." + h) for h in preset["hosts"]):
+        return (
+            f"'{host}' is not a {preset['label'].split(' (')[0]} host (expected one under "
+            f"{', '.join(preset['hosts'])}). Choose the generic platform if this endpoint is behind your own proxy."
+        )
+    if platform == "snowflake" and "/mcp" not in parsed.path:
+        return "a Snowflake managed MCP endpoint path ends in /mcp-servers/<name> (see the URL hint)"
+    if platform == "databricks" and not parsed.path.startswith("/api/2.0/mcp/"):
+        return "a Databricks managed MCP endpoint path starts with /api/2.0/mcp/ (see the URL hint)"
+    return None
 
 # Identity headers this gateway attaches to every downstream call.
 IDENTITY_HEADERS = {
@@ -84,6 +185,10 @@ def normalize_auth(cfg: dict | None) -> dict:
     merged["header_name"] = header_name or DEFAULT_AUTH["header_name"]
 
     merged["username"] = str(merged.get("username") or "").strip()[:200]
+    token_url = str(merged.get("token_url") or "").strip()[:500]
+    merged["token_url"] = token_url if token_url.startswith(("http://", "https://")) else ""
+    merged["scope"] = str(merged.get("scope") or "").strip()[:500]
+    merged["audience"] = str(merged.get("audience") or "").strip()[:500]
     return merged
 
 
@@ -130,9 +235,118 @@ def _decrypt_secret(server_doc: dict) -> str:
         return ""
 
 
+# -- OAuth 2.0 client-credentials ----------------------------------------
+#
+# One access token per registered server, cached in-process until shortly
+# before it expires. The exchange is a plain POST to the server's token
+# endpoint (RFC 6749 §4.4); the client secret is the encrypted per-server
+# secret, the client_id lives in auth.username. Cached by the server_id
+# plus a hash of the inputs so changing the credential invalidates the
+# token at once rather than at expiry.
+_OAUTH_TIMEOUT_SECONDS = 15
+_OAUTH_REFRESH_SKEW_SECONDS = 60
+_oauth_tokens: dict[str, dict] = {}
+_oauth_lock = threading.Lock()
+
+
+class OAuthError(RuntimeError):
+    """Token exchange failed - the message is already human-readable."""
+
+
+def _oauth_cache_key(server_doc: dict, auth: dict, secret: str) -> str:
+    material = "|".join([
+        str((server_doc or {}).get("server_id") or ""),
+        auth.get("token_url") or "", auth.get("username") or "", auth.get("scope") or "",
+        auth.get("audience") or "", hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16],
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def fetch_oauth_token(auth: dict, secret: str) -> dict:
+    """Perform the client-credentials exchange. Returns {access_token,
+    expires_at}. Raises OAuthError with a message an operator can act on."""
+    token_url = auth.get("token_url") or ""
+    client_id = auth.get("username") or ""
+    if not token_url:
+        raise OAuthError("OAuth mode needs a token endpoint URL (the issuer's /oauth/token or /oidc/v1/token)")
+    if not client_id:
+        raise OAuthError("OAuth mode needs a client ID")
+    if not secret:
+        raise OAuthError("OAuth mode needs a client secret - none is stored for this server")
+    form = {"grant_type": "client_credentials"}
+    if auth.get("scope"):
+        form["scope"] = auth["scope"]
+    if auth.get("audience"):
+        # Databricks and some IdPs call it `resource`; Auth0-style issuers
+        # call it `audience`. Sending both is harmless.
+        form["audience"] = auth["audience"]
+        form["resource"] = auth["audience"]
+    try:
+        resp = requests.post(
+            token_url, data=form, auth=(client_id, secret),
+            headers={"Accept": "application/json"}, timeout=_OAUTH_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.SSLError as exc:
+        raise OAuthError(f"TLS handshake with the token endpoint failed ({exc.__class__.__name__}): "
+                         "check the certificate chain or the token URL") from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise OAuthError(f"could not connect to the token endpoint {token_url}: DNS, firewall or the URL "
+                         "itself is wrong") from exc
+    except requests.exceptions.Timeout as exc:
+        raise OAuthError(f"the token endpoint {token_url} did not answer within {_OAUTH_TIMEOUT_SECONDS}s") from exc
+    if resp.status_code >= 400:
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("error_description") or body.get("error") or ""
+        except Exception:  # noqa: BLE001
+            detail = (resp.text or "")[:200]
+        if resp.status_code in (400, 401):
+            raise OAuthError(f"the token endpoint rejected the client credentials (HTTP {resp.status_code}"
+                             f"{': ' + detail if detail else ''}) - check the client ID, secret and scope")
+        raise OAuthError(f"the token endpoint answered HTTP {resp.status_code}{': ' + detail if detail else ''}")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise OAuthError("the token endpoint did not return JSON - is this really an OAuth token URL?") from exc
+    token = body.get("access_token")
+    if not token:
+        raise OAuthError(f"the token endpoint returned no access_token (got keys: {', '.join(body.keys()) or 'none'})")
+    try:
+        expires_in = int(body.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    return {"access_token": str(token), "expires_at": time.time() + max(30, expires_in)}
+
+
+def oauth_access_token(server_doc: dict, auth: dict | None = None, secret: str | None = None) -> str:
+    auth = auth or normalize_auth((server_doc or {}).get("auth"))
+    secret = _decrypt_secret(server_doc) if secret is None else secret
+    key = _oauth_cache_key(server_doc, auth, secret)
+    with _oauth_lock:
+        cached = _oauth_tokens.get(key)
+        if cached and cached["expires_at"] - _OAUTH_REFRESH_SKEW_SECONDS > time.time():
+            return cached["access_token"]
+    fresh = fetch_oauth_token(auth, secret)
+    fresh["server_id"] = str((server_doc or {}).get("server_id") or "")
+    with _oauth_lock:
+        _oauth_tokens[key] = fresh
+    return fresh["access_token"]
+
+
+def forget_oauth_token(server_doc: dict) -> None:
+    sid = str((server_doc or {}).get("server_id") or "")
+    with _oauth_lock:
+        for key in [k for k, v in _oauth_tokens.items() if v.get("server_id") == sid]:
+            _oauth_tokens.pop(key, None)
+
+
 def credential_headers(server_doc: dict) -> dict:
     """The headers that authenticate *this gateway* to one downstream
-    server."""
+    server. For OAuth this may perform a (cached) token exchange; a failed
+    exchange is logged and the call goes out unauthenticated so the
+    downstream server's own 401 is what surfaces - the Test Connection
+    button is where the exchange error itself is reported."""
     auth = normalize_auth((server_doc or {}).get("auth"))
     secret = _decrypt_secret(server_doc)
     if auth["mode"] == "none" or not secret:
@@ -140,6 +354,12 @@ def credential_headers(server_doc: dict) -> dict:
 
     if auth["mode"] == "bearer":
         return {"Authorization": f"Bearer {secret}"}
+    if auth["mode"] == "oauth":
+        try:
+            return {"Authorization": f"Bearer {oauth_access_token(server_doc, auth, secret)}"}
+        except OAuthError as exc:
+            logger.warning("OAuth token exchange failed for server '%s': %s", server_doc.get("server_id"), exc)
+            return {}
     if auth["mode"] == "header":
         return {auth["header_name"]: secret}
     if auth["mode"] == "basic":

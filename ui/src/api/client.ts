@@ -4,8 +4,13 @@ import type {
   AuthUser,
   DashboardResponse,
   DownstreamAuth,
+  DownstreamAuthMode,
+  ConnectionTestResult,
+  ServerPlatform,
+  EvalCase,
   EvalDataset,
   EvalRun,
+  ExperimentResponse,
   EvalsResponse,
   Finding,
   GovernanceConfig,
@@ -48,6 +53,7 @@ import type {
   ContextConfigResponse,
   ContextDashboardResponse,
   Role,
+  RoleUsage,
   SdkInfo,
   ServerDoc,
   SiemConfigResponse,
@@ -57,6 +63,13 @@ import type {
   TopologyResponse,
   TraceDetailResponse,
   TracesResponse,
+  DeliveryTestResult,
+  DestinationConfig,
+  LogForwardingConfig,
+  LogForwardingView,
+  MonitoringConfig,
+  MonitoringView,
+  PrometheusTargetRow,
 } from "./types";
 
 class ApiError extends Error {
@@ -103,6 +116,19 @@ export const api = {
   health: () => request<HealthResponse>("/api/health"),
 
   roles: () => request<{ roles: Role[] }>("/v1/roles"),
+  rolesUsage: () => request<{ usage: Record<string, RoleUsage> }>("/v1/roles/usage"),
+  createRole: (id: string, description: string) =>
+    request<{ role: Role; roles: Role[] }>("/v1/roles", { method: "POST", body: JSON.stringify({ id, description }) }),
+  updateRole: (id: string, description: string) =>
+    request<{ role: Role }>(`/v1/roles/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ description }),
+    }),
+  deleteRole: (id: string, force = false) =>
+    request<{ deleted: boolean; role_id: string; stripped: Record<string, string[]> | null }>(
+      `/v1/roles/${encodeURIComponent(id)}${force ? "?force=true" : ""}`,
+      { method: "DELETE" }
+    ),
 
   // -- Local dashboard login ------------------------------------------
   authBootstrapStatus: () => request<{ needs_setup: boolean; username: string }>("/v1/auth/bootstrap-status"),
@@ -164,6 +190,42 @@ export const api = {
       body: JSON.stringify({ config }),
     }),
 
+  // -- Settings -> Log Forwarding / Monitoring --------------------------
+  getLogForwarding: () => request<LogForwardingView>("/v1/log-forwarding"),
+  saveLogForwarding: (config: LogForwardingConfig) =>
+    request<LogForwardingView>("/v1/log-forwarding", { method: "PUT", body: JSON.stringify({ config }) }),
+  testLogDestination: (vendor: string, destination: DestinationConfig) =>
+    request<DeliveryTestResult>(`/v1/log-forwarding/test/${vendor}`, {
+      method: "POST",
+      body: JSON.stringify({ destination }),
+    }),
+
+  getMonitoring: () => request<MonitoringView>("/v1/monitoring"),
+  saveMonitoring: (config: MonitoringConfig) =>
+    request<MonitoringView>("/v1/monitoring", { method: "PUT", body: JSON.stringify({ config }) }),
+  testExporter: (vendor: string, exporter: DestinationConfig) =>
+    request<DeliveryTestResult>(`/v1/monitoring/test/${vendor}`, { method: "POST", body: JSON.stringify({ exporter }) }),
+  newScrapeToken: () =>
+    request<{ token: string; hint: string; created_at: string; view: MonitoringView }>("/v1/monitoring/scrape-token", {
+      method: "POST",
+    }),
+  clearScrapeToken: () => request<MonitoringView>("/v1/monitoring/scrape-token", { method: "DELETE" }),
+  prometheusSnippet: (targets: string[], tokenInFile: boolean) =>
+    request<{ snippet: string; targets: string[] }>("/v1/monitoring/prometheus/snippet", {
+      method: "POST",
+      body: JSON.stringify({ targets, token_in_file: tokenInFile }),
+    }),
+  prometheusCheck: (prometheusUrl: string, targets: string[]) =>
+    request<{ ok: boolean; detail: string; targets: PrometheusTargetRow[] }>("/v1/monitoring/prometheus/check", {
+      method: "POST",
+      body: JSON.stringify({ prometheus_url: prometheusUrl, targets }),
+    }),
+  grafanaSetup: (payload: { grafana_url: string; prometheus_url: string; token?: string; username?: string; password?: string }) =>
+    request<{ dashboardUrl: string; datasourceUid: string; folderUid: string; health: string; view: MonitoringView }>(
+      "/v1/monitoring/grafana/setup",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+
   tlsCert: () => request<{ info: ServerCertificateInfo | null; can_revert: boolean }>("/v1/auth/tls-cert"),
   validateTlsCert: (certPem: string, keyPem: string) =>
     request<{ valid: boolean; info: ServerCertificateInfo }>("/v1/auth/tls-cert/validate", {
@@ -185,11 +247,25 @@ export const api = {
   skillInfo: (platform: string) => request<SkillInfo>(`/v1/skills/${platform}/info`),
 
   servers: () => request<{ servers: ServerDoc[] }>("/v1/servers"),
+  serverPlatforms: () =>
+    request<{ platforms: ServerPlatform[]; auth_modes: DownstreamAuthMode[] }>("/v1/servers/platforms"),
+  testServerConnection: (payload: {
+    server_id?: string;
+    mcp_url?: string;
+    platform?: string;
+    auth?: Partial<DownstreamAuth>;
+    auth_secret?: string;
+  }) =>
+    request<ConnectionTestResult>("/v1/servers/test-connection", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   registerServer: (payload: {
     server_id: string;
     label: string;
     owner: string;
     mcp_url: string;
+    platform?: string;
     trust_status: "trusted" | "untrusted";
     default_allowed_roles: string[];
     auth?: Partial<DownstreamAuth>;
@@ -356,6 +432,15 @@ export const api = {
       body: JSON.stringify({ dataset_id: datasetId || null }),
     }),
   evalRun: (runId: string) => request<{ run: EvalRun }>(`/v1/evals/runs/${encodeURIComponent(runId)}`),
+
+  // -- Agent Tool Audit: experiments + regression automation ----------
+  toolAuditExperiment: (payload: { roles: string[]; queries: string[]; top_ks: number[]; tool_ids: string[] }) =>
+    request<ExperimentResponse>("/v1/tool-audit/experiment", { method: "POST", body: JSON.stringify(payload) }),
+  toolAuditSaveCase: (payload: { dataset_id?: string | null; dataset_name?: string; case: Partial<EvalCase> }) =>
+    request<{ dataset: EvalDataset; case: EvalCase }>("/v1/tool-audit/save-case", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 
   // -- Limits and budgets ------------------------------------------------
   governanceConfig: () => request<GovernanceConfigResponse>("/v1/governance/config"),

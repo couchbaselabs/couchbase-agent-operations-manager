@@ -59,8 +59,11 @@ from app import (
     mcp_client,
     sdk_packaging,
     server_auth,
+    server_probe,
     siem_forwarding,
     skill_packaging,
+    log_forwarding,
+    monitoring,
     tool_versioning,
     tracing,
     user_auth,
@@ -68,6 +71,7 @@ from app import (
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
 from app.couchbase_client import CouchbaseStore, set_siem_config_provider
 from app.embeddings import ToolEmbeddings
+from app import rbac_policy
 from app.rbac_policy import ROLES, normalize_tool_policies
 from config import (
     APPLIANCE_NAME,
@@ -94,6 +98,9 @@ from config import (
     HIJACK_SCAN_INTERVAL_MINUTES,
     INSIGHTS_LOOKBACK_ENTRIES,
     LDAP_SETTINGS_DOC,
+    LOG_FORWARDING_SETTINGS_DOC,
+    MONITORING_SETTINGS_DOC,
+    ROLES_SETTINGS_DOC,
     LLM_API_KEYS,
     LLM_CACHE_DEFAULTS,
     SAMPLE_MCP_SERVERS_BASE_URL,
@@ -761,8 +768,11 @@ async def couchbase_startup():
     await _startup_step("seed demo agents", seed_demo_agents())
 
     await _startup_step("seed default admin account", seed_default_admin())
+    await _startup_step("load RBAC roles", load_roles())
     await _startup_step("load LDAP config", load_ldap_config())
     await _startup_step("load SIEM config", load_siem_config())
+    await _startup_step("load log forwarding config", load_log_forwarding_config())
+    await _startup_step("load monitoring config", load_monitoring_config())
     await _startup_step("load governance policy", load_governance_config())
     await _startup_step("load guardrails policy", load_guardrails_config())
     await _startup_step("load approvals policy", load_approvals_config())
@@ -946,6 +956,54 @@ async def load_siem_config():
     siem_config = siem_forwarding.normalize_config(stored.get("config") if stored else None)
     enabled = [v for v, c in siem_config.items() if c.get("enabled")]
     logger.info("SIEM forwarding config loaded (enabled destinations: %s)", ", ".join(enabled) or "none")
+
+
+log_forwarding_config: dict = dict(log_forwarding.DEFAULT_CONFIG)
+monitoring_config: dict = dict(monitoring.DEFAULT_CONFIG)
+
+
+async def load_log_forwarding_config():
+    global log_forwarding_config
+    stored = await store.get_setting(LOG_FORWARDING_SETTINGS_DOC)
+    cfg = (stored or {}).get("config") or {}
+    log_forwarding_config = log_forwarding.normalize_config(cfg, previous=cfg)
+    log_forwarding.install()
+    log_forwarding.forwarder.apply(log_forwarding_config)
+    on = [v for v, d in log_forwarding_config["destinations"].items() if d.get("enabled")]
+    logger.info("Log forwarding config loaded (enabled=%s, destinations: %s)", log_forwarding_config["enabled"], ", ".join(on) or "none")
+
+
+async def save_log_forwarding_config(cfg: dict):
+    global log_forwarding_config
+    log_forwarding_config = cfg
+    await store.upsert_setting(
+        LOG_FORWARDING_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "log_forwarding", "config": cfg,
+         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+    )
+    log_forwarding.forwarder.apply(cfg)
+
+
+async def load_monitoring_config():
+    global monitoring_config
+    stored = await store.get_setting(MONITORING_SETTINGS_DOC)
+    cfg = (stored or {}).get("config") or {}
+    monitoring_config = monitoring.normalize_config(cfg, previous=cfg)
+    monitoring.pusher.apply(monitoring_config)
+    on = [v for v, d in monitoring_config["exporters"].items() if d.get("enabled")]
+    logger.info("Monitoring config loaded (prometheus=%s, scrape token=%s, exporters: %s)",
+                monitoring_config["prometheusEnabled"], "set" if monitoring_config.get("scrapeTokenHash") else "none", ", ".join(on) or "none")
+
+
+async def save_monitoring_config(cfg: dict):
+    global monitoring_config
+    monitoring_config = cfg
+    await store.upsert_setting(
+        MONITORING_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "monitoring", "config": cfg,
+         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+    )
+    monitoring.pusher.apply(cfg)
 
 
 async def save_siem_config(cfg: dict):
@@ -1931,8 +1989,22 @@ class RegisterServerRequest(BaseModel):
     # server-side by server_auth.normalize_auth - same "the form is a
     # convenience, this is the boundary" convention as LdapConfigRequest.
     auth: dict = Field(default_factory=dict)
+    # Which managed data platform this server fronts (snowflake /
+    # databricks / bigquery / generic) - see server_auth.PLATFORM_PRESETS.
+    platform: str = "generic"
     # The credential itself, plaintext on the way in and encrypted at rest.
     # Never returned by any route.
+    auth_secret: str | None = None
+
+
+class ServerTestConnectionRequest(BaseModel):
+    """Either a saved server (server_id) or an unsaved form (mcp_url + auth
+    + platform); form values override the saved doc when both are given,
+    so an admin can test an edit before committing it."""
+    server_id: str | None = None
+    mcp_url: str | None = None
+    platform: str | None = None
+    auth: dict | None = None
     auth_secret: str | None = None
 
 
@@ -1950,6 +2022,49 @@ class GovernanceConfigRequest(BaseModel):
     config: dict
 
 
+class LogForwardingConfigRequest(BaseModel):
+    config: dict
+
+
+class LogDestinationTestRequest(BaseModel):
+    destination: dict
+
+
+class MonitoringConfigRequest(BaseModel):
+    config: dict
+
+
+class ExporterTestRequest(BaseModel):
+    exporter: dict
+
+
+class PrometheusCheckRequest(BaseModel):
+    prometheus_url: str
+    targets: list[str] = Field(default_factory=list)
+
+
+class PrometheusSnippetRequest(BaseModel):
+    targets: list[str] = Field(default_factory=list)
+    token_in_file: bool = True
+
+
+class GrafanaSetupRequest(BaseModel):
+    grafana_url: str
+    prometheus_url: str
+    token: str | None = None
+    username: str | None = None
+    password: str | None = None
+
+
+class RoleRequest(BaseModel):
+    id: str
+    description: str
+
+
+class RoleUpdateRequest(BaseModel):
+    description: str
+
+
 class EvalDatasetRequest(BaseModel):
     # Raw dataset dict, re-validated by evals.normalize_dataset.
     dataset: dict
@@ -1957,6 +2072,26 @@ class EvalDatasetRequest(BaseModel):
 
 class EvalRunRequest(BaseModel):
     dataset_id: str | None = None
+
+
+class ToolAuditExperimentRequest(BaseModel):
+    """An experiment matrix for the Agent Tool Audit page: every query is
+    discovered as every role at every top_k, and every tool_id has its
+    invoke *decision* checked as every role. Checked, not executed - same
+    rule as the eval runner - so an experiment is free to sweep a hundred
+    cells without touching a customer system."""
+    roles: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
+    top_ks: list[int] = Field(default_factory=lambda: [5])
+    tool_ids: list[str] = Field(default_factory=list)
+
+
+class ToolAuditSaveCaseRequest(BaseModel):
+    """Append one case, captured from a live discover/invoke on the Agent
+    Tool Audit page, to an eval dataset (created if `dataset_id` is empty)."""
+    dataset_id: str | None = None
+    dataset_name: str | None = None
+    case: dict
 
 
 # -- Local dashboard login ---------------------------------------------------
@@ -2110,11 +2245,16 @@ async def prometheus_scrape(request: Request):
     """Prometheus exposition. Optional bearer auth via METRICS_TOKEN; 404
     when the exporter is disabled so a scraper sees "not here" rather than
     an empty page. See MONITORING.md."""
-    if not metrics.ENABLED:
+    if not metrics.ENABLED or not monitoring_config.get("prometheusEnabled", True):
         raise HTTPException(status_code=404, detail="Metrics disabled")
-    if metrics.METRICS_TOKEN:
-        header = request.headers.get("authorization", "")
-        if header != f"Bearer {metrics.METRICS_TOKEN}":
+    header = request.headers.get("authorization", "")
+    presented = header[7:] if header.lower().startswith("bearer ") else ""
+    # Accepts the console-generated scrape token (Settings -> Monitoring),
+    # METRICS_TOKEN from the environment, or - when neither is configured -
+    # nothing at all, as before. A signed-in admin session also passes.
+    if not monitoring.token_accepted(monitoring_config, presented, metrics.METRICS_TOKEN):
+        user = getattr(request.state, "user", None)
+        if not user or user.get("role") != "admin":
             raise HTTPException(status_code=401, detail="Metrics token required")
     body, content_type = metrics.exposition()
     return Response(content=body, media_type=content_type)
@@ -2140,7 +2280,143 @@ async def health():
 
 @app.get("/v1/roles")
 async def roles():
-    return {"roles": [{"id": rid, "description": desc} for rid, desc in ROLES.items()]}
+    return {"roles": rbac_policy.public_roles()}
+
+
+# ---------------------------------------------------------------------------
+# Roles & RBAC: admin-managed roles (see rbac_policy.apply_stored_roles)
+# ---------------------------------------------------------------------------
+async def load_roles():
+    stored = await store.get_setting(ROLES_SETTINGS_DOC)
+    rbac_policy.apply_stored_roles(stored)
+    logger.info("RBAC roles loaded (%d role(s): %s)", len(ROLES), ", ".join(ROLES))
+
+
+async def save_roles():
+    await store.upsert_setting(
+        ROLES_SETTINGS_DOC,
+        {
+            "doc_type": "settings",
+            "setting_id": "roles",
+            **rbac_policy.roles_document(),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+
+
+async def _role_references(role_id: str) -> dict:
+    """Where a role is still in use - what an admin needs to know before
+    deleting it, and what the UI shows next to each role."""
+    tools = await store.list_tools()
+    servers = await store.list_servers()
+    tool_ids = [t.get("tool_id") for t in tools if role_id in (t.get("allowed_roles") or [])]
+    server_ids = [s.get("server_id") for s in servers if role_id in (s.get("default_allowed_roles") or [])]
+    rag_ids = [a["app_id"] for a in rag_apps_registry.values() if role_id in (a.get("allowed_roles") or [])]
+    return {"tools": tool_ids, "servers": server_ids, "rag_apps": rag_ids}
+
+
+@app.get("/v1/roles/usage")
+async def roles_usage(request: Request):
+    """Per-role reference counts (tools, servers, RAG apps) for the Roles
+    page - computed once here rather than N times in the browser."""
+    require_admin(request)
+    tools = await store.list_tools()
+    servers = await store.list_servers()
+    usage = {}
+    for rid in ROLES:
+        usage[rid] = {
+            "tools": sum(1 for t in tools if rid in (t.get("allowed_roles") or [])),
+            "servers": sum(1 for s in servers if rid in (s.get("default_allowed_roles") or [])),
+            "rag_apps": sum(1 for a in rag_apps_registry.values() if rid in (a.get("allowed_roles") or [])),
+        }
+    return {"usage": usage}
+
+
+@app.post("/v1/roles")
+async def create_role(req: RoleRequest, request: Request):
+    user = require_admin(request)
+    try:
+        rid, desc = rbac_policy.normalize_role(req.id, req.description)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if rid in ROLES:
+        raise HTTPException(status_code=409, detail=f"Role '{rid}' already exists")
+    ROLES[rid] = desc
+    await save_roles()
+    await store.log_access(
+        action="role.create", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason=f"role '{rid}' created", latency_ms=0,
+    )
+    return {"role": {"id": rid, "description": desc, "builtin": False}, "roles": rbac_policy.public_roles()}
+
+
+@app.put("/v1/roles/{role_id}")
+async def update_role(role_id: str, req: RoleUpdateRequest, request: Request):
+    user = require_admin(request)
+    if role_id not in ROLES:
+        raise HTTPException(status_code=404, detail=f"No role '{role_id}'")
+    try:
+        _, desc = rbac_policy.normalize_role(role_id, req.description)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ROLES[role_id] = desc
+    await save_roles()
+    await store.log_access(
+        action="role.update", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason=f"role '{role_id}' description updated", latency_ms=0,
+    )
+    return {"role": {"id": role_id, "description": desc, "builtin": rbac_policy.is_builtin_role(role_id)}}
+
+
+@app.delete("/v1/roles/{role_id}")
+async def delete_role(role_id: str, request: Request, force: bool = False):
+    """Remove a custom role. Refused while anything still grants it unless
+    `force` is set - then the grant is stripped from every tool, server and
+    RAG application so nothing is left pointing at a role that no longer
+    exists (a dangling grant would silently become a no-op, which is the
+    wrong way for access to disappear)."""
+    user = require_admin(request)
+    if role_id not in ROLES:
+        raise HTTPException(status_code=404, detail=f"No role '{role_id}'")
+    if rbac_policy.is_builtin_role(role_id):
+        raise HTTPException(status_code=400, detail=f"'{role_id}' is a built-in role and cannot be deleted")
+    refs = await _role_references(role_id)
+    in_use = any(refs.values())
+    if in_use and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Role '{role_id}' is still granted on {len(refs['tools'])} tool(s), "
+                f"{len(refs['servers'])} server(s) and {len(refs['rag_apps'])} RAG application(s). "
+                "Remove those grants first, or delete with force=true to strip them."
+            ),
+        )
+    if in_use:
+        for tool_id in refs["tools"]:
+            doc = await store.get_tool(tool_id)
+            if doc:
+                doc["allowed_roles"] = [r for r in (doc.get("allowed_roles") or []) if r != role_id]
+                await store.upsert_tool(tool_id, doc)
+        for server_id in refs["servers"]:
+            doc = await store.get_server(server_id)
+            if doc:
+                doc["default_allowed_roles"] = [r for r in (doc.get("default_allowed_roles") or []) if r != role_id]
+                await store.upsert_server(server_id, doc)
+        for app_id in refs["rag_apps"]:
+            a = rag_apps_registry[app_id]
+            a["allowed_roles"] = [r for r in a.get("allowed_roles") or [] if r != role_id]
+        if refs["rag_apps"]:
+            await save_rag_apps()
+    ROLES.pop(role_id, None)
+    await save_roles()
+    await store.log_access(
+        action="role.delete", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW",
+        reason=f"role '{role_id}' deleted" + (" (grants stripped)" if in_use else ""), latency_ms=0,
+    )
+    if in_use:
+        await after_catalog_change(f"role '{role_id}' deleted")
+    return {"deleted": True, "role_id": role_id, "stripped": refs if in_use else None}
 
 
 # ---------------------------------------------------------------------------
@@ -2238,6 +2514,7 @@ def public_server(server_doc: dict) -> dict:
     one is configured."""
     doc = {k: v for k, v in (server_doc or {}).items() if k != "auth_secret"}
     doc["auth"] = server_auth.public_auth(server_doc)
+    doc["platform"] = server_auth.normalize_platform(doc.get("platform"))
     return doc
 
 
@@ -2256,12 +2533,17 @@ async def register_server(req: RegisterServerRequest):
         tool_policies = normalize_tool_policies(req.tool_policies)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    platform = server_auth.normalize_platform(req.platform)
+    platform_issue = server_auth.validate_platform_url(platform, req.mcp_url)
+    if platform_issue:
+        raise HTTPException(status_code=400, detail=f"MCP URL does not match the {platform} platform: {platform_issue}")
 
     server_doc = {
         "server_id": req.server_id,
         "label": req.label,
         "owner": req.owner,
         "mcp_url": req.mcp_url,
+        "platform": platform,
         "trust_status": req.trust_status,
         "default_allowed_roles": req.default_allowed_roles,
         "tool_policies": tool_policies,
@@ -2292,6 +2574,36 @@ async def register_server(req: RegisterServerRequest):
     }
 
 
+@app.get("/v1/servers/platforms")
+async def server_platforms():
+    """The managed data platform presets (Snowflake, Databricks, BigQuery)
+    the registration form offers: URL shape, host allow-list, auth defaults."""
+    return {"platforms": server_auth.public_platforms(), "auth_modes": list(server_auth.AUTH_MODES)}
+
+
+@app.post("/v1/servers/test-connection")
+async def test_server_connection(req: ServerTestConnectionRequest, request: Request):
+    """Probe one MCP endpoint - saved or still in the form - stage by stage
+    (URL, DNS, TCP/TLS, credential, HTTP, MCP handshake) and explain the
+    first stage that fails in plain language. Never stores anything."""
+    require_admin(request)
+    doc: dict = {}
+    if req.server_id:
+        doc = await store.get_server(req.server_id) or {}
+        if not doc:
+            raise HTTPException(status_code=404, detail="Server not registered")
+    if req.mcp_url is not None:
+        doc["mcp_url"] = req.mcp_url
+    if req.platform is not None:
+        doc["platform"] = req.platform
+    if req.auth is not None:
+        doc["auth"] = {**server_auth.normalize_auth(doc.get("auth")), **req.auth}
+    if not doc.get("mcp_url"):
+        raise HTTPException(status_code=400, detail="mcp_url (or a registered server_id) is required")
+    timeout = int((governance_config or {}).get("downstream_timeout_seconds") or server_probe.PROBE_TIMEOUT_SECONDS)
+    return await server_probe.probe(doc, secret=req.auth_secret, timeout_seconds=max(5, min(timeout, 60)))
+
+
 @app.put("/v1/servers/{server_id}/auth")
 async def put_server_auth(server_id: str, req: ServerAuthRequest, request: Request):
     """Set how this gateway authenticates to one registered server. The
@@ -2308,6 +2620,7 @@ async def put_server_auth(server_id: str, req: ServerAuthRequest, request: Reque
         server_auth.clear_secret(server_doc)
     else:
         server_auth.store_secret(server_doc, req.auth_secret)
+    server_auth.forget_oauth_token(server_doc)
 
     await store.upsert_server(server_id, server_doc)
     return {"server": public_server(server_doc)}
@@ -4448,6 +4761,186 @@ async def test_siem_config(vendor: str, req: SiemTestRequest, request: Request):
     return result
 
 
+# -- Settings -> Log Forwarding (admin only) ----------------------------------
+# The operations manager's own application log, batched to a log platform.
+# See app/log_forwarding.py; distinct from the SIEM audit-log forwarding above.
+
+def _log_forwarding_view() -> dict:
+    return {
+        "config": log_forwarding.public_config(log_forwarding_config),
+        "catalog": log_forwarding.VENDORS,
+        "services": log_forwarding.service_status(),
+        "durable": store.connected,
+        "levels": list(log_forwarding.LEVELS),
+    }
+
+
+@app.get("/v1/log-forwarding")
+async def get_log_forwarding(request: Request):
+    require_admin(request)
+    return _log_forwarding_view()
+
+
+@app.put("/v1/log-forwarding")
+async def put_log_forwarding(req: LogForwardingConfigRequest, request: Request):
+    require_admin(request)
+    cfg = log_forwarding.normalize_config(req.config, previous=log_forwarding_config)
+    problems = []
+    for vid, d in cfg["destinations"].items():
+        if d.get("enabled"):
+            missing = log_forwarding.missing_required(vid, d)
+            if missing:
+                problems.append(f"{log_forwarding.VENDOR_BY_ID[vid]['label']}: {', '.join(missing)}")
+    if problems:
+        raise HTTPException(status_code=400, detail="Required fields are empty - " + "; ".join(problems))
+    await save_log_forwarding_config(cfg)
+    return _log_forwarding_view()
+
+
+@app.post("/v1/log-forwarding/test/{vendor}")
+async def test_log_forwarding(vendor: str, req: LogDestinationTestRequest, request: Request):
+    """Deliver one record now, using the form as it is (saved or not)."""
+    require_admin(request)
+    if vendor not in log_forwarding.VENDOR_BY_ID:
+        raise HTTPException(status_code=404, detail=f"Unknown log destination '{vendor}'")
+    candidate = log_forwarding.normalize_config(
+        {**log_forwarding_config, "destinations": {vendor: req.destination}}, previous=log_forwarding_config
+    )
+    return await asyncio.to_thread(log_forwarding.test_destination, vendor, candidate["destinations"][vendor])
+
+
+# -- Settings -> Monitoring (admin only) --------------------------------------
+# Prometheus scrape token + target check, Grafana wizard, push exporters.
+# See app/monitoring.py.
+
+def _monitoring_view() -> dict:
+    api_port = int(os.getenv("API_PORT", "8090"))
+    tls = os.getenv("DISABLE_TLS", "false").strip().lower() not in ("1", "true", "yes")
+    endpoint = monitoring.default_targets(api_port, tls)
+    endpoint["scrapeTokenSet"] = bool(monitoring_config.get("scrapeTokenHash"))
+    endpoint["staticTokenSet"] = bool(metrics.METRICS_TOKEN)
+    endpoint["exporterAvailable"] = metrics.ENABLED
+    return {
+        "config": monitoring.public_config(monitoring_config),
+        "catalog": monitoring.EXPORTERS,
+        "endpoint": endpoint,
+        "services": monitoring.pusher.status(),
+        "durable": store.connected,
+    }
+
+
+@app.get("/v1/monitoring")
+async def get_monitoring(request: Request):
+    require_admin(request)
+    return _monitoring_view()
+
+
+@app.put("/v1/monitoring")
+async def put_monitoring(req: MonitoringConfigRequest, request: Request):
+    require_admin(request)
+    cfg = monitoring.normalize_config(req.config, previous=monitoring_config)
+    problems = []
+    for vid, d in cfg["exporters"].items():
+        if d.get("enabled"):
+            missing = monitoring.missing_required(vid, d)
+            if missing:
+                problems.append(f"{monitoring.EXPORTER_BY_ID[vid]['label']}: {', '.join(missing)}")
+    if problems:
+        raise HTTPException(status_code=400, detail="Required fields are empty - " + "; ".join(problems))
+    await save_monitoring_config(cfg)
+    return _monitoring_view()
+
+
+@app.post("/v1/monitoring/scrape-token")
+async def new_scrape_token(request: Request):
+    """Generate a new scrape token. Only its hash is stored; the plaintext
+    is returned once. The previous token stops working immediately."""
+    user = require_admin(request)
+    cfg, token = monitoring.generate_scrape_token(monitoring_config)
+    await save_monitoring_config(cfg)
+    await store.log_access(
+        action="monitoring.scrape-token", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason="new /metrics scrape token generated", latency_ms=0,
+    )
+    return {"token": token, "hint": cfg["scrapeTokenHint"], "created_at": cfg["scrapeTokenCreatedAt"], "view": _monitoring_view()}
+
+
+@app.delete("/v1/monitoring/scrape-token")
+async def clear_scrape_token(request: Request):
+    require_admin(request)
+    cfg = dict(monitoring_config, scrapeTokenHash="", scrapeTokenHint="", scrapeTokenCreatedAt="")
+    await save_monitoring_config(cfg)
+    return _monitoring_view()
+
+
+@app.post("/v1/monitoring/prometheus/snippet")
+async def prometheus_snippet(req: PrometheusSnippetRequest, request: Request):
+    require_admin(request)
+    view = _monitoring_view()
+    targets = [t.strip() for t in req.targets if t and t.strip()] or [t["address"] for t in view["endpoint"]["defaultTargets"]]
+    return {
+        "snippet": monitoring.scrape_config_snippet(
+            targets, tls=view["endpoint"]["scheme"] == "https",
+            interval=int(monitoring_config.get("scrapeIntervalSeconds") or 15), token_in_file=req.token_in_file,
+        ),
+        "targets": targets,
+    }
+
+
+@app.post("/v1/monitoring/prometheus/check")
+async def prometheus_check(req: PrometheusCheckRequest, request: Request):
+    require_admin(request)
+    url = req.prometheus_url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="prometheus_url must be an absolute http(s) URL")
+    view = _monitoring_view()
+    targets = [t.strip() for t in req.targets if t and t.strip()] or [t["address"] for t in view["endpoint"]["defaultTargets"]]
+    result = await asyncio.to_thread(monitoring.check_prometheus_targets, url, targets)
+    if monitoring_config.get("prometheusUrl") != url:
+        await save_monitoring_config(dict(monitoring_config, prometheusUrl=url))
+    return result
+
+
+@app.post("/v1/monitoring/grafana/setup")
+async def grafana_setup(req: GrafanaSetupRequest, request: Request):
+    """Install the data source, folder and dashboard. The Grafana credential
+    is used for this call and never stored."""
+    user = require_admin(request)
+    try:
+        result = await asyncio.to_thread(
+            monitoring.provision_grafana,
+            grafana_url=req.grafana_url.strip(), token=(req.token or "").strip() or None,
+            username=(req.username or "").strip() or None, password=req.password,
+            prometheus_url=req.prometheus_url.strip(), scrape_token_set=bool(monitoring_config.get("scrapeTokenHash")),
+        )
+    except monitoring.GrafanaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await save_monitoring_config(dict(
+        monitoring_config, grafanaUrl=req.grafana_url.strip(), grafanaPrometheusUrl=req.prometheus_url.strip(),
+        grafanaDashboardUrl=result["dashboardUrl"], grafanaAppliedAt=monitoring._iso(),  # noqa: SLF001
+    ))
+    await store.log_access(
+        action="monitoring.grafana-setup", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason=f"Grafana dashboard installed at {req.grafana_url.strip()}", latency_ms=0,
+    )
+    return {**result, "view": _monitoring_view()}
+
+
+@app.get("/v1/monitoring/grafana/dashboard.json")
+async def grafana_dashboard_json(request: Request):
+    require_admin(request)
+    return JSONResponse(monitoring.dashboard_json(), headers={"Content-Disposition": 'attachment; filename="aom-overview.json"'})
+
+
+@app.post("/v1/monitoring/test/{vendor}")
+async def test_monitoring_exporter(vendor: str, req: ExporterTestRequest, request: Request):
+    require_admin(request)
+    if vendor not in monitoring.EXPORTER_BY_ID:
+        raise HTTPException(status_code=404, detail=f"Unknown exporter '{vendor}'")
+    candidate = monitoring.normalize_config({**monitoring_config, "exporters": {vendor: req.exporter}}, previous=monitoring_config)
+    return await asyncio.to_thread(monitoring.test_exporter, vendor, candidate["exporters"][vendor])
+
+
 # -- Settings -> HTTPS Certificate (admin only) ------------------------------
 # Separate feature from the LDAP corporate CA above - see user_auth.py's
 # section comment for the distinction. This installs the certificate nginx
@@ -4636,6 +5129,133 @@ async def run_evals(req: EvalRunRequest, request: Request):
         return {"runs": [await execute_eval_dataset(dataset, trigger="manual")]}
 
     return {"runs": await run_eval_gate(trigger="manual")}
+
+
+# ---------------------------------------------------------------------------
+# Agent Tool Audit: experimentation + regression automation
+# ---------------------------------------------------------------------------
+MAX_EXPERIMENT_CELLS = 400
+
+
+@app.post("/v1/tool-audit/experiment")
+async def tool_audit_experiment(req: ToolAuditExperimentRequest, request: Request):
+    """Run the matrix and return every cell with what it observed, plus a
+    per-query summary of which tools appeared for which roles - the
+    "what does changing the role / phrasing / top_k do?" question answered
+    in one table rather than one click at a time."""
+    require_admin(request)
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    roles_ = [r for r in dict.fromkeys(r.strip() for r in req.roles) if r]
+    unknown = [r for r in roles_ if r not in ROLES]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown role(s): {unknown}")
+    if not roles_:
+        raise HTTPException(status_code=400, detail="Pick at least one role")
+    queries = [q.strip()[:4000] for q in req.queries if q and q.strip()][:50]
+    top_ks = sorted({max(1, min(25, int(k))) for k in (req.top_ks or [5])})[:5]
+    tool_ids = [t.strip()[:200] for t in req.tool_ids if t and t.strip()][:50]
+    cells = len(roles_) * (len(queries) * len(top_ks) + len(tool_ids))
+    if cells == 0:
+        raise HTTPException(status_code=400, detail="Add at least one query or tool ID")
+    if cells > MAX_EXPERIMENT_CELLS:
+        raise HTTPException(status_code=400, detail=f"{cells} cells is over the {MAX_EXPERIMENT_CELLS}-cell limit for one experiment")
+
+    started = time.time()
+    # Embed each query once, not once per role/top_k.
+    vectors = {q: await embeddings.embed_async(q) for q in queries}
+    discover_cells = []
+    for q in queries:
+        for role in roles_:
+            for k in top_ks:
+                t0 = time.time()
+                try:
+                    tools = await store.discover_tools(role, vectors[q], top_k=k)
+                    discover_cells.append({
+                        "query": q, "role": role, "top_k": k, "ok": True,
+                        "tools": [{"tool_id": t.get("tool_id"), "similarity": t.get("similarity"), "risk_level": t.get("risk_level")} for t in tools],
+                        "latency_ms": int((time.time() - t0) * 1000),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    discover_cells.append({"query": q, "role": role, "top_k": k, "ok": False, "error": str(exc)[:300], "tools": []})
+
+    invoke_cells = []
+    for tool_id in tool_ids:
+        tool = await store.get_tool(tool_id)
+        for role in roles_:
+            if not tool:
+                decision, reason = "DENY", "tool not found in the vetted Couchbase catalog"
+            elif tool.get("drift_status") == "drifted":
+                decision, reason = "DENY", "quarantined: definition changed after approval"
+            elif tool.get("trust_status") != "trusted":
+                decision, reason = "DENY", f"tool trust_status is '{tool.get('trust_status')}'"
+            elif role not in (tool.get("allowed_roles") or []):
+                decision, reason = "DENY", f"role '{role}' is not in allowed_roles {tool.get('allowed_roles')}"
+            else:
+                decision, reason = "ALLOW", "authorized"
+            invoke_cells.append({"tool_id": tool_id, "role": role, "decision": decision, "reason": reason})
+
+    # Per-query comparison: union of tools seen, and which roles saw each.
+    comparison = []
+    for q in queries:
+        seen: dict[str, dict] = {}
+        for c in discover_cells:
+            if c["query"] != q or not c["ok"]:
+                continue
+            for rank, t in enumerate(c["tools"], start=1):
+                row = seen.setdefault(t["tool_id"], {"tool_id": t["tool_id"], "roles": {}, "best_similarity": 0.0})
+                key = f"{c['role']}@{c['top_k']}"
+                row["roles"][key] = rank
+                row["best_similarity"] = max(row["best_similarity"], float(t.get("similarity") or 0.0))
+        comparison.append({"query": q, "tools": sorted(seen.values(), key=lambda r: -r["best_similarity"])})
+
+    await store.log_access(
+        action="tool-audit.experiment", role=request.state.user.get("role"), subject_label=request.state.user.get("username"),
+        query=redact_text_for_storage("; ".join(queries)[:500]) if queries else None, tool_id=None, server_id=None,
+        decision="ALLOW", reason=f"{cells} experiment cell(s) across roles {roles_}", latency_ms=int((time.time() - started) * 1000),
+    )
+    return {
+        "roles": roles_, "queries": queries, "top_ks": top_ks, "tool_ids": tool_ids,
+        "discover": discover_cells, "invoke": invoke_cells, "comparison": comparison,
+        "cells": cells, "latency_ms": int((time.time() - started) * 1000),
+    }
+
+
+@app.post("/v1/tool-audit/save-case")
+async def tool_audit_save_case(req: ToolAuditSaveCaseRequest, request: Request):
+    """Turn what the Agent Tool Audit just observed into a regression case.
+    The observed result becomes the expectation (`expect_tools` /
+    `expect_decision`), so the next run of the dataset fails if the
+    gateway's answer changes - which is what "lock in today's behaviour"
+    means."""
+    require_admin(request)
+    case = evals.normalize_case(req.case, 0)
+    if case["kind"] == "discover" and not case.get("query"):
+        raise HTTPException(status_code=400, detail="A discover case needs a query")
+    if case["kind"] == "invoke" and not case.get("tool_id"):
+        raise HTTPException(status_code=400, detail="An invoke case needs a tool_id")
+    if case.get("role") not in ROLES:
+        raise HTTPException(status_code=400, detail=f"Unknown role '{case.get('role')}'")
+
+    dataset = await store.get_dataset(req.dataset_id) if req.dataset_id else None
+    if req.dataset_id and not dataset:
+        raise HTTPException(status_code=404, detail="No such dataset")
+    if not dataset:
+        name = (req.dataset_name or "").strip() or "Agent Tool Audit regression"
+        dataset = evals.normalize_dataset({"name": name, "description": "Cases captured from the Agent Tool Audit page.", "cases": []})
+    existing_ids = {c["case_id"] for c in dataset.get("cases") or []}
+    base = case["case_id"] if case["case_id"] and case["case_id"] not in existing_ids and not case["case_id"].startswith("case-") else None
+    if not base:
+        n = len(dataset.get("cases") or []) + 1
+        while f"audit-{n}" in existing_ids:
+            n += 1
+        case["case_id"] = f"audit-{n}"
+    dataset["cases"] = (dataset.get("cases") or []) + [case]
+    if len(dataset["cases"]) > evals.MAX_CASES_PER_DATASET:
+        raise HTTPException(status_code=400, detail=f"Dataset already holds {evals.MAX_CASES_PER_DATASET} cases")
+    dataset = evals.normalize_dataset(dataset)
+    await store.upsert_dataset(dataset)
+    return {"dataset": dataset, "case": case}
 
 
 @app.get("/v1/evals/runs/{run_id:path}")
@@ -5663,9 +6283,13 @@ async def list_rag_apps(request: Request):
     llm_events, context_events = await asyncio.gather(
         store.recent_llm_events(limit=2000), store.recent_context_events(limit=2000)
     )
-    activity = rag_apps.activity_by_app([a["app_id"] for a in apps], llm_events, context_events)
+    app_ids = [a["app_id"] for a in apps]
+    activity = rag_apps.activity_by_app(app_ids, llm_events, context_events)
+    # Per-user LLM Caching token statistics, from the same events - see
+    # rag_apps.usage_by_user. Keyed by app_id.
+    usage = rag_apps.usage_by_user(app_ids, llm_events)
     return {
-        "apps": [dict(a, activity=activity.get(a["app_id"])) for a in apps],
+        "apps": [dict(a, activity=activity.get(a["app_id"]), usage_by_user=usage.get(a["app_id"]) or []) for a in apps],
         "roles": list(ROLES),
         "knowledge_generation": knowledge_generation,
         "activity_window_events": 2000,

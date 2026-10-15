@@ -27,6 +27,8 @@ import { SettingsHttpsCertificatePage } from "./pages/SettingsHttpsCertificatePa
 import { SettingsLimitsPage } from "./pages/SettingsLimitsPage";
 import { SettingsGuardrailsPage } from "./pages/SettingsGuardrailsPage";
 import { SettingsAgentsPage } from "./pages/SettingsAgentsPage";
+import { SettingsLogForwardingPage } from "./pages/SettingsLogForwardingPage";
+import { SettingsMonitoringPage } from "./pages/SettingsMonitoringPage";
 import { LoginPage } from "./pages/LoginPage";
 import { RequirePasswordChangePage } from "./pages/RequirePasswordChangePage";
 import { useAuth } from "./auth/AuthContext";
@@ -123,6 +125,22 @@ export default function App() {
             element={
               <AdminRoute>
                 <SettingsLimitsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/settings/log-forwarding"
+            element={
+              <AdminRoute>
+                <SettingsLogForwardingPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/settings/monitoring"
+            element={
+              <AdminRoute>
+                <SettingsMonitoringPage />
               </AdminRoute>
             }
           />

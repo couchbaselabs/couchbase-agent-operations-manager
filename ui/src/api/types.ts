@@ -1,6 +1,14 @@
 export interface Role {
   id: string;
   description: string;
+  /** Seeded by rbac_policy.BUILTIN_ROLES - editable, never deletable. */
+  builtin?: boolean;
+}
+
+export interface RoleUsage {
+  tools: number;
+  servers: number;
+  rag_apps: number;
 }
 
 export interface SdkInfo {
@@ -17,7 +25,38 @@ export interface SkillInfo {
   size_bytes: number;
 }
 
-export type DownstreamAuthMode = "none" | "bearer" | "header" | "basic";
+export type DownstreamAuthMode = "none" | "bearer" | "header" | "basic" | "oauth";
+
+/** A managed data platform preset for the registration form - see
+ * server_auth.PLATFORM_PRESETS. */
+export interface ServerPlatform {
+  id: string;
+  label: string;
+  url_hint: string;
+  hosts: string[];
+  auth_mode: DownstreamAuthMode;
+  token_url_hint?: string;
+  scope_hint?: string;
+  notes: string;
+}
+
+export interface ConnectionTestStep {
+  step: "url" | "dns" | "connect" | "credential" | "http" | "mcp";
+  ok: boolean;
+  detail: string;
+  warning?: string | null;
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  summary: string;
+  suggestion: string | null;
+  steps: ConnectionTestStep[];
+  tools: Array<{ name: string; description: string }>;
+  latency_ms: number;
+  platform: string;
+  auth_mode: DownstreamAuthMode;
+}
 
 /** How this gateway authenticates to one registered MCP server. The
  * credential itself is never returned by the API - `secret_configured` is
@@ -25,7 +64,12 @@ export type DownstreamAuthMode = "none" | "bearer" | "header" | "basic";
 export interface DownstreamAuth {
   mode: DownstreamAuthMode;
   header_name: string;
+  /** Basic-auth username, or the OAuth client_id. */
   username: string;
+  /** OAuth client-credentials only. */
+  token_url?: string;
+  scope?: string;
+  audience?: string;
   secret_configured: boolean;
 }
 
@@ -34,6 +78,7 @@ export interface ServerDoc {
   label: string;
   owner: string;
   mcp_url: string;
+  platform?: string;
   trust_status: "trusted" | "untrusted";
   default_allowed_roles: string[];
   auth?: DownstreamAuth;
@@ -781,6 +826,44 @@ export interface EvalsResponse {
   last_gate_at: string | null;
 }
 
+// --- Agent Tool Audit: experiments ------------------------------------------
+
+export interface ExperimentDiscoverCell {
+  query: string;
+  role: string;
+  top_k: number;
+  ok: boolean;
+  error?: string;
+  tools: Array<{ tool_id: string; similarity: number; risk_level: string }>;
+  latency_ms?: number;
+}
+
+export interface ExperimentInvokeCell {
+  tool_id: string;
+  role: string;
+  decision: "ALLOW" | "DENY";
+  reason: string;
+}
+
+export interface ExperimentComparisonRow {
+  tool_id: string;
+  /** "<role>@<top_k>" -> rank at which the tool appeared */
+  roles: Record<string, number>;
+  best_similarity: number;
+}
+
+export interface ExperimentResponse {
+  roles: string[];
+  queries: string[];
+  top_ks: number[];
+  tool_ids: string[];
+  discover: ExperimentDiscoverCell[];
+  invoke: ExperimentInvokeCell[];
+  comparison: Array<{ query: string; tools: ExperimentComparisonRow[] }>;
+  cells: number;
+  latency_ms: number;
+}
+
 // --- Limits and budgets -----------------------------------------------------
 
 export interface GovernanceConfig {
@@ -1179,6 +1262,29 @@ export interface RagApp {
   created_by: string | null;
   updated_at: string | null;
   activity?: RagAppActivity | null;
+  /** Per-user LLM Caching token usage over the same recent-events window
+   *  as `activity` - see rag_apps.usage_by_user. */
+  usage_by_user?: RagAppUserUsage[];
+}
+
+export interface RagAppUserUsage {
+  subject: string;
+  role: string;
+  queries: number;
+  hits: number;
+  exact_hits: number;
+  semantic_hits: number;
+  misses: number;
+  bypasses: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tokens_spent: number;
+  tokens_saved: number;
+  cost_usd: number;
+  cost_saved_usd: number;
+  latency_saved_ms: number;
+  hit_rate_pct: number;
+  last_query_at: string | null;
 }
 
 export interface RagAppsResponse {
@@ -1215,4 +1321,128 @@ export interface RagQueryResponse {
   };
   latency_ms: number;
   trace: { trace_id: string };
+}
+
+// --- Settings -> Log Forwarding / Monitoring (CRDS parity) ------------------
+
+export const SECRET_MASK = "********";
+
+export interface VendorField {
+  name: string;
+  label: string;
+  input: "text" | "secret" | "number" | "select" | "bool";
+  default: string;
+  required: boolean;
+  placeholder: string;
+  hint: string | null;
+  options: string[];
+}
+
+export interface Vendor {
+  id: string;
+  label: string;
+  product: string;
+  openSource: boolean;
+  transport: string;
+  description: string;
+  fields: VendorField[];
+}
+
+export interface DestinationConfig {
+  type: string;
+  enabled: boolean;
+  fields: Record<string, string>;
+}
+
+export interface DeliveryTestResult {
+  success: boolean;
+  detail: string;
+}
+
+export interface LogForwardingConfig {
+  enabled: boolean;
+  minLevel: "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR";
+  batchSize: number;
+  flushIntervalMs: number;
+  queueCapacity: number;
+  includeStackTraces: boolean;
+  maxMessageChars: number;
+  destinations: Record<string, DestinationConfig>;
+}
+
+export interface DestinationDelivery {
+  sent: number;
+  failed: number;
+  lastOkAt: string | null;
+  lastError: string | null;
+  backingOff: boolean;
+}
+
+export interface ForwarderStatus {
+  active: boolean;
+  received: number;
+  queued: number;
+  droppedQueueFull: number;
+  destinations: Record<string, DestinationDelivery>;
+}
+
+export interface ServiceStatus<T> {
+  service: string;
+  node: string;
+  at: string;
+  status: T | null;
+}
+
+export interface LogForwardingView {
+  config: LogForwardingConfig;
+  catalog: Vendor[];
+  services: Record<string, ServiceStatus<ForwarderStatus>>;
+  durable: boolean;
+  levels: string[];
+}
+
+export interface MonitoringConfig {
+  prometheusEnabled: boolean;
+  scrapeTokenHint: string;
+  scrapeTokenCreatedAt: string;
+  scrapeIntervalSeconds: number;
+  prometheusUrl: string;
+  grafanaUrl: string;
+  grafanaPrometheusUrl: string;
+  grafanaDashboardUrl: string;
+  grafanaAppliedAt: string;
+  pushIntervalSeconds: number;
+  exporters: Record<string, DestinationConfig>;
+}
+
+export interface ExporterStatus {
+  pushes: number;
+  failures: number;
+  lastOkAt: string | null;
+  lastError: string | null;
+}
+
+export interface MonitoringView {
+  config: MonitoringConfig;
+  catalog: Vendor[];
+  endpoint: {
+    scheme: "http" | "https";
+    path: string;
+    defaultTargets: Array<{ address: string; service: string }>;
+    scrapeTokenSet: boolean;
+    staticTokenSet: boolean;
+    exporterAvailable: boolean;
+  };
+  services: Record<string, ServiceStatus<Record<string, ExporterStatus>>>;
+  durable: boolean;
+}
+
+export interface PrometheusTargetRow {
+  job: string | null;
+  instance: string;
+  health: string;
+  lastError: string;
+  lastScrape: string | null;
+  scrapeUrl: string | null;
+  expected: boolean;
 }

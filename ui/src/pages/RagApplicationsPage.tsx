@@ -122,6 +122,7 @@ export function RagApplicationsPage() {
   const [asking, setAsking] = useState(false);
   const [result, setResult] = useState<RagQueryResponse | null>(null);
   const [askError, setAskError] = useState<string | null>(null);
+  const [usageAppId, setUsageAppId] = useState<string>("");
 
   const load = useCallback(async () => {
     setError(null);
@@ -786,6 +787,113 @@ print(res["retrieval"]["cache"], res["llm"]["cache"]["status"])  # e.g. hit, hit
 
       {data && data.apps.length > 0 && (
         <>
+          <h2 style={{ fontSize: 16, margin: "22px 0 4px 0" }}>Token usage by user</h2>
+          <p className="cell-muted" style={{ fontSize: 12.5, margin: "0 0 14px 0" }}>
+            What each caller spent and saved through LLM Caching, per application, over the same recent-events window
+            as the activity columns above (last {data.activity_window_events.toLocaleString()} cache events). A user
+            is the caller subject the gateway authenticated - an agent identity, a masked API key or an OIDC subject -
+            the same value the Audit Log shows.
+          </p>
+          <div className="card" style={{ marginBottom: 24 }}>
+            <div className="flex-row" style={{ gap: 10, marginBottom: 10, alignItems: "center" }}>
+              <label style={{ margin: 0, fontSize: 12.5 }}>Application</label>
+              <select
+                value={usageAppId || data.apps[0].app_id}
+                onChange={(e) => setUsageAppId(e.target.value)}
+                style={{ maxWidth: 360 }}
+              >
+                {data.apps.map((a) => (
+                  <option key={a.app_id} value={a.app_id}>
+                    {a.name} ({a.app_id}) - {(a.usage_by_user || []).length} user
+                    {(a.usage_by_user || []).length === 1 ? "" : "s"}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {(() => {
+              const app = data.apps.find((a) => a.app_id === (usageAppId || data.apps[0].app_id)) || data.apps[0];
+              const rows = app.usage_by_user || [];
+              if (rows.length === 0) {
+                return <div className="empty-state">No queries recorded for {app.name} in the current window.</div>;
+              }
+              const totals = rows.reduce(
+                (t, r) => ({
+                  queries: t.queries + r.queries,
+                  hits: t.hits + r.hits,
+                  tokens_spent: t.tokens_spent + r.tokens_spent,
+                  tokens_saved: t.tokens_saved + r.tokens_saved,
+                  cost_usd: t.cost_usd + r.cost_usd,
+                  cost_saved_usd: t.cost_saved_usd + r.cost_saved_usd,
+                }),
+                { queries: 0, hits: 0, tokens_spent: 0, tokens_saved: 0, cost_usd: 0, cost_saved_usd: 0 }
+              );
+              return (
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>User (subject)</th>
+                        <th>Role</th>
+                        <th style={{ textAlign: "right" }}>Queries</th>
+                        <th style={{ textAlign: "right" }}>Cache hits</th>
+                        <th style={{ textAlign: "right" }}>Hit rate</th>
+                        <th style={{ textAlign: "right" }}>Tokens spent</th>
+                        <th style={{ textAlign: "right" }}>Tokens saved</th>
+                        <th style={{ textAlign: "right" }}>Spent</th>
+                        <th style={{ textAlign: "right" }}>Saved</th>
+                        <th>Last query</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r) => (
+                        <tr key={`${r.subject}|${r.role}`}>
+                          <td className="cell-mono">{r.subject}</td>
+                          <td className="cell-muted cell-mono">{r.role || "-"}</td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {r.queries.toLocaleString()}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }} title={`${r.exact_hits} exact · ${r.semantic_hits} semantic · ${r.misses} misses · ${r.bypasses} bypassed`}>
+                            {r.hits.toLocaleString()}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {r.hit_rate_pct.toFixed(1)}%
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }} title={`${r.prompt_tokens.toLocaleString()} prompt + ${r.completion_tokens.toLocaleString()} completion`}>
+                            {r.tokens_spent.toLocaleString()}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {r.tokens_saved.toLocaleString()}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {money(r.cost_usd)}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {money(r.cost_saved_usd)}
+                          </td>
+                          <td className="cell-muted" style={{ fontSize: 12 }}>
+                            {r.last_query_at ? new Date(r.last_query_at).toLocaleString() : "-"}
+                          </td>
+                        </tr>
+                      ))}
+                      <tr style={{ fontWeight: 600 }}>
+                        <td>Total</td>
+                        <td></td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{totals.queries.toLocaleString()}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{totals.hits.toLocaleString()}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{pct(totals.hits, totals.queries)}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{totals.tokens_spent.toLocaleString()}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{totals.tokens_saved.toLocaleString()}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{money(totals.cost_usd)}</td>
+                        <td className="cell-mono" style={{ textAlign: "right" }}>{money(totals.cost_saved_usd)}</td>
+                        <td></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
+          </div>
+
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Try an application</h2>
           <form className="panel section-gap" onSubmit={handleAsk} style={{ marginBottom: 24 }}>
             <div className="three-col-fields">

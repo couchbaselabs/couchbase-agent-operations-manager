@@ -352,6 +352,21 @@ LDAP_SETTINGS_DOC = "settings::ldap"
 # destinations (same settings::<name> convention) - see app/siem_forwarding.py.
 SIEM_SETTINGS_DOC = "settings::siem"
 
+# Couchbase settings-collection doc id for the operations-manager's own
+# application-log forwarding (Splunk/Elastic/Datadog/Sumo Logic/Graylog/
+# syslog) - see app/log_forwarding.py and Settings -> Log Forwarding.
+# Distinct from settings::siem, which forwards *audit log entries*.
+LOG_FORWARDING_SETTINGS_DOC = "settings::log_forwarding"
+
+# Couchbase settings-collection doc id for Settings -> Monitoring: the
+# /metrics scrape token, Prometheus/Grafana wiring and the Datadog/
+# Dynatrace/New Relic push exporters - see app/monitoring.py.
+MONITORING_SETTINGS_DOC = "settings::monitoring"
+
+# Couchbase settings-collection doc id for admin-managed RBAC roles - see
+# app/rbac_policy.py (apply_stored_roles) and the Roles & RBAC page.
+ROLES_SETTINGS_DOC = "settings::roles"
+
 # Couchbase settings-collection doc id for the rate limits, budgets and
 # timeouts applied to the gateway (same settings::<name> convention) - see
 # app/governance.py and Settings -> Limits & Budgets.

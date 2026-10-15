@@ -9,10 +9,15 @@ and `tools` collections are authoritative - new servers registered through
 the Servers page or `POST /v1/servers`, and roles assigned to them there,
 persist independently of this file and survive a redeploy of this image.
 
-ROLES stays code-defined because roles are the kind of thing a security
-team reviews in a PR, not something end users add through a UI. Servers
-and tool-level RBAC, by contrast, need to change without a redeploy - that
-is what the dynamic registration API and Servers page are for.
+ROLES is seeded from BUILTIN_ROLES below, and from then on is managed by
+admins through the Roles & RBAC page (POST/PUT/DELETE /v1/roles). Custom
+roles are stored in Couchbase at settings::roles (config.ROLES_SETTINGS_DOC)
+and merged *into this same dict in place* at startup (see apply_stored_roles)
+so every module that imported ROLES - rag_apps, agent_oidc, the governance
+policy, normalize_tool_policies below - sees additions without a restart.
+The built-in roles can have their description edited but cannot be
+deleted: the seeded tool policy, demo agents and sample servers reference
+them, and `admin` in particular is what deny-by-default falls back to.
 
 SEED_SERVERS is the bundled sample MCP servers used for out-of-the-box
 evaluation - jira/zendesk/snowflake (well-behaved), plus two fixtures for
@@ -32,11 +37,71 @@ so it can never be discovered or invoked through this operations manager no
 matter how well a query matches it semantically.
 """
 
-ROLES = {
+import re
+
+BUILTIN_ROLES = {
     "support_agent": "Customer Support Agent - handles tickets and related issue tracking.",
     "finance_analyst": "Finance Analyst - runs read-only analytics against the data warehouse.",
     "admin": "Platform Administrator - full access to every trusted tool, including admin actions.",
 }
+
+# The live role registry. Mutated in place only - never rebound - because
+# main.py and friends hold a reference to this exact object.
+ROLES: dict[str, str] = dict(BUILTIN_ROLES)
+
+ROLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,47}$")
+MAX_ROLE_DESCRIPTION_CHARS = 300
+
+
+def is_builtin_role(role_id: str) -> bool:
+    return role_id in BUILTIN_ROLES
+
+
+def normalize_role(role_id: str, description: str | None) -> tuple[str, str]:
+    """Validate one role as submitted through the Roles & RBAC page. Role
+    IDs become label values in Prometheus metrics and keys in every tool's
+    allowed_roles list, so the character set is deliberately narrow and the
+    ID is immutable once created (editing renames nothing - it only changes
+    the description)."""
+    rid = str(role_id or "").strip().lower()
+    if not ROLE_ID_PATTERN.match(rid):
+        raise ValueError(
+            "role id must start with a letter and contain only lowercase letters, digits and underscores (2-48 chars)"
+        )
+    desc = " ".join(str(description or "").split())[:MAX_ROLE_DESCRIPTION_CHARS]
+    if not desc:
+        raise ValueError("a role needs a one-line description of who holds it and what it is for")
+    return rid, desc
+
+
+def apply_stored_roles(stored: dict | None) -> None:
+    """Merge the settings::roles document into ROLES in place. Built-in
+    roles always exist (their descriptions may be overridden); custom roles
+    come entirely from the document; anything no longer in the document is
+    dropped. Called at startup and after every change through the API."""
+    custom = (stored or {}).get("roles") or {}
+    merged = dict(BUILTIN_ROLES)
+    for rid, desc in custom.items():
+        try:
+            rid, desc = normalize_role(rid, desc)
+        except ValueError:
+            continue
+        merged[rid] = desc
+    ROLES.clear()
+    ROLES.update(merged)
+
+
+def roles_document() -> dict:
+    """The settings::roles payload: every role, including built-ins so an
+    edited built-in description survives a restart."""
+    return {"roles": dict(ROLES)}
+
+
+def public_roles() -> list[dict]:
+    return [
+        {"id": rid, "description": desc, "builtin": is_builtin_role(rid)}
+        for rid, desc in ROLES.items()
+    ]
 
 # server_id -> metadata describing a bundled sample MCP server, seeded once
 # on first boot. Editable afterwards from the Servers page like any other

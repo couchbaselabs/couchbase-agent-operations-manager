@@ -273,3 +273,85 @@ def activity_by_app(app_ids: list[str], llm_events: list[dict], context_events: 
         s["cost_saved_usd"] = round(s["cost_saved_usd"], 6)
         s["cost_usd"] = round(s["cost_usd"], 6)
     return stats
+
+
+MAX_USERS_PER_APP = 50
+
+
+def usage_by_user(app_ids: list[str], llm_events: list[dict]) -> dict:
+    """Per-user LLM Caching token statistics for each RAG application,
+    from the same recent LLM cache events activity_by_app() reads - so the
+    per-app totals and the per-user rows always add up to each other.
+
+    A "user" is the caller subject the LLM cache event was recorded with:
+    the agent identity (`agent:<id>`), the masked API-key subject, or an
+    OIDC subject - exactly what the audit log shows. Keyed by app_id, each
+    value a list sorted by tokens spent, descending, capped at
+    MAX_USERS_PER_APP (the rest is summed into one "other" row so the
+    column totals still match the app's activity)."""
+    per_app: dict[str, dict[tuple, dict]] = {a: {} for a in app_ids}
+
+    def _app_of(namespace: str | None) -> str | None:
+        parts = (namespace or "").split(":")
+        return parts[1] if len(parts) >= 2 and parts[0] == "rag" and parts[1] in per_app else None
+
+    def _blank(subject, role):
+        return {
+            "subject": subject, "role": role,
+            "queries": 0, "hits": 0, "exact_hits": 0, "semantic_hits": 0, "misses": 0, "bypasses": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "tokens_spent": 0, "tokens_saved": 0,
+            "cost_usd": 0.0, "cost_saved_usd": 0.0, "latency_saved_ms": 0, "last_query_at": None,
+        }
+
+    for e in llm_events:
+        a = _app_of(e.get("namespace"))
+        if not a or e.get("outcome") == "error":
+            continue
+        subject = str(e.get("subject") or "unknown")
+        role = str(e.get("role") or "")
+        row = per_app[a].setdefault((subject, role), _blank(subject, role))
+        outcome = str(e.get("outcome") or "")
+        row["queries"] += 1
+        if outcome == "hit_exact":
+            row["hits"] += 1
+            row["exact_hits"] += 1
+        elif outcome == "hit_semantic":
+            row["hits"] += 1
+            row["semantic_hits"] += 1
+        elif outcome == "miss":
+            row["misses"] += 1
+        elif outcome == "bypass":
+            row["bypasses"] += 1
+        if outcome.startswith("hit"):
+            row["tokens_saved"] += int(e.get("tokens_saved") or 0)
+            row["cost_saved_usd"] += float(e.get("cost_saved_usd") or 0.0)
+            row["latency_saved_ms"] += int(e.get("latency_saved_ms") or 0)
+        else:
+            row["prompt_tokens"] += int(e.get("prompt_tokens") or 0)
+            row["completion_tokens"] += int(e.get("completion_tokens") or 0)
+            row["tokens_spent"] += int(e.get("total_tokens") or 0)
+            row["cost_usd"] += float(e.get("cost_usd") or 0.0)
+        ts = e.get("timestamp")
+        if ts and (not row["last_query_at"] or ts > row["last_query_at"]):
+            row["last_query_at"] = ts
+
+    out: dict[str, list[dict]] = {}
+    for a, rows in per_app.items():
+        ordered = sorted(rows.values(), key=lambda r: (r["tokens_spent"] + r["tokens_saved"], r["queries"]), reverse=True)
+        kept, rest = ordered[:MAX_USERS_PER_APP], ordered[MAX_USERS_PER_APP:]
+        if rest:
+            other = _blank(f"other ({len(rest)} more)", "")
+            for r in rest:
+                for k, v in r.items():
+                    if isinstance(v, (int, float)) and k not in ("subject", "role"):
+                        other[k] += v
+                if r["last_query_at"] and (not other["last_query_at"] or r["last_query_at"] > other["last_query_at"]):
+                    other["last_query_at"] = r["last_query_at"]
+            kept.append(other)
+        for r in kept:
+            cacheable = r["hits"] + r["misses"]
+            r["hit_rate_pct"] = round(r["hits"] / cacheable * 100, 1) if cacheable else 0.0
+            r["cost_usd"] = round(r["cost_usd"], 6)
+            r["cost_saved_usd"] = round(r["cost_saved_usd"], 6)
+        out[a] = kept
+    return out

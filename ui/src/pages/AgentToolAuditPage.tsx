@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { DiscoveredTool, HijackScanResult } from "../api/types";
+import type { DiscoveredTool, HijackScanResult, Role } from "../api/types";
 import { SeverityBadge } from "../components/badges/Badges";
+import { ExperimentsPanel } from "../components/audit/ExperimentsPanel";
+import { useAuth } from "../auth/AuthContext";
 
 const API_KEY_STORAGE_KEY = "agent-tool-audit-api-key";
 
@@ -14,6 +16,15 @@ function loadStoredApiKey(): string {
 }
 
 export function AgentToolAuditPage() {
+  const { user } = useAuth();
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [lastDiscover, setLastDiscover] = useState<{ role: string; query: string; topK: number; tools: DiscoveredTool[] } | null>(null);
+  const [lastInvoke, setLastInvoke] = useState<{
+    role: string | null;
+    toolId: string;
+    args: Record<string, unknown>;
+    decision: "ALLOW" | "DENY";
+  } | null>(null);
   const [apiKey, setApiKey] = useState(loadStoredApiKey());
   const [query, setQuery] = useState("look up a customer support ticket");
   const [topK, setTopK] = useState(5);
@@ -29,6 +40,10 @@ export function AgentToolAuditPage() {
   const [invokeResult, setInvokeResult] = useState<unknown>(null);
   const [invokeLatency, setInvokeLatency] = useState<number | null>(null);
   const [invokeHijackWarning, setInvokeHijackWarning] = useState<HijackScanResult | null>(null);
+
+  useEffect(() => {
+    api.roles().then((r) => setRoles(r.roles)).catch(() => undefined);
+  }, []);
 
   function persistApiKey(v: string) {
     setApiKey(v);
@@ -47,6 +62,7 @@ export function AgentToolAuditPage() {
     try {
       const res = await api.discover(apiKey, query, topK);
       setDiscoverResult(res);
+      setLastDiscover({ role: res.role, query, topK, tools: res.tools });
     } catch (err) {
       const e2 = err as ApiError;
       setDiscoverError(e2.message || "Discovery failed");
@@ -75,9 +91,16 @@ export function AgentToolAuditPage() {
       setInvokeResult(res.result);
       setInvokeLatency(res.latency_ms);
       setInvokeHijackWarning(res.hijack_warning);
+      setLastInvoke({ role: res.role, toolId, args: parsedArgs, decision: "ALLOW" });
     } catch (err) {
       const e2 = err as ApiError;
       setInvokeError(`${e2.status ? `[${e2.status}] ` : ""}${e2.message || "Invoke failed"}`);
+      // A 403 is the gateway's DENY decision - worth locking in as a
+      // regression case just as much as an ALLOW. The role comes from the
+      // last discover with this key (a denied invoke does not echo it).
+      if (e2.status === 403) {
+        setLastInvoke({ role: discoverResult?.role || lastDiscover?.role || null, toolId, args: parsedArgs, decision: "DENY" });
+      }
     } finally {
       setInvokeLoading(false);
     }
@@ -224,6 +247,8 @@ export function AgentToolAuditPage() {
           )}
         </div>
       </div>
+
+      {user?.role === "admin" && <ExperimentsPanel roles={roles} lastDiscover={lastDiscover} lastInvoke={lastInvoke} />}
     </div>
   );
 }

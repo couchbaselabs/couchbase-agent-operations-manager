@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { DownstreamAuthMode, Role, ServerDoc } from "../api/types";
+import type { ConnectionTestResult, DownstreamAuthMode, Role, ServerDoc, ServerPlatform } from "../api/types";
 import { TrustBadge } from "../components/badges/Badges";
 
 const EMPTY_FORM = {
@@ -8,11 +8,15 @@ const EMPTY_FORM = {
   label: "",
   owner: "",
   mcp_url: "",
+  platform: "generic",
   trust_status: "trusted" as "trusted" | "untrusted",
   default_allowed_roles: [] as string[],
   auth_mode: "none" as DownstreamAuthMode,
   auth_header_name: "X-Api-Key",
   auth_username: "",
+  auth_token_url: "",
+  auth_scope: "",
+  auth_audience: "",
   auth_secret: "",
 };
 
@@ -21,28 +25,150 @@ const AUTH_MODE_LABELS: Record<DownstreamAuthMode, string> = {
   bearer: "bearer token (Authorization: Bearer ...)",
   header: "API key in a named header",
   basic: "HTTP basic (username + password)",
+  oauth: "OAuth 2.0 client credentials (token endpoint + client ID/secret)",
 };
+
+const STEP_LABELS: Record<string, string> = {
+  url: "URL",
+  dns: "DNS",
+  connect: "TCP / TLS",
+  credential: "Credential",
+  http: "HTTP",
+  mcp: "MCP handshake",
+};
+
+/** The stage-by-stage result of a Test Connection, shared by the
+ *  registration form and the per-server button in the table. */
+function ConnectionTestPanel({ result, onClose }: { result: ConnectionTestResult; onClose?: () => void }) {
+  return (
+    <div
+      className="helper-banner section-gap"
+      style={
+        result.ok
+          ? undefined
+          : { borderColor: "var(--red-border)", background: "var(--red-bg)", color: "var(--red-dim)" }
+      }
+    >
+      <div className="flex-between" style={{ alignItems: "flex-start" }}>
+        <div>
+          <div className="helper-banner-heading">
+            {result.ok ? "Connection OK" : "Connection failed"} · {result.latency_ms} ms
+          </div>
+          <div>{result.summary}</div>
+          {result.suggestion && (
+            <div style={{ marginTop: 6 }}>
+              <strong>What to do:</strong> {result.suggestion}
+            </div>
+          )}
+        </div>
+        {onClose && (
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onClose}>
+            Dismiss
+          </button>
+        )}
+      </div>
+      <div style={{ marginTop: 10, display: "grid", gap: 4 }}>
+        {result.steps.map((st) => (
+          <div key={st.step} className="flex-row" style={{ gap: 8, fontSize: 12.5, alignItems: "baseline" }}>
+            <span className={`badge ${st.ok ? "badge-success" : "badge-high"}`} style={{ minWidth: 92, textAlign: "center" }}>
+              {st.ok ? "✓" : "✗"} {STEP_LABELS[st.step] || st.step}
+            </span>
+            <span className="cell-mono" style={{ wordBreak: "break-all" }}>
+              {st.detail}
+            </span>
+            {st.warning && <span className="badge badge-medium">{st.warning}</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function ServersPage() {
   const [servers, setServers] = useState<ServerDoc[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
+  const [platforms, setPlatforms] = useState<ServerPlatform[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [submitResult, setSubmitResult] = useState<string | null>(null);
+  const [formTest, setFormTest] = useState<ConnectionTestResult | null>(null);
+  const [formTesting, setFormTesting] = useState(false);
+  const [rowTests, setRowTests] = useState<Record<string, ConnectionTestResult>>({});
+  const [testingId, setTestingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [s, r] = await Promise.all([api.servers(), api.roles()]);
+      const [s, r, p] = await Promise.all([api.servers(), api.roles(), api.serverPlatforms()]);
       setServers(s.servers);
       setRoles(r.roles);
+      setPlatforms(p.platforms);
     } catch (e: any) {
       setError(e.message || "Failed to load servers");
     }
   }, []);
+
+  const platform = platforms.find((p) => p.id === form.platform);
+
+  function choosePlatform(id: string) {
+    const p = platforms.find((x) => x.id === id);
+    setForm((f) => ({
+      ...f,
+      platform: id,
+      // A preset only fills in blanks and switches the auth mode when the
+      // form is still at its default - never overwrite what was typed.
+      auth_mode: f.auth_mode === "none" && p ? p.auth_mode : f.auth_mode,
+      auth_token_url: f.auth_token_url || "",
+      auth_scope: f.auth_scope || p?.scope_hint || "",
+    }));
+    setFormTest(null);
+  }
+
+  function authPayload() {
+    return {
+      mode: form.auth_mode,
+      header_name: form.auth_header_name,
+      username: form.auth_username,
+      token_url: form.auth_token_url,
+      scope: form.auth_scope,
+      audience: form.auth_audience,
+    };
+  }
+
+  async function handleTestForm() {
+    setFormTesting(true);
+    setFormTest(null);
+    setError(null);
+    try {
+      const res = await api.testServerConnection({
+        mcp_url: form.mcp_url,
+        platform: form.platform,
+        auth: authPayload(),
+        auth_secret: form.auth_secret || undefined,
+      });
+      setFormTest(res);
+    } catch (e: any) {
+      setError(e.message || "Test connection failed");
+    } finally {
+      setFormTesting(false);
+    }
+  }
+
+  async function handleTestRow(serverId: string) {
+    setTestingId(serverId);
+    setError(null);
+    try {
+      const res = await api.testServerConnection({ server_id: serverId });
+      setRowTests((t) => ({ ...t, [serverId]: res }));
+    } catch (e: any) {
+      setError(`Test failed for '${serverId}': ${e.message}`);
+    } finally {
+      setTestingId(null);
+    }
+  }
 
   useEffect(() => {
     load();
@@ -86,13 +212,10 @@ export function ServersPage() {
         label: form.label,
         owner: form.owner,
         mcp_url: form.mcp_url,
+        platform: form.platform,
         trust_status: form.trust_status,
         default_allowed_roles: form.default_allowed_roles,
-        auth: {
-          mode: form.auth_mode,
-          header_name: form.auth_header_name,
-          username: form.auth_username,
-        },
+        auth: authPayload(),
         auth_secret: form.auth_secret || undefined,
       });
       if (res.ingest_error) {
@@ -105,6 +228,7 @@ export function ServersPage() {
         );
       }
       setForm(EMPTY_FORM);
+      setFormTest(null);
       await load();
     } catch (e: any) {
       setError(e.message || "Failed to register server");
@@ -187,14 +311,34 @@ export function ServersPage() {
             </div>
           </div>
           <div className="field">
+            <label>Platform</label>
+            <select value={form.platform} onChange={(e) => choosePlatform(e.target.value)}>
+              {platforms.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+            {platform && platform.id !== "generic" && (
+              <div className="field-hint">
+                {platform.notes} Endpoint hosts are checked against {platform.hosts.join(", ")}.
+              </div>
+            )}
+          </div>
+          <div className="field">
             <label>MCP URL (Streamable HTTP endpoint)</label>
             <input
               type="url"
               required
-              placeholder="http://host:port/path/mcp"
+              placeholder={platform?.url_hint || "http://host:port/path/mcp"}
               value={form.mcp_url}
               onChange={(e) => setForm((f) => ({ ...f, mcp_url: e.target.value }))}
             />
+            {platform && platform.id !== "generic" && (
+              <div className="field-hint cell-mono" style={{ fontSize: 11.5 }}>
+                {platform.url_hint}
+              </div>
+            )}
           </div>
           <div className="field">
             <label>Default allowed roles</label>
@@ -236,6 +380,51 @@ export function ServersPage() {
             </div>
           </div>
 
+          {form.auth_mode === "oauth" && (
+            <div className="two-col">
+              <div className="field">
+                <label>Token endpoint URL</label>
+                <input
+                  type="url"
+                  placeholder={platform?.token_url_hint || "https://issuer/oauth/token"}
+                  value={form.auth_token_url}
+                  onChange={(e) => setForm((f) => ({ ...f, auth_token_url: e.target.value }))}
+                />
+                <div className="field-hint">
+                  Client-credentials grant (RFC 6749 §4.4). The access token is cached until it expires and refreshed
+                  on its own.
+                </div>
+              </div>
+              <div className="field">
+                <label>Client ID</label>
+                <input
+                  type="text"
+                  value={form.auth_username}
+                  onChange={(e) => setForm((f) => ({ ...f, auth_username: e.target.value }))}
+                />
+              </div>
+              <div className="field">
+                <label>Scope</label>
+                <input
+                  type="text"
+                  placeholder={platform?.scope_hint || "optional"}
+                  value={form.auth_scope}
+                  onChange={(e) => setForm((f) => ({ ...f, auth_scope: e.target.value }))}
+                />
+              </div>
+              <div className="field">
+                <label>Audience / resource</label>
+                <input
+                  type="text"
+                  placeholder="optional"
+                  value={form.auth_audience}
+                  onChange={(e) => setForm((f) => ({ ...f, auth_audience: e.target.value }))}
+                />
+                <div className="field-hint">Sent as both <code>audience</code> and <code>resource</code> when set.</div>
+              </div>
+            </div>
+          )}
+
           {form.auth_mode !== "none" && (
             <div className="two-col">
               {form.auth_mode === "header" && (
@@ -260,7 +449,9 @@ export function ServersPage() {
                 </div>
               )}
               <div className="field">
-                <label>{form.auth_mode === "basic" ? "Password" : "Credential"}</label>
+                <label>
+                  {form.auth_mode === "basic" ? "Password" : form.auth_mode === "oauth" ? "Client secret" : "Credential"}
+                </label>
                 <input
                   type="password"
                   autoComplete="new-password"
@@ -275,9 +466,21 @@ export function ServersPage() {
             </div>
           )}
 
-          <button className="btn btn-primary" type="submit" disabled={submitting}>
-            {submitting ? "Registering..." : "Register & ingest"}
-          </button>
+          <div className="flex-row" style={{ gap: 8 }}>
+            <button
+              className="btn btn-secondary"
+              type="button"
+              disabled={formTesting || !form.mcp_url}
+              onClick={handleTestForm}
+              title="Checks DNS, TCP/TLS, the credential, HTTP and the MCP handshake before you register"
+            >
+              {formTesting ? "Testing..." : "Test connection"}
+            </button>
+            <button className="btn btn-primary" type="submit" disabled={submitting}>
+              {submitting ? "Registering..." : "Register & ingest"}
+            </button>
+          </div>
+          {formTest && <ConnectionTestPanel result={formTest} onClose={() => setFormTest(null)} />}
           {submitResult && <div className="loading-note">{submitResult}</div>}
         </form>
       )}
@@ -298,13 +501,21 @@ export function ServersPage() {
             </thead>
             <tbody>
               {servers?.map((s) => (
-                <tr key={s.server_id}>
+                <React.Fragment key={s.server_id}>
+                <tr>
                   <td>
                     <div style={{ fontWeight: 600 }}>{s.label}</div>
                     <div className="cell-muted cell-mono">{s.server_id}</div>
                   </td>
                   <td className="cell-muted">{s.owner}</td>
-                  <td className="cell-mono cell-muted">{s.mcp_url}</td>
+                  <td className="cell-mono cell-muted">
+                    {s.mcp_url}
+                    {s.platform && s.platform !== "generic" && (
+                      <div>
+                        <span className="badge badge-neutral">{s.platform}</span>
+                      </div>
+                    )}
+                  </td>
                   <td>
                     <TrustBadge trust={s.trust_status} />
                   </td>
@@ -327,6 +538,14 @@ export function ServersPage() {
                     <div className="flex-row">
                       <button
                         className="btn btn-secondary btn-sm"
+                        disabled={testingId === s.server_id}
+                        onClick={() => handleTestRow(s.server_id)}
+                        title="Probe the endpoint with the stored credential and explain any failure"
+                      >
+                        {testingId === s.server_id ? "Testing..." : "Test"}
+                      </button>
+                      <button
+                        className="btn btn-secondary btn-sm"
                         disabled={busyId === s.server_id || s.trust_status !== "trusted"}
                         onClick={() => handleReingest(s.server_id)}
                       >
@@ -342,6 +561,23 @@ export function ServersPage() {
                     </div>
                   </td>
                 </tr>
+                {rowTests[s.server_id] && (
+                  <tr>
+                    <td colSpan={7} style={{ paddingTop: 0 }}>
+                      <ConnectionTestPanel
+                        result={rowTests[s.server_id]}
+                        onClose={() =>
+                          setRowTests((t) => {
+                            const next = { ...t };
+                            delete next[s.server_id];
+                            return next;
+                          })
+                        }
+                      />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>

@@ -123,6 +123,12 @@ if ENABLED:
 
     SIEM_FORWARDS = Counter("aom_siem_forward_total", "Audit entries forwarded to SIEM destinations", ["vendor", "status"])
 
+    LOG_FORWARDS = Counter(
+        "aom_log_forwarding_destination_records_total",
+        "Application log records delivered to (or failed at) each log-forwarding destination",
+        ["destination", "result"],
+    )
+
     COUCHBASE_CONNECTED = Gauge("aom_couchbase_connected", "1 while the Couchbase SDK connection is established")
 
 
@@ -191,6 +197,11 @@ def record_span(span: dict) -> None:
 def record_siem_forward(vendor: str, ok: bool) -> None:
     if ENABLED:
         SIEM_FORWARDS.labels(_label(vendor), "ok" if ok else "error").inc()
+
+
+def record_log_forward(destination: str, result: str, n: int = 1) -> None:
+    if ENABLED:
+        LOG_FORWARDS.labels(_label(destination), _label(result)).inc(max(0, int(n)))
 
 
 def in_flight() -> Callable[[], None]:
