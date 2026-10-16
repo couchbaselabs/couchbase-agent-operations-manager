@@ -89,7 +89,7 @@ VENDORS: list[dict] = [
                "The part before .snowflakecomputing.com (org-account or account locator with region)."),
             _f("user", "User", "text", "", True, "AOM_SVC", "The user the key pair or token belongs to."),
             _f("auth_method", "Authentication", "select", "keypair", True, "", None, ["keypair", "token"]),
-            _f("private_key", "Private key (PEM)", "secret", "", False, "",
+            _f("private_key", "Private key (PEM)", "secret_text", "", False, "",
                "Key-pair auth: the RSA private key registered on the user (ALTER USER ... SET RSA_PUBLIC_KEY). PKCS#8 PEM; "
                "encrypted keys need the passphrase below."),
             _f("private_key_passphrase", "Private key passphrase", "secret", "", False, "", "Only for an encrypted private key."),
@@ -123,7 +123,7 @@ VENDORS: list[dict] = [
         "description": "Runs the query as a BigQuery job and streams the result pages.",
         "fields": [
             _f("project_id", "Project ID", "text", "", True, "my-gcp-project", "Billing project for the query job."),
-            _f("service_account_json", "Service-account JSON key", "secret", "", True, "",
+            _f("service_account_json", "Service-account JSON key", "secret_text", "", True, "",
                "Needs roles/bigquery.jobUser on the project and read access to the queried datasets."),
             _f("location", "Location", "text", "", False, "US", "Optional; the datasets' location (US, EU, us-central1...)."),
         ],
@@ -133,8 +133,11 @@ VENDOR_BY_ID = {v["id"]: v for v in VENDORS}
 MODES = ("replace", "snapshot")
 
 
+SECRET_INPUTS = ("secret", "secret_text")
+
+
 def _secret_names(vendor_id: str) -> set[str]:
-    return {f["name"] for f in VENDOR_BY_ID[vendor_id]["fields"] if f["input"] == "secret"}
+    return {f["name"] for f in VENDOR_BY_ID[vendor_id]["fields"] if f["input"] in SECRET_INPUTS}
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +164,7 @@ def normalize_connection(vendor: str, incoming: dict | None, previous: dict | No
     for f in VENDOR_BY_ID[vendor]["fields"]:
         name = f["name"]
         val = incoming.get(name)
-        if f["input"] == "secret":
+        if f["input"] in SECRET_INPUTS:
             enc = f"{name}_encrypted"
             if val is None or val == "" or val == MASK:
                 if previous.get(enc):
@@ -180,7 +183,7 @@ def normalize_connection(vendor: str, incoming: dict | None, previous: dict | No
 def public_connection(vendor: str, stored: dict) -> dict:
     out = {}
     for f in VENDOR_BY_ID[vendor]["fields"]:
-        if f["input"] == "secret":
+        if f["input"] in SECRET_INPUTS:
             out[f["name"]] = MASK if stored.get(f"{f['name']}_encrypted") else ""
         else:
             out[f["name"]] = stored.get(f["name"], f["default"])

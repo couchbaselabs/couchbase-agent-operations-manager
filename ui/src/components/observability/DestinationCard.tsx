@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import { SECRET_MASK, type DeliveryTestResult, type DestinationConfig, type Vendor, type VendorField } from "../../api/types";
 
 /** Relative time, e.g. "12 s ago" - for delivery pills and status tables. */
@@ -87,8 +87,34 @@ export function VendorForm({
             </div>
           );
         }
-        const secretStored = f.input === "secret" && get(f) === SECRET_MASK;
+        const secretStored = (f.input === "secret" || f.input === "secret_text") && get(f) === SECRET_MASK;
         const hint = secretStored ? "Stored. Leave the asterisks to keep it." : f.hint;
+        if (f.input === "secret_text") {
+          // Multi-line secret (PEM private key, service-account JSON): a
+          // single-line password box would strip the newlines. Masked with
+          // CSS; the value never leaves the form unencrypted anyway.
+          return (
+            <div className="field" key={f.name}>
+              <label>{label}</label>
+              <textarea
+                rows={secretStored ? 1 : 5}
+                className="cell-mono"
+                value={get(f)}
+                placeholder={f.placeholder || (f.name.endsWith("_json") ? "{ ... }" : "-----BEGIN PRIVATE KEY-----")}
+                disabled={disabled}
+                autoComplete="off"
+                spellCheck={false}
+                style={{ WebkitTextSecurity: "disc", fontSize: 12 } as React.CSSProperties}
+                onFocus={(e) => {
+                  if (get(f) === SECRET_MASK) set(f, "");
+                  e.currentTarget.rows = 5;
+                }}
+                onChange={(e) => set(f, e.target.value)}
+              />
+              {hint && <div className="field-hint">{hint}</div>}
+            </div>
+          );
+        }
         return (
           <div className="field" key={f.name}>
             <label>{label}</label>

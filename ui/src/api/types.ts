@@ -1381,7 +1381,8 @@ export const SECRET_MASK = "********";
 export interface VendorField {
   name: string;
   label: string;
-  input: "text" | "secret" | "number" | "select" | "bool";
+  /** secret_text: a multi-line secret (a PEM key, a JSON key file) - masked textarea. */
+  input: "text" | "secret" | "secret_text" | "number" | "select" | "bool";
   default: string;
   required: boolean;
   placeholder: string;
