@@ -18,6 +18,9 @@ REST API that should be replaced.
 - A new agent project needs to call external tools, cache LLM
   completions, remember things about a user, or retrieve from a governed
   knowledge base, with an AOM appliance as the backend.
+- A data pipeline, ETL job or CI step should load documents or warehouse
+  exports (Snowflake, Databricks, BigQuery) into the appliance's Knowledge
+  Base, or keep a table there fresh on a schedule - that is Step 10.
 
 ## Step 1 - get the SDK
 
@@ -203,12 +206,67 @@ the approval envelope as one. Either check for it, or use
 explicit check in anything event-driven; `invoke_with_approval()` blocks
 for as long as a person takes.
 
+## Step 10 - load the knowledge base from a pipeline (operator side)
+
+Steps 1-9 are the agent side, authenticated with an agent key. Putting
+documents *in* is an operator decision - who may read a document is fixed
+at upload time - so it sits behind the dashboard login, and agent keys
+cannot do it. When the codebase is a data pipeline, an ETL job or a CI
+step that should feed the appliance (typically a Snowflake, Databricks or
+BigQuery export), use `AOMAdminClient` from the same package:
+
+```python
+from aom_sdk import AOMAdminClient
+
+admin = AOMAdminClient(os.environ["AOM_DASHBOARD_URL"],      # the dashboard origin, e.g. https://host:3111
+                       username=os.environ["AOM_USERNAME"],
+                       password=os.environ["AOM_PASSWORD"])
+
+# stream a local export (up to 5 GB by default; nothing buffered in memory)
+job = admin.upload_knowledge("orders_0_0_0.csv.gz", allowed_roles=["finance_analyst"],
+                             dump={"source": "snowflake", "table_name": "SALES.PUBLIC.ORDERS"})
+admin.wait_for_job(job["job_id"])
+
+# or let the appliance pull from s3:// gs:// az:// https:// (credential used once, never stored)
+job = admin.import_knowledge("gs://exports/orders.parquet", allowed_roles=["finance_analyst"],
+                             auth={"service_account_json": sa_json}, dump={"source": "bigquery"})
+```
+
+Rules of thumb:
+
+- Point it at the **dashboard** origin (port 3111 on the bundled stack),
+  not the API port: that is where the session cookie is set and where
+  nginx allows unbuffered multi-gigabyte uploads. The inline
+  `POST /v1/knowledge` JSON path caps at 20 MB - never base64 a large
+  file through it.
+- Pass `dump=` for table exports (CSV/TSV, JSON/NDJSON, Parquet, Avro,
+  plain or gzip/zip) so rows are chunked with the schema attached; omit
+  it for documents (text, Markdown, PDF).
+- Every call returns an *ingestion job*; `wait_for_job()` polls it and
+  raises `AOMError` with the job's own error text if it fails. Do not
+  treat the 202 as success.
+- If the pipeline exists only to export a table on a schedule, replace it
+  with a **warehouse sync** (`admin.create_warehouse_sync({...})` with a
+  `cron` or `interval` schedule, `mode: "replace"` or `"snapshot"`): the
+  appliance then runs the query itself. Call
+  `admin.test_warehouse_sync(vendor, connection, query)` first - it
+  authenticates and previews 10 rows before anything is saved.
+- `AOM_PASSWORD` is a dashboard credential: read it from the environment
+  or a secret store, never commit it, and prefer a dedicated local
+  account for pipelines.
+- `admin.roles()` / `create_role()` exist for pipelines that provision
+  roles alongside documents. Roles are admin-managed now (Roles & RBAC
+  page), so do not hardcode the built-in list in the codebase - read it.
+
+For a one-off load from a shell, the appliance repo ships
+`scripts/kb-upload.py`, which does the same thing without writing code.
+
 ## Error handling
 
 Use the SDK's typed exceptions rather than checking HTTP status codes:
 `AOMConnectionError`, `AOMAuthenticationError`, `AOMAuthorizationError`,
 `AOMNotFoundError`, `AOMServerError`, and `AOMError` as the base class.
-Match the codebase's existing error-handling style when wrapping these.
+`AOMAdminClient` raises the same family. Match the codebase's existing error-handling style when wrapping these.
 
 ## After integrating
 

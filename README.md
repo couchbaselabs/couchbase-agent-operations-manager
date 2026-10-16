@@ -818,6 +818,27 @@ Non-2xx responses raise typed exceptions (`AOMAuthenticationError`,
 rest, including a worked example of the LLM-caching cost/latency savings
 described above at agent-fleet scale.
 
+The same package carries the **operator** side as `AOMAdminClient`, which
+signs in with a dashboard account (local or LDAP) rather than an agent key
+and wraps the Knowledge Base loading surface - streaming uploads of
+multi-gigabyte warehouse exports, cloud imports, the ingestion jobs they
+produce, scheduled Snowflake / Databricks / BigQuery warehouse syncs - plus
+roles and the MCP server connection test. Point it at the dashboard origin
+(`:3111` on the bundled stack), which is where the session cookie lives and
+where nginx is configured for unbuffered uploads:
+
+```python
+from aom_sdk import AOMAdminClient
+
+admin = AOMAdminClient("https://localhost:3111", username="admin", password=os.environ["AOM_PASSWORD"], verify=False)
+job = admin.upload_knowledge("orders_0_0_0.csv.gz", allowed_roles=["finance_analyst"],
+                             dump={"source": "snowflake", "table_name": "SALES.PUBLIC.ORDERS"})
+admin.wait_for_job(job["job_id"])
+```
+
+See `examples/knowledge_loading.py` and [Loading large data into the
+Knowledge Base](#loading-large-data-into-the-knowledge-base) below.
+
 ### Agent memory
 
 Durable, cross-session recall stored in the same Couchbase cluster as
@@ -852,6 +873,14 @@ plain instructions text with a README on where to paste it (Custom GPT
 instructions, an Assistants/Responses system message, an `AGENTS.md` file,
 a `GEMINI.md` context file, or a Gem's instructions). All three download
 from **Tools -> Developer SDK**, or `GET /v1/skills/{claude,chatgpt,gemini}/download`.
+Each walks an assistant through the agent-side integration (Steps 1-9) and,
+for data pipelines, loading the Knowledge Base with `AOMAdminClient`
+(Step 10).
+
+The REST API itself is documented at `/docs` (OpenAPI, generated from the
+running code and grouped by area: Agent gateway, Knowledge Base, Warehouse
+syncs, Roles & RBAC, MCP servers, Monitoring, Log forwarding & SIEM, and
+so on), reachable through the dashboard's **Tools -> API Documentation**.
 
 ## Registering your own MCP servers
 
@@ -923,7 +952,8 @@ it parses and embeds inside the request. Everything else goes through the
   base64, no JSON envelope). The operations manager writes it to its spool
   directory as it arrives, never holding more than 1 MB in memory, and
   answers `202` with a job. The page uses this for every file; from a
-  shell, `scripts/kb-upload.py` or plain `curl --data-binary @file`.
+  shell, `scripts/kb-upload.py` or plain `curl --data-binary @file`; from
+  Python, `AOMAdminClient.upload_knowledge()` in the Developer SDK.
 - **`POST /v1/knowledge/imports`** - the same, from an object URI:
   `s3://` (boto3; a key pair in the request, or the pod's IAM role / IRSA),
   `gs://` (service-account JSON, or Application Default Credentials),

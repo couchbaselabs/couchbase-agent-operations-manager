@@ -265,6 +265,78 @@ for chunk in client.search_knowledge("what is our refund window?"):
 This replaces a separate RAG stack for knowledge that should be governed
 the same way everything else the agent touches is.
 
+Roles are no longer a fixed list: an admin can add custom roles under
+Roles & RBAC, and `client.roles()` returns the current set (built-in ones
+carry `"builtin": true`). Retrieval and discovery honor whatever roles a
+document or tool was granted, so a role created yesterday works today
+with no SDK change.
+
+## Loading the knowledge base (operators)
+
+Everything above is the *agent* side, authenticated with an agent key.
+Putting documents in is an operator decision - who may read a document is
+decided at upload time - so it sits behind the dashboard login instead.
+`AOMAdminClient` signs in with a dashboard account (local or LDAP) and
+wraps that surface:
+
+```python
+from aom_sdk import AOMAdminClient
+
+admin = AOMAdminClient("https://localhost:3111", username="admin",
+                       password=os.environ["AOM_PASSWORD"], verify=False)
+
+# Stream a warehouse export (up to 5 GB by default; nothing is buffered in memory)
+job = admin.upload_knowledge("orders_0_0_0.csv.gz", allowed_roles=["finance_analyst"],
+                             dump={"source": "snowflake", "table_name": "SALES.PUBLIC.ORDERS"})
+job = admin.wait_for_job(job["job_id"])        # polls; raises AOMError if the job fails
+print(job["document_id"], job["progress"]["chunks_written"])
+
+# Or have the appliance pull it straight from the bucket (credential used once, never stored)
+job = admin.import_knowledge("gs://exports/orders/orders-000000000000.parquet",
+                             allowed_roles=["finance_analyst"],
+                             auth={"service_account_json": open("sa.json").read()},
+                             dump={"source": "bigquery", "table_name": "shop.orders"})
+
+# Or stop exporting: a scheduled query the appliance runs itself
+sync = admin.create_warehouse_sync({
+    "name": "Orders (daily)", "vendor": "snowflake",
+    "connection": {"account": "xy12345.us-east-1", "user": "AOM_SVC", "auth_method": "keypair",
+                   "private_key": open("rsa_key.p8").read(), "warehouse": "COMPUTE_WH"},
+    "query": "SELECT * FROM SALES.PUBLIC.ORDERS WHERE ORDER_DATE >= DATEADD(day, -90, CURRENT_DATE)",
+    "allowed_roles": ["finance_analyst"],
+    "schedule": {"kind": "cron", "cron": "0 2 * * *"}, "mode": "replace",
+})
+admin.run_warehouse_sync(sync["sync_id"])      # first run now; then every night at 02:00
+```
+
+Use the dashboard origin (port 3111 on the bundled stack, not the 8090
+API port): that is where the session cookie is set and where nginx is
+configured for unbuffered multi-gigabyte uploads. Uploads, imports and
+sync runs all return an *ingestion job* (`uploading -> queued ->
+downloading -> running -> done | failed | cancelled`) with row and chunk
+counters; `knowledge_jobs()`, `knowledge_job()`, `cancel_job()` and
+`retry_job()` manage them. Supported export formats are CSV/TSV, JSON and
+NDJSON, Parquet and Avro, plain or gzip/zip-compressed; `dump` names the
+source and table so each chunk carries the schema and is retrievable by
+column name. Without `dump`, the file is ingested as a document (text,
+Markdown, PDF).
+
+Warehouse syncs run a user-defined query against Snowflake (key-pair JWT
+or token), Databricks (OAuth M2M or PAT) or BigQuery (service account) on
+an interval or cron schedule. `mode: "replace"` keeps one current document
+per sync; `mode: "snapshot"` keeps dated copies with
+`snapshot_ttl_seconds`. `test_warehouse_sync(vendor, connection, query)`
+authenticates and previews 10 rows before anything is saved;
+`warehouse_syncs()["vendors"]` lists each vendor's connection fields.
+
+The same client manages roles (`roles()`, `create_role()`,
+`update_role()`, `delete_role(force=...)`) and probes an MCP server's
+connectivity stage by stage (`test_server_connection(...)` reports DNS,
+TCP/TLS, credential, HTTP and MCP handshake results with a plain-language
+suggestion). For a one-off shell load there is also
+`scripts/kb-upload.py` in the appliance repo, which does the same thing
+as `upload_knowledge()`/`import_knowledge()` from the command line.
+
 ## Error handling
 
 Every non-2xx response raises a typed exception from `aom_sdk`:
@@ -336,6 +408,7 @@ servers, so each one works on a fresh install with no real credentials:
 | `llm_caching.py` | What the response cache saves at agent-fleet scale. |
 | `context_caching.py` | Caching an agent's own data-source lookups with `context_get`/`context_set`/`cached_context`. |
 | `mcp_tools.py` | Using AOM's catalog as MCP tool definitions, or as an MCP server. |
+| `knowledge_loading.py` | Operator side: stream a 5 GB export, queue a cloud import, create a warehouse sync (`AOMAdminClient`). |
 
 ```bash
 AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \
@@ -347,8 +420,11 @@ AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \
 This SDK wraps a deliberate subset of the appliance's REST API. The
 gateway's own OpenAPI docs (`/docs` on the operations-manager origin) and
 the appliance's repo README are the source of truth for every endpoint,
-including the admin surface (server registration, roles, audit log, cache
-administration) that most agent code never needs.
+including the rest of the admin surface (server registration, audit log,
+cache administration, log forwarding, monitoring) that neither
+`AOMClient` nor `AOMAdminClient` wraps. The OpenAPI page groups routes by
+area (Agent gateway, Knowledge Base, Warehouse syncs, Roles, Servers,
+Settings...) so the admin calls are easy to find.
 
 ## License
 

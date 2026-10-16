@@ -107,6 +107,28 @@ result = client.invoke_mcp_tool(mcp_tools[0]["name"], arguments={})
 # to (pip install "couchbase-aom-sdk[mcp]"):
 #   AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=... AOM_VERIFY_SSL=false python -m aom_sdk.mcp_server`;
 
+const ADMIN_CODE = `# Operator side: a dashboard login, not an agent key - adding documents
+# decides who may read them, so agent keys deliberately cannot.
+from aom_sdk import AOMAdminClient
+
+admin = AOMAdminClient("https://localhost:3111", username="admin",
+                       password=os.environ["AOM_PASSWORD"], verify=False)
+
+# Stream a warehouse export (up to 5 GB by default; nothing is buffered)
+job = admin.upload_knowledge("orders_0_0_0.csv.gz", allowed_roles=["finance_analyst"],
+                             dump={"source": "snowflake", "table_name": "SALES.PUBLIC.ORDERS"})
+job = admin.wait_for_job(job["job_id"])
+
+# Or let the appliance pull it: s3:// gs:// az:// https:// (credential used once, never stored)
+job = admin.import_knowledge("gs://exports/orders.parquet", allowed_roles=["finance_analyst"],
+                             auth={"service_account_json": sa_json}, dump={"source": "bigquery"})
+
+# Or stop exporting - a warehouse sync runs your query on a schedule
+sync = admin.create_warehouse_sync({"name": "Orders (daily)", "vendor": "snowflake",
+    "connection": {...}, "query": "SELECT * FROM SALES.PUBLIC.ORDERS",
+    "allowed_roles": ["finance_analyst"], "schedule": {"kind": "cron", "cron": "0 2 * * *"},
+    "mode": "replace"})`;
+
 const SKILL_PLATFORMS: Array<{ platform: string; label: string; blurb: string }> = [
   { platform: "chatgpt", label: "ChatGPT Skill", blurb: "Custom GPT instructions, an Assistants/Responses system message, or an AGENTS.md file." },
   { platform: "gemini", label: "Gemini Skill", blurb: "A GEMINI.md context file for Gemini CLI/Code Assist, or a Gem's instructions." },
@@ -408,7 +430,21 @@ export function DeveloperSdkPage() {
       </div>
 
       <div className="card section-gap">
-        <div className="card-title">10. Handling errors</div>
+        <div className="card-title">10. Loading the Knowledge Base (operators)</div>
+        <p className="cell-muted" style={{ marginBottom: 10 }}>
+          Everything above authenticates with an agent key. Putting documents <em>in</em> is an operator decision,
+          so <code>AOMAdminClient</code> signs in with a dashboard account instead and wraps the{" "}
+          <Link to="/knowledge">Knowledge Base</Link> loading surface: streaming uploads of multi-gigabyte
+          warehouse exports, imports straight from cloud storage, scheduled Snowflake / Databricks / BigQuery
+          warehouse syncs, and the ingestion jobs each of those produces. It also manages{" "}
+          <Link to="/roles">roles</Link> and runs the MCP server connection test. Point it at this dashboard&apos;s
+          origin, not the API port - that is where the session cookie is set and where uploads are unbuffered.
+        </p>
+        <pre className="json-block">{ADMIN_CODE}</pre>
+      </div>
+
+      <div className="card section-gap">
+        <div className="card-title">11. Handling errors</div>
         <p className="cell-muted" style={{ marginBottom: 10 }}>
           Every non-2xx response raises a typed exception instead of a bare HTTP error, so calling code can branch on
           what actually went wrong:

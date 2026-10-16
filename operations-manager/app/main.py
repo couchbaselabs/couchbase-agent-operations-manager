@@ -138,10 +138,57 @@ def spawn(coro) -> "asyncio.Task":
     return task
 
 
+# OpenAPI grouping for /docs. Routes are tagged by path prefix in
+# _tag_openapi_routes() at the bottom of this module, so a new route lands
+# in the right group without remembering a `tags=` argument; the order
+# here is the order the groups appear in the docs.
+OPENAPI_TAGS = [
+    {"name": "Agent gateway", "description": "What an agent calls with its agent key (or OIDC token): role-filtered "
+     "tool discovery and invocation, cached LLM completions, context caching, memory, approvals, governed knowledge "
+     "retrieval and RAG. The bundled Python SDK (`aom_sdk.AOMClient`) wraps these."},
+    {"name": "Knowledge Base", "description": "Documents, knowledge sets and embedding models, plus the large-file "
+     "path: streaming uploads (`POST /v1/knowledge/uploads`, up to KNOWLEDGE_MAX_UPLOAD_MB), cloud imports and the "
+     "ingestion jobs they produce. Dashboard session (admin). `aom_sdk.AOMAdminClient` wraps these."},
+    {"name": "Warehouse syncs", "description": "Scheduled queries against Snowflake, Databricks or BigQuery that keep "
+     "a Knowledge Base document current (replace mode) or keep dated snapshots. Dashboard session (admin)."},
+    {"name": "Roles & RBAC", "description": "Built-in and admin-defined roles. Tools, servers, RAG apps and "
+     "documents all grant access by role id."},
+    {"name": "MCP servers", "description": "Registering downstream MCP servers (including Snowflake, Databricks and "
+     "BigQuery endpoints and OAuth client-credentials auth), the tool catalog, per-tool policy and the stage-by-stage "
+     "connection test."},
+    {"name": "RAG applications", "description": "Named RAG apps with their own knowledge sets, prompts and per-user "
+     "token accounting."},
+    {"name": "LLM caching", "description": "Response-cache configuration, providers, dashboard and cache administration."},
+    {"name": "Context caching", "description": "The agent-side data-source cache: configuration, entries and purge/sweep."},
+    {"name": "Agent memory", "description": "Durable per-user memory: entries, search, consolidation and forgetting."},
+    {"name": "Agent identities", "description": "Agent keys (issue, rotate, revoke) and OIDC federation settings."},
+    {"name": "Approvals", "description": "Human-in-the-loop holds on high-risk tools and the policy behind them."},
+    {"name": "Governance & guardrails", "description": "Limits and budgets, guardrail policy and testing, threat detection."},
+    {"name": "Tool audit & evals", "description": "Agent Tool Audit experiments and regression cases; eval datasets and runs."},
+    {"name": "Observability", "description": "Dashboard data, traces, audit log, insights, topology and the Prometheus "
+     "`/metrics` endpoint (bearer scrape token)."},
+    {"name": "Log forwarding & SIEM", "description": "Forwarding appliance logs to Splunk, Elastic, Datadog, Sumo "
+     "Logic, Graylog or syslog, and SIEM audit-event export."},
+    {"name": "Monitoring", "description": "Prometheus scrape token and snippet, Grafana provisioning, and pushing "
+     "metrics to Datadog, Dynatrace or New Relic."},
+    {"name": "Authentication & accounts", "description": "Dashboard login (local accounts or LDAP), bootstrap, "
+     "TLS certificate management."},
+    {"name": "Developer SDK & skills", "description": "Download the Python SDK and the Claude / ChatGPT / Gemini "
+     "integration skills built from this appliance's own source."},
+]
+
 app = FastAPI(
     title=APPLIANCE_NAME,
-    description="RBAC + Couchbase Vector Search pre-filtering gateway for MCP tool servers.",
-    version="1.0.0",
+    description=(
+        "RBAC + Couchbase Vector Search pre-filtering gateway for MCP tool servers.\n\n"
+        "Two kinds of caller use this API. **Agents** send `Authorization: Bearer <agent key or OIDC token>` to the "
+        "*Agent gateway* routes. **Operators** sign in with `POST /v1/auth/login` (local account or LDAP) and carry "
+        "the session cookie to everything else; routes that change configuration or load data require the admin role. "
+        "The Python SDK (`Tools -> Developer SDK`) wraps the agent surface as `AOMClient` and the Knowledge Base, "
+        "warehouse sync, roles and server-test surface as `AOMAdminClient`."
+    ),
+    version="1.1.0",
+    openapi_tags=OPENAPI_TAGS,
 )
 # CORS: the dashboard session cookie makes this security-sensitive (see
 # config.CORS_ALLOWED_ORIGINS) - a wildcard origin combined with
@@ -2283,6 +2330,7 @@ async def prometheus_scrape(request: Request):
 
 @app.get("/api/health")
 async def health():
+    """Liveness: appliance version, Couchbase connectivity and readiness."""
     # Deliberately still 200 when degraded: this endpoint is the container's
     # own healthcheck, and an appliance that is up and able to explain what is
     # wrong with it must not be restarted out from under the operator reading
@@ -2301,6 +2349,8 @@ async def health():
 
 @app.get("/v1/roles")
 async def roles():
+    """Every role, built-in and admin-defined, with `builtin` flags. The
+    public list agents and the dashboard both read."""
     return {"roles": rbac_policy.public_roles()}
 
 
@@ -2355,6 +2405,7 @@ async def roles_usage(request: Request):
 
 @app.post("/v1/roles")
 async def create_role(req: RoleRequest, request: Request):
+    """Add a custom role (`id` matches ^[a-z][a-z0-9_]{1,47}$). Admin only."""
     user = require_admin(request)
     try:
         rid, desc = rbac_policy.normalize_role(req.id, req.description)
@@ -2736,6 +2787,8 @@ async def discover(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
+    """Agent gateway: rank the caller's role-visible tools against a
+    natural-language task (Couchbase vector search with an RBAC pre-filter)."""
     role, subject = await authenticate(authorization, request)
     if not store.connected or embeddings is None:
         raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
@@ -2791,6 +2844,9 @@ async def invoke(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
+    """Agent gateway: invoke one tool through the appliance - policy,
+    guardrails, limits, approvals and audit all apply. May return
+    `{"status": "pending_approval"}` for held tools."""
     role, subject = await authenticate(authorization, request)
     ctx = trace_context(request)
     start = time.time()
@@ -3405,6 +3461,8 @@ async def llm_complete(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
+    """Agent gateway: an LLM completion through the response cache, with
+    per-agent (and per-user, for RAG apps) token accounting."""
     role, subject = await authenticate(authorization, request)
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required")
@@ -4486,6 +4544,8 @@ async def bootstrap(req: BootstrapRequest, request: Request, response: Response)
 
 @app.post("/v1/auth/login")
 async def login(req: LoginRequest, request: Request, response: Response):
+    """Dashboard / operator sign-in (local account or LDAP). Sets the session
+    cookie that every non-agent route requires."""
     _require_store()
     username = req.username.strip()
     if not username or not req.password:
@@ -4551,12 +4611,14 @@ async def login(req: LoginRequest, request: Request, response: Response):
 
 @app.post("/v1/auth/logout")
 async def logout(response: Response):
+    """End the dashboard session."""
     response.delete_cookie(user_auth.SESSION_COOKIE_NAME, path="/")
     return {"logged_out": True}
 
 
 @app.get("/v1/auth/me")
 async def auth_me(request: Request):
+    """The signed-in dashboard account."""
     session = getattr(request.state, "user", None)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -4798,12 +4860,15 @@ def _log_forwarding_view() -> dict:
 
 @app.get("/v1/log-forwarding")
 async def get_log_forwarding(request: Request):
+    """Log forwarding settings for every vendor (secrets masked) and the
+    vendor field catalog."""
     require_admin(request)
     return _log_forwarding_view()
 
 
 @app.put("/v1/log-forwarding")
 async def put_log_forwarding(req: LogForwardingConfigRequest, request: Request):
+    """Save log forwarding settings. Masked secrets keep their stored value."""
     require_admin(request)
     cfg = log_forwarding.normalize_config(req.config, previous=log_forwarding_config)
     problems = []
@@ -4852,12 +4917,15 @@ def _monitoring_view() -> dict:
 
 @app.get("/v1/monitoring")
 async def get_monitoring(request: Request):
+    """Monitoring settings: scrape token state, exporter configuration
+    (secrets masked), the exporter field catalog and Grafana state."""
     require_admin(request)
     return _monitoring_view()
 
 
 @app.put("/v1/monitoring")
 async def put_monitoring(req: MonitoringConfigRequest, request: Request):
+    """Save monitoring / exporter settings. Masked secrets keep their stored value."""
     require_admin(request)
     cfg = monitoring.normalize_config(req.config, previous=monitoring_config)
     problems = []
@@ -4888,6 +4956,7 @@ async def new_scrape_token(request: Request):
 
 @app.delete("/v1/monitoring/scrape-token")
 async def clear_scrape_token(request: Request):
+    """Revoke the Prometheus scrape token; /metrics then requires a dashboard session."""
     require_admin(request)
     cfg = dict(monitoring_config, scrapeTokenHash="", scrapeTokenHint="", scrapeTokenCreatedAt="")
     await save_monitoring_config(cfg)
@@ -4896,6 +4965,7 @@ async def clear_scrape_token(request: Request):
 
 @app.post("/v1/monitoring/prometheus/snippet")
 async def prometheus_snippet(req: PrometheusSnippetRequest, request: Request):
+    """Render a ready-to-paste scrape_config for this appliance."""
     require_admin(request)
     view = _monitoring_view()
     targets = [t.strip() for t in req.targets if t and t.strip()] or [t["address"] for t in view["endpoint"]["defaultTargets"]]
@@ -4910,6 +4980,7 @@ async def prometheus_snippet(req: PrometheusSnippetRequest, request: Request):
 
 @app.post("/v1/monitoring/prometheus/check")
 async def prometheus_check(req: PrometheusCheckRequest, request: Request):
+    """Ask the configured Prometheus whether it is scraping this appliance."""
     require_admin(request)
     url = req.prometheus_url.strip()
     if not url.startswith(("http://", "https://")):
@@ -4949,12 +5020,14 @@ async def grafana_setup(req: GrafanaSetupRequest, request: Request):
 
 @app.get("/v1/monitoring/grafana/dashboard.json")
 async def grafana_dashboard_json(request: Request):
+    """The bundled Grafana dashboard, for manual import."""
     require_admin(request)
     return JSONResponse(monitoring.dashboard_json(), headers={"Content-Disposition": 'attachment; filename="aom-overview.json"'})
 
 
 @app.post("/v1/monitoring/test/{vendor}")
 async def test_monitoring_exporter(vendor: str, req: ExporterTestRequest, request: Request):
+    """Push one test metric to the vendor with the settings as given (saved or not)."""
     require_admin(request)
     if vendor not in monitoring.EXPORTER_BY_ID:
         raise HTTPException(status_code=404, detail=f"Unknown exporter '{vendor}'")
@@ -5511,6 +5584,8 @@ class KnowledgeSetRequest(BaseModel):
 
 @app.get("/v1/knowledge")
 async def list_knowledge(request: Request):
+    """Documents, knowledge sets, embedding models, upload limits, spool
+    state and recent ingestion jobs - everything the Knowledge Base page shows."""
     documents = await store.list_knowledge_documents()
     for d in documents:
         d.setdefault("set_id", knowledge_sets.DEFAULT_SET_ID)
@@ -5911,6 +5986,8 @@ async def import_knowledge(req: KnowledgeImportRequest, request: Request):
 
 @app.get("/v1/knowledge/jobs")
 async def list_knowledge_jobs(request: Request, limit: int = 50):
+    """Recent ingestion jobs (uploads, imports and sync runs), newest first,
+    plus how many are active."""
     require_admin(request)
     jobs = await store.list_knowledge_jobs(limit=max(1, min(limit, 200)))
     return {"jobs": [ingest_jobs.public_job(j) for j in jobs], "active": _ingest_runner().active_count()}
@@ -5918,6 +5995,8 @@ async def list_knowledge_jobs(request: Request, limit: int = 50):
 
 @app.get("/v1/knowledge/jobs/{job_id}")
 async def get_knowledge_job(job_id: str, request: Request):
+    """One job: status (uploading | queued | downloading | running | done |
+    failed | cancelled), phase, bytes received and row/chunk progress."""
     require_admin(request)
     job = await store.get_knowledge_job(job_id)
     if not job:
@@ -6188,6 +6267,8 @@ def _public_syncs() -> list[dict]:
 
 @app.get("/v1/warehouse-syncs")
 async def list_warehouse_syncs(request: Request):
+    """All warehouse syncs (secrets masked), the per-vendor connection field
+    catalog the form is built from, and the available modes."""
     require_admin(request)
     return {"syncs": _public_syncs(), "vendors": warehouse_sync.VENDORS, "modes": list(warehouse_sync.MODES),
             "tick_seconds": warehouse_sync.SCHEDULER_TICK_SECONDS}
@@ -6195,6 +6276,10 @@ async def list_warehouse_syncs(request: Request):
 
 @app.post("/v1/warehouse-syncs")
 async def create_warehouse_sync(req: WarehouseSyncRequest, request: Request):
+    """Create a scheduled query. `sync` carries name, vendor (snowflake |
+    databricks | bigquery), connection, query, allowed_roles, schedule
+    ({kind: interval|cron|manual}), mode (replace | snapshot) and
+    optional set_id / table_name / snapshot_ttl_seconds."""
     user = require_admin(request)
     try:
         doc = warehouse_sync.normalize_sync(req.sync, roles=set(ROLES))
@@ -6210,6 +6295,8 @@ async def create_warehouse_sync(req: WarehouseSyncRequest, request: Request):
 
 @app.put("/v1/warehouse-syncs/{sync_id}")
 async def update_warehouse_sync(sync_id: str, req: WarehouseSyncRequest, request: Request):
+    """Update a sync. Secret fields sent back as the mask keep their stored
+    value; the vendor cannot change."""
     user = require_admin(request)
     existing = warehouse_syncs.get(sync_id)
     if not existing:
@@ -6228,6 +6315,8 @@ async def update_warehouse_sync(sync_id: str, req: WarehouseSyncRequest, request
 
 @app.delete("/v1/warehouse-syncs/{sync_id}")
 async def delete_warehouse_sync(sync_id: str, request: Request, delete_document: bool = False):
+    """Remove a sync, cancelling any run in flight. `delete_document=true`
+    also removes the document it keeps current."""
     user = require_admin(request)
     sync = warehouse_syncs.get(sync_id)
     if not sync:
@@ -6248,6 +6337,8 @@ async def delete_warehouse_sync(sync_id: str, request: Request, delete_document:
 
 @app.post("/v1/warehouse-syncs/{sync_id}/run")
 async def run_warehouse_sync_now(sync_id: str, request: Request):
+    """Run the query now, outside the schedule. Returns the ingestion job
+    to follow under /v1/knowledge/jobs/{job_id}."""
     user = require_admin(request)
     sync = warehouse_syncs.get(sync_id)
     if not sync:
@@ -6260,6 +6351,7 @@ async def run_warehouse_sync_now(sync_id: str, request: Request):
 
 @app.post("/v1/warehouse-syncs/{sync_id}/enabled")
 async def set_warehouse_sync_enabled(sync_id: str, request: Request, enabled: bool = True):
+    """Pause or resume the schedule without touching the definition."""
     require_admin(request)
     sync = warehouse_syncs.get(sync_id)
     if not sync:
@@ -6288,6 +6380,7 @@ async def test_warehouse_sync(req: WarehouseSyncTestRequest, request: Request):
 
 @app.delete("/v1/knowledge/{document_id}")
 async def delete_knowledge(document_id: str, request: Request):
+    """Delete a document and every chunk it produced."""
     require_admin(request)
     removed = await store.delete_knowledge_document(document_id)
     if not removed:
@@ -6902,6 +6995,7 @@ def _with_trace_headers(request: Request, trace_id: str, agent_id: str | None) -
 
 @app.get("/v1/rag/apps")
 async def list_rag_apps(request: Request):
+    """RAG applications with their per-user token usage."""
     apps = sorted(rag_apps_registry.values(), key=lambda a: a.get("created_at") or "", reverse=True)
     llm_events, context_events = await asyncio.gather(
         store.recent_llm_events(limit=2000), store.recent_context_events(limit=2000)
@@ -7526,3 +7620,66 @@ async def knowledge_expiry_sweeper_loop():
             await sweep_expired_knowledge()
         except Exception as exc:  # noqa: BLE001
             logger.error("Knowledge expiry sweep failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI: group every route under one of OPENAPI_TAGS by its path, so /docs
+# stays navigable as the API grows. Runs once at import, after every route
+# above has been registered.
+# ---------------------------------------------------------------------------
+_AGENT_GATEWAY_PATHS = (
+    "/v1/tools/discover", "/v1/tools/invoke", "/v1/llm/complete", "/v1/context/get", "/v1/context/set",
+    "/v1/memory", "/v1/agent/",
+)
+_OPENAPI_PREFIX_TAGS = (
+    ("/v1/knowledge", "Knowledge Base"),
+    ("/v1/warehouse-syncs", "Warehouse syncs"),
+    ("/v1/roles", "Roles & RBAC"),
+    ("/v1/servers", "MCP servers"),
+    ("/v1/tools", "MCP servers"),
+    ("/v1/catalog", "MCP servers"),
+    ("/v1/rag", "RAG applications"),
+    ("/v1/llm", "LLM caching"),
+    ("/v1/context", "Context caching"),
+    ("/v1/agent-memory", "Agent memory"),
+    ("/v1/agents", "Agent identities"),
+    ("/v1/approvals", "Approvals"),
+    ("/v1/governance", "Governance & guardrails"),
+    ("/v1/guardrails", "Governance & guardrails"),
+    ("/v1/threat-detection", "Governance & guardrails"),
+    ("/v1/tool-audit", "Tool audit & evals"),
+    ("/v1/evals", "Tool audit & evals"),
+    ("/v1/traces", "Observability"),
+    ("/v1/audit-log", "Observability"),
+    ("/v1/dashboard", "Observability"),
+    ("/v1/insights", "Observability"),
+    ("/v1/topology", "Observability"),
+    ("/metrics", "Observability"),
+    ("/api/health", "Observability"),
+    ("/v1/log-forwarding", "Log forwarding & SIEM"),
+    ("/v1/siem", "Log forwarding & SIEM"),
+    ("/v1/monitoring", "Monitoring"),
+    ("/v1/auth", "Authentication & accounts"),
+    ("/v1/sdk", "Developer SDK & skills"),
+    ("/v1/skills", "Developer SDK & skills"),
+)
+
+
+def _tag_openapi_routes() -> None:
+    from fastapi.routing import APIRoute
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or route.tags:
+            continue
+        path = route.path
+        if any(path == p or path.startswith(p + "/") or (p.endswith("/") and path.startswith(p)) for p in _AGENT_GATEWAY_PATHS):
+            route.tags = ["Agent gateway"]
+            continue
+        for prefix, tag in _OPENAPI_PREFIX_TAGS:
+            if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "-"):
+                route.tags = [tag]
+                break
+    app.openapi_schema = None  # regenerate /openapi.json with the tags applied
+
+
+_tag_openapi_routes()
