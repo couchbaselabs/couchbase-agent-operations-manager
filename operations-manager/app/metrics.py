@@ -123,6 +123,10 @@ if ENABLED:
 
     SIEM_FORWARDS = Counter("aom_siem_forward_total", "Audit entries forwarded to SIEM destinations", ["vendor", "status"])
 
+    WAREHOUSE_SYNCS = Counter(
+        "aom_warehouse_sync_runs_total", "Scheduled warehouse-to-Knowledge-Base sync runs", ["vendor", "status"]
+    )
+
     LOG_FORWARDS = Counter(
         "aom_log_forwarding_destination_records_total",
         "Application log records delivered to (or failed at) each log-forwarding destination",
@@ -197,6 +201,11 @@ def record_span(span: dict) -> None:
 def record_siem_forward(vendor: str, ok: bool) -> None:
     if ENABLED:
         SIEM_FORWARDS.labels(_label(vendor), "ok" if ok else "error").inc()
+
+
+def record_warehouse_sync(vendor: str, status: str) -> None:
+    if ENABLED:
+        WAREHOUSE_SYNCS.labels(_label(vendor), _label(status)).inc()
 
 
 def record_log_forward(destination: str, result: str, n: int = 1) -> None:

@@ -89,9 +89,11 @@ def new_job(*, kind: str, params: dict, filename: str, source_uri: str | None, b
     return {
         "doc_type": "knowledge_job",
         "job_id": new_job_id(),
-        "kind": kind,  # "upload" | "import"
+        "kind": kind,  # "upload" | "import" | "sync" (app/warehouse_sync.py)
         "status": "uploading" if kind == "upload" else "queued",
         "phase": "receiving" if kind == "upload" else "queued",
+        "sync_id": None,
+        "sync_name": None,
         "filename": (filename or "")[:300],
         "source_uri": (source_uri or "")[:1000] or None,
         "bytes_total": bytes_total,
@@ -346,6 +348,12 @@ class IngestRunner:
         self.spawn = spawn
         self._cancel: set[str] = set()
         self._running: dict[str, asyncio.Task] = {}
+        # job_id -> async callable(job) run once the job reaches a terminal
+        # state (warehouse syncs use it to swap in the new document).
+        self._on_finish: dict[str, Callable[[dict], Awaitable[None]]] = {}
+
+    def on_finish(self, job_id: str, callback: Callable[[dict], Awaitable[None]]) -> None:
+        self._on_finish[job_id] = callback
 
     # -- lifecycle -----------------------------------------------------------
     def enqueue(self, job: dict) -> None:
@@ -372,7 +380,16 @@ class IngestRunner:
                 await self.store.upsert_knowledge_job(job)
                 self.spool.remove(job["job_id"])
                 continue
-            if job["kind"] == "upload" and not self.spool.exists(job["job_id"]):
+            if job["kind"] == "sync" and job.get("phase") == "querying":
+                # The query was still streaming rows when the process died;
+                # the spool holds a partial result. The sync's next scheduled
+                # window re-runs the query from scratch.
+                job.update(status="failed", phase="failed", finished_at=now_iso(), updated_at=now_iso(),
+                           error="the warehouse query was interrupted by a restart - the next scheduled run re-queries")
+                await self.store.upsert_knowledge_job(job)
+                self.spool.remove(job["job_id"])
+                continue
+            if job["kind"] in ("upload", "sync") and not self.spool.exists(job["job_id"]):
                 job.update(status="failed", phase="failed", finished_at=now_iso(), updated_at=now_iso(),
                            error="the spooled file was lost in a restart (the spool directory is not on a persistent "
                                  "volume) - upload it again")
@@ -426,6 +443,12 @@ class IngestRunner:
         finally:
             self._cancel.discard(job_id)
             self._running.pop(job_id, None)
+            hook = self._on_finish.pop(job_id, None)
+            if hook is not None:
+                try:
+                    await hook(job)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("post-job hook for %s failed: %s", job_id, exc)
 
     async def _abort(self, job: dict, *, status: str, error: str) -> None:
         # _ingest records the document id on the job as soon as it picks

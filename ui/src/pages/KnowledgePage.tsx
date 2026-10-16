@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeJob, KnowledgeResponse } from "../api/types";
 import { usePoll } from "../hooks/usePoll";
+import { WarehouseSyncsPanel } from "../components/knowledge/WarehouseSyncsPanel";
 
 function fmtBytes(n: number | null | undefined): string {
   if (n == null) return "?";
@@ -1216,6 +1217,8 @@ export function KnowledgePage() {
             </div>
           </form>
 
+          <WarehouseSyncsPanel sets={data.sets} roles={data.roles} onChanged={load} />
+
           <h2 style={{ fontSize: 16, margin: "22px 0 4px 0" }}>Ingestion jobs</h2>
           <p className="cell-muted" style={{ fontSize: 12.5, margin: "0 0 14px 0" }}>
             Every file upload and cloud import runs as a background job: spooled to disk, then parsed, embedded in
@@ -1267,7 +1270,7 @@ export function KnowledgePage() {
                               {j.job_id}
                             </div>
                             <div className="cell-muted" style={{ fontSize: 11.5 }}>
-                              {j.kind === "import" ? "cloud import" : "upload"}
+                              {j.kind === "import" ? "cloud import" : j.kind === "sync" ? `warehouse sync${j.sync_name ? ` · ${j.sync_name}` : ""}` : "upload"}
                               {j.params.dump ? ` · ${j.params.dump.source} dump` : " · document"}
                               {j.uploaded_by ? ` · ${j.uploaded_by}` : ""}
                             </div>

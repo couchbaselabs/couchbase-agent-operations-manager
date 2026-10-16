@@ -26,6 +26,9 @@ import type {
   KnowledgeDocument,
   KnowledgeJob,
   KnowledgeResponse,
+  WarehouseSync,
+  WarehouseSyncsResponse,
+  WarehouseSyncTestResult,
   KnowledgeSet,
   EmbeddingModelOption,
   RagApp,
@@ -571,6 +574,30 @@ export const api = {
     request<{ job: KnowledgeJob }>(`/v1/knowledge/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   deleteKnowledgeJob: (jobId: string) =>
     request<{ deleted: boolean }>(`/v1/knowledge/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
+  // -- Warehouse syncs ------------------------------------------------
+  warehouseSyncs: () => request<WarehouseSyncsResponse>("/v1/warehouse-syncs"),
+  createWarehouseSync: (sync: Partial<WarehouseSync>) =>
+    request<{ sync: WarehouseSync }>("/v1/warehouse-syncs", { method: "POST", body: JSON.stringify({ sync }) }),
+  updateWarehouseSync: (syncId: string, sync: Partial<WarehouseSync>) =>
+    request<{ sync: WarehouseSync }>(`/v1/warehouse-syncs/${encodeURIComponent(syncId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ sync }),
+    }),
+  deleteWarehouseSync: (syncId: string, deleteDocument = false) =>
+    request<{ deleted: boolean; documents_removed: number }>(
+      `/v1/warehouse-syncs/${encodeURIComponent(syncId)}${deleteDocument ? "?delete_document=true" : ""}`,
+      { method: "DELETE" }
+    ),
+  runWarehouseSync: (syncId: string) =>
+    request<{ job: KnowledgeJob; sync: WarehouseSync }>(`/v1/warehouse-syncs/${encodeURIComponent(syncId)}/run`, {
+      method: "POST",
+    }),
+  setWarehouseSyncEnabled: (syncId: string, enabled: boolean) =>
+    request<{ sync: WarehouseSync }>(`/v1/warehouse-syncs/${encodeURIComponent(syncId)}/enabled?enabled=${enabled}`, {
+      method: "POST",
+    }),
+  testWarehouseSync: (payload: { vendor: string; connection: Record<string, string>; query?: string; sync_id?: string }) =>
+    request<WarehouseSyncTestResult>("/v1/warehouse-syncs/test", { method: "POST", body: JSON.stringify(payload) }),
   embeddingModels: () =>
     request<{ models: EmbeddingModelOption[]; max_dims: number }>("/v1/knowledge/embedding-models"),
   importEmbeddingModel: (payload: {

@@ -68,6 +68,7 @@ from app import (
     tool_versioning,
     tracing,
     user_auth,
+    warehouse_sync,
 )
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
 from app.couchbase_client import CouchbaseStore, set_siem_config_provider
@@ -825,6 +826,8 @@ async def couchbase_startup():
     await _startup_step("load RAG applications", load_rag_apps())
     spawn(knowledge_expiry_sweeper_loop())
     await _startup_step("resume knowledge ingestion jobs", resume_ingest_jobs())
+    await _startup_step("load warehouse syncs", load_warehouse_syncs())
+    spawn(warehouse_sync_scheduler_loop())
 
     if EVAL_SEED_STARTER_DATASET:
         await _startup_step("seed starter eval dataset", seed_starter_dataset())
@@ -5985,6 +5988,302 @@ async def delete_knowledge_job(job_id: str, request: Request):
     ingest_spool.remove(job_id)
     await store.delete_knowledge_job(job_id)
     return {"deleted": True, "job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
+# Warehouse syncs: scheduled query -> Knowledge Base (see app/warehouse_sync.py)
+# ---------------------------------------------------------------------------
+WAREHOUSE_SYNCS_SETTINGS_DOC = "settings::warehouse_syncs"
+warehouse_syncs: dict[str, dict] = {}
+_sync_lock = asyncio.Lock()
+
+
+async def load_warehouse_syncs():
+    global warehouse_syncs
+    stored = await store.get_setting(WAREHOUSE_SYNCS_SETTINGS_DOC)
+    syncs = {}
+    for sid, doc in ((stored or {}).get("syncs") or {}).items():
+        doc = dict(doc)
+        # A run that was in flight when the process died is over; the
+        # ingest runner has already resumed or failed its job.
+        if doc.get("active_job_id"):
+            job = await store.get_knowledge_job(doc["active_job_id"])
+            if not job or job.get("status") in ingest_jobs.TERMINAL_STATUSES:
+                doc["active_job_id"] = None
+        syncs[sid] = doc
+    warehouse_syncs = syncs
+    logger.info("Warehouse syncs loaded (%d)", len(syncs))
+
+
+async def save_warehouse_syncs():
+    await store.upsert_setting(
+        WAREHOUSE_SYNCS_SETTINGS_DOC,
+        {"doc_type": "settings", "setting_id": "warehouse_syncs", "syncs": warehouse_syncs,
+         "updated_at": warehouse_sync.now_iso()},
+    )
+
+
+def _record_run(sync: dict, entry: dict) -> None:
+    sync["last_run"] = entry
+    sync["runs"] = ([entry] + list(sync.get("runs") or []))[: warehouse_sync.MAX_RUN_HISTORY]
+
+
+async def start_warehouse_sync_run(sync: dict, *, trigger: str, user: dict | None = None) -> dict:
+    """Kick off one run: the query streams into the spool in a worker thread,
+    then the ingestion job takes over. Returns the job."""
+    if sync.get("active_job_id"):
+        raise HTTPException(status_code=409, detail="A run of this sync is still in progress")
+    runner = _ingest_runner()
+    kset = get_knowledge_set(sync.get("set_id"))
+    title = sync.get("table_name") or sync["name"]
+    params = {
+        "title": title, "allowed_roles": list(sync["allowed_roles"]), "set_id": kset["set_id"],
+        "expires_at": None, "metadata": {"sync_id": sync["sync_id"], "sync_name": sync["name"], "trigger": trigger},
+        "dump": {"source": sync["vendor"], "table_name": title, "header": None, "column_names": []},
+    }
+    job = ingest_jobs.new_job(kind="sync", params=params, filename=f"{sync['sync_id']}.ndjson", source_uri=None,
+                              bytes_total=None, uploaded_by=(user or {}).get("username") or f"sync:{sync['sync_id']}")
+    job["sync_id"] = sync["sync_id"]
+    job["sync_name"] = sync["name"]
+    job["status"], job["phase"] = "queued", "querying"
+    await store.upsert_knowledge_job(job)
+    sync["active_job_id"] = job["job_id"]
+    sync["next_run_at"] = warehouse_sync.compute_next_run(sync, after=time.time())
+    _record_run(sync, {"job_id": job["job_id"], "status": "querying", "trigger": trigger, "started_at": job["created_at"],
+                       "finished_at": None, "rows": 0, "document_id": None, "error": None})
+    await save_warehouse_syncs()
+    runner.on_finish(job["job_id"], functools.partial(_finish_warehouse_sync_run, sync["sync_id"]))
+    spawn(_run_warehouse_query(sync["sync_id"], job))
+    return job
+
+
+async def _run_warehouse_query(sync_id: str, job: dict) -> None:
+    """Phase 1 of a run: execute the query and stream rows into the spool."""
+    runner = _ingest_runner()
+    sync = warehouse_syncs.get(sync_id)
+    if not sync:
+        return
+    path = ingest_spool.path(job["job_id"])
+    loop = asyncio.get_running_loop()
+    last = [0.0]
+
+    def on_progress(n: int):
+        job["progress"]["rows_parsed"] = n
+        job["bytes_received"] = os.path.getsize(path) if os.path.exists(path) else 0
+        if time.time() - last[0] > ingest_jobs.PROGRESS_FLUSH_SECONDS:
+            last[0] = time.time()
+            asyncio.run_coroutine_threadsafe(store.upsert_knowledge_job(dict(job)), loop)
+
+    def on_total(n: int):
+        job["progress"]["rows_total"] = n
+
+    try:
+        job["status"], job["phase"], job["started_at"] = "running", "querying", warehouse_sync.now_iso()
+        await store.upsert_knowledge_job(job)
+        rows = await asyncio.to_thread(
+            warehouse_sync.write_rows_ndjson, sync["vendor"], sync["connection"], sync["query"], path,
+            cancelled=lambda: runner.is_cancelled(job["job_id"]), on_progress=on_progress, on_total=on_total,
+        )
+        if runner.is_cancelled(job["job_id"]):
+            raise warehouse_sync.SyncError("cancelled")
+        if rows == 0:
+            raise warehouse_sync.SyncError("the query returned no rows")
+        job["bytes_received"] = job["bytes_total"] = os.path.getsize(path)
+        job["progress"]["rows_parsed"] = 0  # the ingest phase counts rows again as it parses
+        job["progress"]["rows_total"] = rows
+        job["status"], job["phase"] = "queued", "queued"
+        await store.upsert_knowledge_job(job)
+        runner.enqueue(job)
+    except Exception as exc:  # noqa: BLE001
+        cancelled = runner.is_cancelled(job["job_id"]) or str(exc) == "cancelled"
+        job.update(status="cancelled" if cancelled else "failed", phase="cancelled" if cancelled else "failed",
+                   error="cancelled by an operator" if cancelled else str(exc)[:1000], finished_at=warehouse_sync.now_iso())
+        await store.upsert_knowledge_job(job)
+        ingest_spool.remove(job["job_id"])
+        runner._cancel.discard(job["job_id"])  # noqa: SLF001
+        runner._on_finish.pop(job["job_id"], None)  # noqa: SLF001
+        await _finish_warehouse_sync_run(sync_id, job)
+
+
+async def _finish_warehouse_sync_run(sync_id: str, job: dict) -> None:
+    """Phase 3: the job reached a terminal state - apply the refresh mode."""
+    async with _sync_lock:
+        sync = warehouse_syncs.get(sync_id)
+        if not sync:
+            return
+        entry = {"job_id": job["job_id"], "status": job["status"], "trigger": (job.get("params") or {}).get("metadata", {}).get("trigger"),
+                 "started_at": job.get("started_at") or job.get("created_at"), "finished_at": job.get("finished_at") or warehouse_sync.now_iso(),
+                 "rows": int((job.get("progress") or {}).get("rows_parsed") or 0), "document_id": job.get("document_id"), "error": job.get("error")}
+        if job["status"] == "done" and job.get("document_id"):
+            previous = sync.get("current_document_id")
+            sync["current_document_id"] = job["document_id"]
+            if previous and previous != job["document_id"]:
+                if sync.get("mode") == "snapshot":
+                    expires = (datetime.now(timezone.utc) + timedelta(seconds=int(sync.get("snapshot_ttl_seconds") or 30 * 86400))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    await store.update_knowledge_expiry(previous, expires)
+                    entry["replaced"] = f"previous snapshot {previous} expires {expires}"
+                else:
+                    removed = await store.delete_knowledge_document(previous)
+                    entry["replaced"] = f"previous document {previous} removed ({removed} doc(s))"
+                bump_knowledge_generation()
+        sync["active_job_id"] = None
+        _record_run(sync, entry)
+        try:
+            metrics.record_warehouse_sync(sync["vendor"], job["status"])
+        except Exception:  # noqa: BLE001 - never let a metric break the bookkeeping
+            pass
+        await save_warehouse_syncs()
+        await store.log_access(
+            action="knowledge.sync", role="system", subject_label=f"sync:{sync_id}", query=None, tool_id=None, server_id=None,
+            decision="ALLOW" if job["status"] == "done" else "ERROR",
+            reason=f"warehouse sync '{sync['name']}' {job['status']}: {entry['rows']} row(s)" + (f" - {job.get('error')}" if job.get("error") else ""),
+            latency_ms=0,
+        )
+
+
+async def warehouse_sync_scheduler_loop():
+    """Every tick, start any enabled sync whose next_run_at has passed. A
+    window missed while the process was down runs once; one that is still
+    running is skipped and the skip recorded."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            if store.connected and embeddings is not None:
+                now = warehouse_sync.now_iso()
+                for sync in list(warehouse_syncs.values()):
+                    if not sync.get("enabled") or not sync.get("next_run_at") or sync["next_run_at"] > now:
+                        continue
+                    if sync.get("active_job_id"):
+                        sync["next_run_at"] = warehouse_sync.compute_next_run(sync, after=time.time())
+                        _record_run(sync, {"job_id": None, "status": "skipped", "trigger": "schedule", "started_at": now, "finished_at": now,
+                                           "rows": 0, "document_id": None, "error": "previous run still in progress"})
+                        await save_warehouse_syncs()
+                        continue
+                    try:
+                        await start_warehouse_sync_run(sync, trigger="schedule")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Scheduled warehouse sync '%s' could not start: %s", sync.get("name"), exc)
+                        sync["next_run_at"] = warehouse_sync.compute_next_run(sync, after=time.time())
+                        await save_warehouse_syncs()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Warehouse sync scheduler tick failed: %s", exc)
+        await asyncio.sleep(warehouse_sync.SCHEDULER_TICK_SECONDS)
+
+
+class WarehouseSyncRequest(BaseModel):
+    sync: dict
+
+
+class WarehouseSyncTestRequest(BaseModel):
+    vendor: str
+    connection: dict = Field(default_factory=dict)
+    query: str | None = None
+    # When testing an existing sync, stored secrets fill in masked fields.
+    sync_id: str | None = None
+
+
+def _public_syncs() -> list[dict]:
+    return sorted((warehouse_sync.public_sync(s) for s in warehouse_syncs.values()), key=lambda s: s.get("name", ""))
+
+
+@app.get("/v1/warehouse-syncs")
+async def list_warehouse_syncs(request: Request):
+    require_admin(request)
+    return {"syncs": _public_syncs(), "vendors": warehouse_sync.VENDORS, "modes": list(warehouse_sync.MODES),
+            "tick_seconds": warehouse_sync.SCHEDULER_TICK_SECONDS}
+
+
+@app.post("/v1/warehouse-syncs")
+async def create_warehouse_sync(req: WarehouseSyncRequest, request: Request):
+    user = require_admin(request)
+    try:
+        doc = warehouse_sync.normalize_sync(req.sync, roles=set(ROLES))
+    except warehouse_sync.SyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_knowledge_set(doc["set_id"])
+    warehouse_syncs[doc["sync_id"]] = doc
+    await save_warehouse_syncs()
+    await store.log_access(action="knowledge.sync.create", role=user.get("role"), subject_label=user.get("username"), query=None,
+                           tool_id=None, server_id=None, decision="ALLOW", reason=f"warehouse sync '{doc['name']}' ({doc['vendor']}) created", latency_ms=0)
+    return {"sync": warehouse_sync.public_sync(doc)}
+
+
+@app.put("/v1/warehouse-syncs/{sync_id}")
+async def update_warehouse_sync(sync_id: str, req: WarehouseSyncRequest, request: Request):
+    user = require_admin(request)
+    existing = warehouse_syncs.get(sync_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="No such sync")
+    try:
+        doc = warehouse_sync.normalize_sync({**req.sync, "vendor": existing["vendor"]}, roles=set(ROLES), existing=existing)
+    except warehouse_sync.SyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_knowledge_set(doc["set_id"])
+    warehouse_syncs[sync_id] = doc
+    await save_warehouse_syncs()
+    await store.log_access(action="knowledge.sync.update", role=user.get("role"), subject_label=user.get("username"), query=None,
+                           tool_id=None, server_id=None, decision="ALLOW", reason=f"warehouse sync '{doc['name']}' updated", latency_ms=0)
+    return {"sync": warehouse_sync.public_sync(doc)}
+
+
+@app.delete("/v1/warehouse-syncs/{sync_id}")
+async def delete_warehouse_sync(sync_id: str, request: Request, delete_document: bool = False):
+    user = require_admin(request)
+    sync = warehouse_syncs.get(sync_id)
+    if not sync:
+        raise HTTPException(status_code=404, detail="No such sync")
+    if sync.get("active_job_id"):
+        _ingest_runner().cancel(sync["active_job_id"])
+    removed = 0
+    if delete_document and sync.get("current_document_id"):
+        removed = await store.delete_knowledge_document(sync["current_document_id"])
+        bump_knowledge_generation()
+    warehouse_syncs.pop(sync_id, None)
+    await save_warehouse_syncs()
+    await store.log_access(action="knowledge.sync.delete", role=user.get("role"), subject_label=user.get("username"), query=None,
+                           tool_id=None, server_id=None, decision="ALLOW",
+                           reason=f"warehouse sync '{sync['name']}' deleted" + (" with its document" if delete_document else ""), latency_ms=0)
+    return {"deleted": True, "sync_id": sync_id, "documents_removed": removed}
+
+
+@app.post("/v1/warehouse-syncs/{sync_id}/run")
+async def run_warehouse_sync_now(sync_id: str, request: Request):
+    user = require_admin(request)
+    sync = warehouse_syncs.get(sync_id)
+    if not sync:
+        raise HTTPException(status_code=404, detail="No such sync")
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    job = await start_warehouse_sync_run(sync, trigger="manual", user=user)
+    return {"job": ingest_jobs.public_job(job), "sync": warehouse_sync.public_sync(sync)}
+
+
+@app.post("/v1/warehouse-syncs/{sync_id}/enabled")
+async def set_warehouse_sync_enabled(sync_id: str, request: Request, enabled: bool = True):
+    require_admin(request)
+    sync = warehouse_syncs.get(sync_id)
+    if not sync:
+        raise HTTPException(status_code=404, detail="No such sync")
+    sync["enabled"] = enabled
+    sync["next_run_at"] = warehouse_sync.compute_next_run(sync, after=time.time())
+    sync["updated_at"] = warehouse_sync.now_iso()
+    await save_warehouse_syncs()
+    return {"sync": warehouse_sync.public_sync(sync)}
+
+
+@app.post("/v1/warehouse-syncs/test")
+async def test_warehouse_sync(req: WarehouseSyncTestRequest, request: Request):
+    """Authenticate to the warehouse and, with a query, run a LIMIT-10
+    preview - using the form as it is, saved or not."""
+    require_admin(request)
+    if req.vendor not in warehouse_sync.VENDOR_BY_ID:
+        raise HTTPException(status_code=400, detail="vendor must be snowflake, databricks or bigquery")
+    previous = (warehouse_syncs.get(req.sync_id) or {}).get("connection") if req.sync_id else None
+    try:
+        conn = warehouse_sync.normalize_connection(req.vendor, req.connection, previous)
+    except warehouse_sync.SyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await asyncio.to_thread(warehouse_sync.test_connection, req.vendor, conn, req.query)
 
 
 @app.delete("/v1/knowledge/{document_id}")

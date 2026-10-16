@@ -587,8 +587,10 @@ over.
   job** (progress, cancel, retry on the page), so the limit is 5 GB per
   file rather than what a browser tab can hold; exports already sitting
   in S3, Cloud Storage or Azure Blob are imported from their URI without
-  passing through the browser at all. See [Loading large data into the
-  Knowledge Base](#loading-large-data-into-the-knowledge-base).
+  passing through the browser at all, and **Warehouse syncs** run a SQL
+  query against Snowflake, Databricks or BigQuery on a schedule and keep the
+  result loaded. See [Loading large data into the Knowledge
+  Base](#loading-large-data-into-the-knowledge-base).
 - **RAG Applications** - register an application over the Knowledge Base,
   try it, and read **Token usage by user**: per caller subject, queries,
   cache hits and hit rate, tokens spent and saved, cost spent and saved,
@@ -966,6 +968,35 @@ curl -k -b cookies.txt -X POST \
   -H "Content-Type: application/octet-stream" --data-binary @orders.csv.gz
 curl -k -b cookies.txt https://192.168.111.5:3111/v1/knowledge/jobs/<job_id>
 ```
+
+### Warehouse syncs: a scheduled query instead of a file
+
+For data that changes, skip the export step: **Warehouse syncs** on the
+Knowledge Base page run a SQL query you write against Snowflake, Databricks
+or BigQuery on a schedule and load the result as a table document. Each run
+streams rows from the warehouse's own HTTP API (Snowflake SQL REST API
+result partitions, Databricks Statement Execution API `EXTERNAL_LINKS`
+chunks, BigQuery `jobs.query` pages) into the ingestion spool and hands the
+file to the same ingestion job as an upload - so a 50 M-row result costs the
+process the same memory as a small one, and shows up in the Ingestion jobs
+table with progress and cancel.
+
+- **Connection**: Snowflake key-pair JWT (recommended) or a PAT/OAuth token;
+  Databricks service-principal OAuth M2M or a PAT, plus the SQL warehouse ID;
+  BigQuery a service-account JSON key. Secrets are encrypted at rest and never
+  returned. *Test connection* and *Preview query* (10 rows) work before saving.
+- **Schedule**: an interval, a five-field cron expression (UTC), or manual.
+  Checked every 30 s; a window missed while the operations manager was down
+  runs once at startup; a run still going when the next window arrives is
+  skipped and recorded. One run per sync at a time.
+- **Mode**: *replace* deletes the previous run's document once the new one is
+  fully indexed (agents see the old table until then - never both, never
+  neither); *snapshot* keeps it with an expiry (default 30 days).
+- Every run is an audit entry (`knowledge.sync`) and a sample of
+  `aom_warehouse_sync_runs_total{vendor,status}`, so a failing sync shows up in
+  Monitoring. Run history (last 20) is on the sync.
+- API: `GET/POST /v1/warehouse-syncs`, `PUT/DELETE /v1/warehouse-syncs/{id}`,
+  `POST .../run`, `POST .../enabled?enabled=`, `POST /v1/warehouse-syncs/test`.
 
 What each warehouse should export: Snowflake `COPY INTO @stage ... FILE_FORMAT
 = (TYPE = CSV COMPRESSION = GZIP) HEADER = TRUE` (or `TYPE = PARQUET`),

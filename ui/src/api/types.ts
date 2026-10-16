@@ -1108,7 +1108,9 @@ export type KnowledgeJobStatus = "uploading" | "queued" | "downloading" | "runni
  *  operations-manager/app/ingest_jobs.py. */
 export interface KnowledgeJob {
   job_id: string;
-  kind: "upload" | "import";
+  kind: "upload" | "import" | "sync";
+  sync_id?: string | null;
+  sync_name?: string | null;
   status: KnowledgeJobStatus;
   phase: string;
   filename: string;
@@ -1494,4 +1496,62 @@ export interface PrometheusTargetRow {
   lastScrape: string | null;
   scrapeUrl: string | null;
   expected: boolean;
+}
+
+// --- Warehouse syncs (scheduled query -> Knowledge Base) ----------------------
+
+export interface WarehouseSyncRun {
+  job_id: string | null;
+  status: "querying" | "queued" | "running" | "done" | "failed" | "cancelled" | "skipped";
+  trigger: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  rows: number;
+  document_id: string | null;
+  error: string | null;
+  replaced?: string;
+}
+
+export interface WarehouseSyncSchedule {
+  kind: "interval" | "cron" | "manual";
+  every_minutes?: number;
+  cron?: string;
+}
+
+export interface WarehouseSync {
+  sync_id: string;
+  name: string;
+  vendor: "snowflake" | "databricks" | "bigquery";
+  /** Secrets read as "********" when stored; send that back to keep them. */
+  connection: Record<string, string>;
+  query: string;
+  set_id: string;
+  allowed_roles: string[];
+  table_name: string;
+  description: string;
+  schedule: WarehouseSyncSchedule;
+  mode: "replace" | "snapshot";
+  snapshot_ttl_seconds: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  current_document_id: string | null;
+  active_job_id: string | null;
+  last_run: WarehouseSyncRun | null;
+  runs: WarehouseSyncRun[];
+  next_run_at: string | null;
+}
+
+export interface WarehouseSyncsResponse {
+  syncs: WarehouseSync[];
+  vendors: Vendor[];
+  modes: string[];
+  tick_seconds: number;
+}
+
+export interface WarehouseSyncTestResult {
+  ok: boolean;
+  detail: string;
+  columns: string[];
+  rows: Array<Record<string, unknown>>;
 }
