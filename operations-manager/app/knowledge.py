@@ -58,7 +58,7 @@ MAX_CHUNK_CHARS = 4000
 # app/ingest_jobs.py uses config.KNOWLEDGE_MAX_DOCUMENT_CHARS /
 # KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT instead.
 import os as _os
-MAX_DOCUMENT_CHARS = int(_os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000"))
+MAX_DOCUMENT_CHARS = int(float(_os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000")))
 MAX_CHUNKS_PER_DOCUMENT = 2000
 
 SUPPORTED_EXTENSIONS = (".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".htm", ".pdf", ".log", ".rst")

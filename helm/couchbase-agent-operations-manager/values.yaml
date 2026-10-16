@@ -305,7 +305,9 @@ operationsManager:
     maxInlineMb: 20
     ingestConcurrency: 1
     ingestBatchChunks: 256
-    maxChunksPerDocument: 2000000
+    # Quoted on purpose: Helm renders an unquoted number this large as
+    # "2e+06", which the operations manager cannot parse as an integer.
+    maxChunksPerDocument: "2000000"
   spool:
     persistence:
       enabled: true

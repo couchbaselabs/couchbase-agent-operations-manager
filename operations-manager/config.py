@@ -257,7 +257,7 @@ KNOWLEDGE_CHUNK_OVERLAP = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "200"))
 # spooled to KNOWLEDGE_SPOOL_DIR and ingested in batches by a background
 # job, so the ceiling is about spool disk, not RAM. The spool must have
 # room for this many MB per concurrently uploading job.
-KNOWLEDGE_MAX_UPLOAD_MB = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_MB", "5120"))
+KNOWLEDGE_MAX_UPLOAD_MB = int(float(os.getenv("KNOWLEDGE_MAX_UPLOAD_MB", "5120")))
 
 # Largest body for the original inline path (POST /v1/knowledge: base64 in
 # JSON, parsed and embedded inside the request). Kept for pasted text and
@@ -282,11 +282,14 @@ KNOWLEDGE_INGEST_BATCH_CHUNKS = int(os.getenv("KNOWLEDGE_INGEST_BATCH_CHUNKS", "
 # Safety ceiling on chunks per document for the background path (the
 # inline path keeps knowledge.MAX_CHUNKS_PER_DOCUMENT). At 1,200
 # characters a chunk, 2,000,000 chunks is roughly 2.4 GB of indexed text.
-KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", "2000000"))
+# int(float(...)): Helm (and some shells) hand large numbers over as
+# "2e+06", which int() alone rejects - and a crash here takes the whole
+# process down before it can serve a login page.
+KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT = int(float(os.getenv("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", "2000000")))
 
 # Characters kept from one parsed document on the background path; the
 # inline path uses the same value capped by its own upload limit.
-KNOWLEDGE_MAX_DOCUMENT_CHARS = int(os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000"))
+KNOWLEDGE_MAX_DOCUMENT_CHARS = int(float(os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000")))
 
 
 # ---------------------------------------------------------------------------
