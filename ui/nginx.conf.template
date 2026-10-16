@@ -109,6 +109,32 @@ server {
     # on the wire) and parses and embeds them inline, which can take
     # minutes. nginx's defaults (1MB body, 60s read) rejected anything over
     # about 750KB with a 413 and cut off large ones part-way.
+    # Streaming uploads (POST /v1/knowledge/uploads): the body is the file
+    # itself and operations-manager spools it to disk as it arrives, so
+    # nginx must NOT buffer it (proxy_request_buffering off streams each
+    # chunk straight through) and must allow bodies up to
+    # KNOWLEDGE_MAX_UPLOAD_MB (5 GB default). The timeouts bound a stalled
+    # connection, not the total transfer: a 5 GB upload over a slow link
+    # keeps sending and never trips them. Ingestion itself runs as a
+    # background job after the 202, so nothing here waits on embedding.
+    location = /v1/knowledge/uploads {
+        client_max_body_size 5120m;
+        client_body_timeout 600s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass ${OPERATIONS_MANAGER_SCHEME}://operations_manager/v1/knowledge/uploads;
+        proxy_ssl_verify off;
+        proxy_ssl_session_reuse on;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
     location = /v1/knowledge {
         client_max_body_size 32m;
         proxy_pass ${OPERATIONS_MANAGER_SCHEME}://operations_manager/v1/knowledge;

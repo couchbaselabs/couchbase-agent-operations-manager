@@ -54,7 +54,11 @@ DEFAULT_CHUNK_CHARS = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 MIN_CHUNK_CHARS = 200
 MAX_CHUNK_CHARS = 4000
-MAX_DOCUMENT_CHARS = 4_000_000
+# Inline-path ceilings (POST /v1/knowledge). The background path in
+# app/ingest_jobs.py uses config.KNOWLEDGE_MAX_DOCUMENT_CHARS /
+# KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT instead.
+import os as _os
+MAX_DOCUMENT_CHARS = int(_os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000"))
 MAX_CHUNKS_PER_DOCUMENT = 2000
 
 SUPPORTED_EXTENSIONS = (".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".htm", ".pdf", ".log", ".rst")
@@ -250,7 +254,10 @@ def build_chunk_doc(
 ) -> dict:
     return {
         "doc_type": "knowledge_chunk",
-        "chunk_id": f"{document_id}::{index:04d}",
+        # Zero-padded wide enough for the millions of chunks a warehouse
+        # export can produce (see app/ingest_jobs.py); ordering is by
+        # chunk_index, so the width only has to be consistent per document.
+        "chunk_id": f"{document_id}::{index:08d}",
         "document_id": document_id,
         "document_title": document_title,
         "chunk_index": index,

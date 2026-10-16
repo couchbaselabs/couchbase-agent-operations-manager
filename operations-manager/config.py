@@ -251,9 +251,42 @@ EVAL_RUN_HISTORY = int(os.getenv("EVAL_RUN_HISTORY", "50"))
 KNOWLEDGE_CHUNK_CHARS = int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "1200"))
 KNOWLEDGE_CHUNK_OVERLAP = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "200"))
 
-# Largest upload accepted, in megabytes. Ingestion embeds every chunk on
-# CPU, so this bounds how long one upload can occupy the service.
-KNOWLEDGE_MAX_UPLOAD_MB = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_MB", "20"))
+# Largest upload accepted by the streaming/background path (POST
+# /v1/knowledge/uploads and /imports - see app/ingest_jobs.py), in
+# megabytes. Nothing of that size is ever held in memory: the body is
+# spooled to KNOWLEDGE_SPOOL_DIR and ingested in batches by a background
+# job, so the ceiling is about spool disk, not RAM. The spool must have
+# room for this many MB per concurrently uploading job.
+KNOWLEDGE_MAX_UPLOAD_MB = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_MB", "5120"))
+
+# Largest body for the original inline path (POST /v1/knowledge: base64 in
+# JSON, parsed and embedded inside the request). Kept for pasted text and
+# small files; anything bigger should use the streaming path.
+KNOWLEDGE_MAX_INLINE_MB = int(os.getenv("KNOWLEDGE_MAX_INLINE_MB", "20"))
+
+# Where streaming uploads and cloud imports are spooled while a job works
+# through them. In Kubernetes this should be a persistent volume (see the
+# chart's operationsManager.spool.persistence) so a queued job survives a
+# pod restart; on an emptyDir it is re-uploaded instead.
+KNOWLEDGE_SPOOL_DIR = os.getenv("KNOWLEDGE_SPOOL_DIR", "/app/spool/knowledge")
+
+# How many ingestion jobs embed at once. Each one shares the embedding
+# model's inference slots with interactive requests; 1 keeps a 5 GB
+# import from starving discovery, 2-3 suits a node with spare cores.
+KNOWLEDGE_INGEST_CONCURRENCY = int(os.getenv("KNOWLEDGE_INGEST_CONCURRENCY", "1"))
+
+# Chunks embedded and written per batch inside a job - the unit of memory
+# and of progress reporting.
+KNOWLEDGE_INGEST_BATCH_CHUNKS = int(os.getenv("KNOWLEDGE_INGEST_BATCH_CHUNKS", "256"))
+
+# Safety ceiling on chunks per document for the background path (the
+# inline path keeps knowledge.MAX_CHUNKS_PER_DOCUMENT). At 1,200
+# characters a chunk, 2,000,000 chunks is roughly 2.4 GB of indexed text.
+KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", "2000000"))
+
+# Characters kept from one parsed document on the background path; the
+# inline path uses the same value capped by its own upload limit.
+KNOWLEDGE_MAX_DOCUMENT_CHARS = int(os.getenv("KNOWLEDGE_MAX_DOCUMENT_CHARS", "50000000"))
 
 
 # ---------------------------------------------------------------------------

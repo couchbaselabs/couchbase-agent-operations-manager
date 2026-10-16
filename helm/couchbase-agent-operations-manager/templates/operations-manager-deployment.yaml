@@ -252,12 +252,26 @@ spec:
               value: {{ .Values.operationsManager.llmCache.logRetentionHours | quote }}
             - name: LOG_LEVEL
               value: INFO
+            - name: KNOWLEDGE_MAX_UPLOAD_MB
+              value: {{ .Values.operationsManager.knowledge.maxUploadMb | quote }}
+            - name: KNOWLEDGE_MAX_INLINE_MB
+              value: {{ .Values.operationsManager.knowledge.maxInlineMb | quote }}
+            - name: KNOWLEDGE_SPOOL_DIR
+              value: /app/spool/knowledge
+            - name: KNOWLEDGE_INGEST_CONCURRENCY
+              value: {{ .Values.operationsManager.knowledge.ingestConcurrency | quote }}
+            - name: KNOWLEDGE_INGEST_BATCH_CHUNKS
+              value: {{ .Values.operationsManager.knowledge.ingestBatchChunks | quote }}
+            - name: KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT
+              value: {{ .Values.operationsManager.knowledge.maxChunksPerDocument | quote }}
             {{- with .Values.operationsManager.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
             - name: hf-cache
               mountPath: /home/appuser/.cache/huggingface
+            - name: knowledge-spool
+              mountPath: /app/spool/knowledge
             - name: tls
               mountPath: /app/tls
             {{- if and (not .Values.couchbase.enabled) .Values.couchbase.external.tlsCaCert }}
@@ -303,6 +317,14 @@ spec:
             claimName: {{ include "aom.fullname" . }}-hf-cache
           {{- else }}
           emptyDir: {}
+          {{- end }}
+        - name: knowledge-spool
+          {{- if .Values.operationsManager.spool.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "aom.fullname" . }}-knowledge-spool
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.operationsManager.spool.emptyDirSizeLimit }}
           {{- end }}
         - name: tls
           secret:

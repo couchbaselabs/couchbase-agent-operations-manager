@@ -84,7 +84,7 @@ RUN chmod +x docker-entrypoint.sh
 RUN groupadd --system --gid 10001 appuser \
     && useradd --system --uid 10001 --gid appuser --home-dir /home/appuser --create-home --shell /usr/sbin/nologin appuser \
     && usermod -aG root appuser \
-    && mkdir -p /home/appuser/.cache/huggingface \
+    && mkdir -p /home/appuser/.cache/huggingface /app/spool/knowledge \
     && chown -R appuser:appuser /app /home/appuser \
     && chown appuser:root /app/tls/server.key \
     && chmod 640 /app/tls/server.key

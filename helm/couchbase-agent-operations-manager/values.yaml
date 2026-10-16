@@ -294,6 +294,26 @@ operationsManager:
       size: 5Gi
       storageClassName: ""
 
+  # Knowledge Base streaming uploads and cloud imports (see
+  # operations-manager/app/ingest_jobs.py). An upload is spooled to
+  # /app/spool/knowledge and ingested by a background job, so the ceiling
+  # is spool disk, not pod memory. With persistence on, a queued job
+  # survives a pod restart; on an emptyDir it has to be uploaded again.
+  # Size the volume for maxUploadMb times the uploads you expect in flight.
+  knowledge:
+    maxUploadMb: 5120
+    maxInlineMb: 20
+    ingestConcurrency: 1
+    ingestBatchChunks: 256
+    maxChunksPerDocument: 2000000
+  spool:
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClassName: ""
+    # Used when persistence is off.
+    emptyDirSizeLimit: 10Gi
+
   resources:
     # torch (CPU build) + sentence-transformers need real headroom for
     # the embedding model; tune down only if you've confirmed it fits.
@@ -452,6 +472,14 @@ metrics:
 ingress:
   enabled: false
   className: ""
+  # If the dashboard sits behind an ingress controller, raise its body
+  # limit and timeouts for streaming Knowledge Base uploads
+  # (POST /v1/knowledge/uploads, up to operationsManager.knowledge.maxUploadMb),
+  # e.g. for ingress-nginx:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "5120m"
+  #   nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
   annotations: {}
   hosts:
     - host: agent-operations.local

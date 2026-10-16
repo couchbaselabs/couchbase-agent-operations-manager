@@ -1,6 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeResponse } from "../api/types";
+import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeJob, KnowledgeResponse } from "../api/types";
+import { usePoll } from "../hooks/usePoll";
+
+function fmtBytes(n: number | null | undefined): string {
+  if (n == null) return "?";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+const JOB_ACTIVE = new Set(["uploading", "queued", "downloading", "running"]);
+
+// Where a 5 GB export usually lives, per warehouse - the URI shapes the
+// cloud-import form accepts, with the credential each one needs.
+const IMPORT_HELP: Record<string, string> = {
+  snowflake:
+    "Unload to an external stage, then import the object: s3://bucket/path/data_0_0_0.csv.gz (AWS access key + secret, or an instance role), gs://bucket/path/... (service-account JSON), az://container/path/... (account key or SAS). A presigned URL from GET_PRESIGNED_URL(@stage, 'file') works as https:// with no credential.",
+  databricks:
+    "Write to a Volume, then use the Files API as https://<workspace>.cloud.databricks.com/api/2.0/fs/files/Volumes/<catalog>/<schema>/<volume>/<path> with a bearer token (PAT or service-principal OAuth token), or export to s3://, gs:// or abfss:// and import that directly.",
+  bigquery:
+    "EXPORT DATA to Cloud Storage, then import gs://bucket/path/orders-000000000000.parquet with a service-account JSON that has storage.objects.get on the bucket - or a signed URL (gsutil signurl) as https:// with no credential.",
+  other: "Any https://, s3://, gs://, az:// or abfss:// object; the credential is used for the download only and never stored.",
+};
 
 const NEW_SET = "__new__";
 
@@ -79,35 +102,8 @@ function modelOptionLabel(m: EmbeddingModelOption) {
 
 const API_KEY_STORAGE_KEY = "aom.knowledge.api-key";
 
-// Formats the browser can hand over as text. Anything else is sent as
-// base64 and parsed server-side, which is what PDF needs.
-const TEXT_EXTENSIONS = [".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".htm", ".log", ".rst"];
 
-function isTextFile(name: string) {
-  const lower = name.toLowerCase();
-  return TEXT_EXTENSIONS.some((ext) => lower.endsWith(ext));
-}
 
-function readAsText(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("Could not read that file"));
-    reader.readAsText(file);
-  });
-}
-
-function readAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || "");
-      resolve(result.includes(",") ? result.split(",")[1] : result);
-    };
-    reader.onerror = () => reject(new Error("Could not read that file"));
-    reader.readAsDataURL(file);
-  });
-}
 
 export function KnowledgePage() {
   const [data, setData] = useState<KnowledgeResponse | null>(null);
@@ -119,7 +115,19 @@ export function KnowledgePage() {
   const [allowedRoles, setAllowedRoles] = useState<string[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [pastedText, setPastedText] = useState("");
-  const [addMode, setAddMode] = useState<"document" | "dump">("document");
+  const [addMode, setAddMode] = useState<"document" | "dump" | "import">("document");
+  const [uploadProgress, setUploadProgress] = useState<{ sent: number; total: number } | null>(null);
+  const uploadAbort = useRef<AbortController | null>(null);
+  const [importUri, setImportUri] = useState("");
+  const [importAuthMode, setImportAuthMode] = useState<"none" | "bearer" | "header" | "aws" | "gcp" | "azure">("none");
+  const [importSecret, setImportSecret] = useState("");
+  const [importKeyId, setImportKeyId] = useState("");
+  const [importRegion, setImportRegion] = useState("");
+  const [importHeaderName, setImportHeaderName] = useState("X-Api-Key");
+  const [importAccount, setImportAccount] = useState("");
+  const [importIsDump, setImportIsDump] = useState(true);
+  const [jobs, setJobs] = useState<KnowledgeJob[]>([]);
+  const [jobBusy, setJobBusy] = useState<string | null>(null);
   const [dumpSource, setDumpSource] = useState("snowflake");
   const [tableName, setTableName] = useState("");
   const [headerMode, setHeaderMode] = useState<"auto" | "yes" | "no">("auto");
@@ -158,6 +166,7 @@ export function KnowledgePage() {
     try {
       const [kb, catalog] = await Promise.all([api.knowledge(), api.embeddingModels().catch(() => null)]);
       setData(kb);
+      setJobs(kb.jobs || []);
       if (catalog) setModels(catalog.models);
       setSetId((current) => (current && current !== NEW_SET ? current : current || kb.default_set_id));
     } catch (e: any) {
@@ -206,82 +215,150 @@ export function KnowledgePage() {
     setAllowedRoles((roles) => (roles.includes(role) ? roles.filter((r) => r !== role) : [...roles, role]));
   }
 
+  // Ingestion jobs refresh on their own while any is active; a job that
+  // just finished also refreshes the document list once.
+  const anyJobActive = jobs.some((j) => JOB_ACTIVE.has(j.status));
+  const activeBefore = useRef(false);
+  usePoll(
+    async () => {
+      const res = await api.knowledgeJobs();
+      setJobs(res.jobs);
+      const nowActive = res.jobs.some((j) => JOB_ACTIVE.has(j.status));
+      if (activeBefore.current && !nowActive) await load();
+      activeBefore.current = nowActive;
+    },
+    3000,
+    anyJobActive
+  );
+
+  async function handleJobAction(job: KnowledgeJob, action: "cancel" | "retry" | "delete") {
+    setJobBusy(job.job_id);
+    setError(null);
+    try {
+      if (action === "cancel") await api.cancelKnowledgeJob(job.job_id);
+      else if (action === "retry") await api.retryKnowledgeJob(job.job_id);
+      else await api.deleteKnowledgeJob(job.job_id);
+      const res = await api.knowledgeJobs();
+      setJobs(res.jobs);
+      if (action !== "cancel") await load();
+    } catch (e: any) {
+      setError(e.message || `Could not ${action} the job`);
+    } finally {
+      setJobBusy(null);
+    }
+  }
+
+  function importAuth(): Record<string, string> | undefined {
+    switch (importAuthMode) {
+      case "bearer":
+        return importSecret ? { mode: "bearer", secret: importSecret } : undefined;
+      case "header":
+        return importSecret ? { mode: "header", header_name: importHeaderName, secret: importSecret } : undefined;
+      case "aws":
+        return importKeyId && importSecret
+          ? { access_key_id: importKeyId, secret: importSecret, ...(importRegion ? { region: importRegion } : {}) }
+          : undefined;
+      case "gcp":
+        return importSecret ? { service_account_json: importSecret } : undefined;
+      case "azure":
+        return importSecret.startsWith("DefaultEndpointsProtocol=") || importSecret.includes("AccountKey=")
+          ? { connection_string: importSecret }
+          : importAccount && importSecret
+            ? { account: importAccount, secret: importSecret }
+            : undefined;
+      default:
+        return undefined;
+    }
+  }
+
   async function handleUpload(e: React.FormEvent) {
     e.preventDefault();
     setUploading(true);
     setError(null);
     setNotice(null);
     try {
-      let content: string;
-      let encoding: "text" | "base64" = "text";
-      let filename = "";
-
       const expiryOpt = EXPIRY_OPTIONS.find((o) => o.value === expiryChoice);
       const expiry: { ttl_seconds?: number; expires_at?: string } =
         expiryChoice === "date" ? { expires_at: expiryDate } : expiryOpt?.seconds ? { ttl_seconds: expiryOpt.seconds } : {};
       if (expiryChoice === "date" && !expiryDate) throw new Error("Pick the date this document expires");
 
-      if (addMode === "dump") {
-        if (!file) throw new Error("Pick the export file to import");
-        // Always sent as bytes: dumps are often gzip, zip, Parquet or Avro.
-        const res = await api.ingestKnowledge({
-          title: title || tableName || file.name,
-          content: await readAsBase64(file),
-          encoding: "base64",
-          filename: file.name,
-          source: file.name,
+      const dumpOptions = {
+        source: dumpSource,
+        table_name: tableName || undefined,
+        header: headerMode === "auto" ? null : headerMode === "yes",
+        column_names:
+          headerMode === "no" && columnNames.trim()
+            ? columnNames.split(",").map((c) => c.trim()).filter(Boolean)
+            : undefined,
+      };
+
+      if (addMode === "import") {
+        if (!importUri.trim()) throw new Error("Enter the object URI to import");
+        const res = await api.importKnowledge({
+          uri: importUri.trim(),
+          auth: importAuth(),
+          title: title || tableName || undefined,
           allowed_roles: allowedRoles,
           set_id: setId,
           ...expiry,
-          dump: {
-            source: dumpSource,
-            table_name: tableName || undefined,
-            header: headerMode === "auto" ? null : headerMode === "yes",
-            column_names:
-              headerMode === "no" && columnNames.trim()
-                ? columnNames.split(",").map((c) => c.trim()).filter(Boolean)
-                : undefined,
-          },
+          dump: importIsDump ? dumpOptions : undefined,
         });
-        const dump = res.document.dump;
         setNotice(
-          `Imported ${dump?.source_label} table "${dump?.table_name}" - ${dump?.rows_indexed.toLocaleString()} of ` +
-            `${dump?.total_rows.toLocaleString()} row(s) across ${dump?.column_count} column(s) into ` +
-            `${res.document.chunk_count} chunk(s)` +
-            (res.document.expires_at ? `, expiring ${res.document.expires_at.replace("T", " ").replace("Z", " UTC")}` : "") +
-            "." +
-            (dump?.notes?.length ? " " + dump.notes.join(" ") : "")
+          `Import queued as job ${res.job.job_id}: the object is being downloaded into the spool and indexed in the ` +
+            "background - progress is in the Ingestion jobs table below."
+        );
+        setImportUri("");
+        setImportSecret("");
+        setJobs((j) => [res.job, ...j]);
+        return;
+      }
+
+      // Any file goes through the streaming upload: the browser streams
+      // the File as the request body (nothing read into memory) and the
+      // operations manager indexes it as a background job.
+      if (file) {
+        const abort = new AbortController();
+        uploadAbort.current = abort;
+        setUploadProgress({ sent: 0, total: file.size });
+        const res = await api.uploadKnowledgeStream(
+          file,
+          {
+            title: title || tableName || file.name,
+            allowed_roles: allowedRoles,
+            set_id: setId,
+            ...expiry,
+            dump: addMode === "dump" ? dumpOptions : undefined,
+          },
+          (sent, total) => setUploadProgress({ sent, total }),
+          abort.signal
+        );
+        setNotice(
+          `Uploaded ${fmtBytes(file.size)} as job ${res.job.job_id}. ` +
+            (addMode === "dump" ? "Rows are being parsed and embedded" : "The document is being chunked and embedded") +
+            " in the background - progress is in the Ingestion jobs table below."
         );
         setTitle("");
         setTableName("");
         setColumnNames("");
         setFile(null);
         if (fileInput.current) fileInput.current.value = "";
-        await load();
+        setJobs((j) => [res.job, ...j]);
         return;
       }
 
-      if (file) {
-        filename = file.name;
-        if (isTextFile(file.name)) {
-          content = await readAsText(file);
-        } else {
-          content = await readAsBase64(file);
-          encoding = "base64";
-        }
-      } else {
-        content = pastedText;
-        filename = `${title || "pasted"}.txt`;
-      }
+      if (addMode === "dump") throw new Error("Pick the export file to upload");
 
+      // Pasted text: small by nature, so it takes the inline path.
+      const content = pastedText;
+      const filename = `${title || "pasted"}.txt`;
       if (!content.trim()) throw new Error("Nothing to ingest - pick a file or paste some text");
 
       const res = await api.ingestKnowledge({
-        title: title || file?.name || "Untitled",
+        title: title || "Untitled",
         content,
-        encoding,
+        encoding: "text",
         filename,
-        source: file ? file.name : "pasted",
+        source: "pasted",
         allowed_roles: allowedRoles,
         set_id: setId,
         ...expiry,
@@ -300,6 +377,8 @@ export function KnowledgePage() {
       setError(e.message || "Ingestion failed");
     } finally {
       setUploading(false);
+      setUploadProgress(null);
+      uploadAbort.current = null;
     }
   }
 
@@ -493,9 +572,12 @@ export function KnowledgePage() {
             <div className="stat-card">
               <div className="stat-label">Upload limit</div>
               <div className="stat-value" style={{ fontSize: 20 }}>
-                {data.max_upload_mb} MB
+                {data.max_upload_mb >= 1024 ? `${(data.max_upload_mb / 1024).toFixed(data.max_upload_mb % 1024 ? 1 : 0)} GB` : `${data.max_upload_mb} MB`}
               </div>
-              <div className="stat-hint">Every chunk is embedded on CPU</div>
+              <div className="stat-hint">
+                streamed to disk, indexed in the background
+                {data.ingest.spool_free_bytes != null ? ` · ${fmtBytes(data.ingest.spool_free_bytes)} spool free` : ""}
+              </div>
             </div>
             <div className="stat-card">
               <div className="stat-label">Formats</div>
@@ -777,10 +859,161 @@ export function KnowledgePage() {
                     A data dump (Snowflake, Databricks or BigQuery table export)
                   </label>
                 </div>
+                <div className="checkbox-row" style={{ margin: 0 }}>
+                  <input
+                    type="radio"
+                    id="mode-import"
+                    checked={addMode === "import"}
+                    onChange={() => {
+                      setAddMode("import");
+                      setFile(null);
+                      if (fileInput.current) fileInput.current.value = "";
+                    }}
+                  />
+                  <label htmlFor="mode-import" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                    Import from cloud storage or a URL (S3, GCS, Azure, https)
+                  </label>
+                </div>
               </div>
             </div>
 
-            {addMode === "dump" ? (
+            {addMode === "import" ? (
+              <>
+                <div className="two-col">
+                  <div className="field">
+                    <label>Object URI</label>
+                    <input
+                      type="text"
+                      value={importUri}
+                      placeholder="s3://bucket/exports/orders_0_0_0.csv.gz  ·  gs://...  ·  az://container/path  ·  https://..."
+                      onChange={(e) => {
+                        setImportUri(e.target.value);
+                        const v = e.target.value.trim().toLowerCase();
+                        if (v.startsWith("s3://") && importAuthMode === "none") setImportAuthMode("aws");
+                        else if (v.startsWith("gs://") && importAuthMode === "none") setImportAuthMode("gcp");
+                        else if ((v.startsWith("az://") || v.startsWith("abfss://")) && importAuthMode === "none") setImportAuthMode("azure");
+                        if (!tableName && v) {
+                          const base = e.target.value.split("?")[0].split("/").pop() || "";
+                          setTableName(base.replace(/(\.(gz|zip|csv|tsv|json|jsonl|ndjson|parquet|avro|snappy))+$/i, ""));
+                        }
+                      }}
+                    />
+                    <div className="field-hint">
+                      Streamed straight into the ingestion spool - the file never passes through your browser. Up to{" "}
+                      {data.max_upload_mb >= 1024 ? `${(data.max_upload_mb / 1024).toFixed(0)} GB` : `${data.max_upload_mb} MB`}.
+                    </div>
+                  </div>
+                  <div className="field">
+                    <label>Credential</label>
+                    <select value={importAuthMode} onChange={(e) => setImportAuthMode(e.target.value as any)}>
+                      <option value="none">none (public object or presigned/signed URL)</option>
+                      <option value="bearer">https: bearer token (Databricks PAT / OAuth token)</option>
+                      <option value="header">https: API key in a named header</option>
+                      <option value="aws">S3: access key ID + secret (omit to use the pod's IAM role)</option>
+                      <option value="gcp">GCS: service-account JSON (omit to use Application Default Credentials)</option>
+                      <option value="azure">Azure: connection string, or account name + key/SAS</option>
+                    </select>
+                    <div className="field-hint">Used for the download only - never stored on the job or the document.</div>
+                  </div>
+                </div>
+                {importAuthMode !== "none" && (
+                  <div className="two-col">
+                    {importAuthMode === "aws" && (
+                      <>
+                        <div className="field">
+                          <label>Access key ID</label>
+                          <input type="text" value={importKeyId} onChange={(e) => setImportKeyId(e.target.value)} />
+                        </div>
+                        <div className="field">
+                          <label>Region (optional)</label>
+                          <input type="text" value={importRegion} placeholder="us-east-1" onChange={(e) => setImportRegion(e.target.value)} />
+                        </div>
+                      </>
+                    )}
+                    {importAuthMode === "header" && (
+                      <div className="field">
+                        <label>Header name</label>
+                        <input type="text" value={importHeaderName} onChange={(e) => setImportHeaderName(e.target.value)} />
+                      </div>
+                    )}
+                    {importAuthMode === "azure" && (
+                      <div className="field">
+                        <label>Storage account (when not using a connection string)</label>
+                        <input type="text" value={importAccount} onChange={(e) => setImportAccount(e.target.value)} />
+                      </div>
+                    )}
+                    <div className="field">
+                      <label>
+                        {importAuthMode === "gcp"
+                          ? "Service-account JSON"
+                          : importAuthMode === "azure"
+                            ? "Connection string, account key or SAS token"
+                            : importAuthMode === "aws"
+                              ? "Secret access key"
+                              : "Token"}
+                      </label>
+                      {importAuthMode === "gcp" ? (
+                        <textarea rows={3} value={importSecret} onChange={(e) => setImportSecret(e.target.value)} />
+                      ) : (
+                        <input type="password" autoComplete="new-password" value={importSecret} onChange={(e) => setImportSecret(e.target.value)} />
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="field">
+                  <div className="checkbox-row">
+                    <input type="checkbox" id="import-dump" checked={importIsDump} onChange={(e) => setImportIsDump(e.target.checked)} />
+                    <label htmlFor="import-dump" style={{ margin: 0, fontWeight: 400, color: "var(--text)" }}>
+                      This is a table export (parse rows; otherwise it is treated as a text document)
+                    </label>
+                  </div>
+                </div>
+                {importIsDump && (
+                  <>
+                    <div className="two-col">
+                      <div className="field">
+                        <label>Source</label>
+                        <select value={dumpSource} onChange={(e) => setDumpSource(e.target.value)}>
+                          {data.dump_sources.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.label}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="field-hint">{IMPORT_HELP[dumpSource] || IMPORT_HELP.other}</div>
+                      </div>
+                      <div className="field">
+                        <label>Table name</label>
+                        <input type="text" value={tableName} placeholder="e.g. SALES.PUBLIC.ORDERS" onChange={(e) => setTableName(e.target.value)} />
+                      </div>
+                    </div>
+                    <div className="two-col">
+                      <div className="field">
+                        <label>Header row (CSV/TSV)</label>
+                        <select value={headerMode} onChange={(e) => setHeaderMode(e.target.value as "auto" | "yes" | "no")}>
+                          <option value="auto">Auto-detect</option>
+                          <option value="yes">First row is the header</option>
+                          <option value="no">No header row</option>
+                        </select>
+                        {headerMode === "no" && (
+                          <input
+                            type="text"
+                            style={{ marginTop: 8 }}
+                            value={columnNames}
+                            placeholder="Column names, comma-separated (optional)"
+                            onChange={(e) => setColumnNames(e.target.value)}
+                          />
+                        )}
+                      </div>
+                      <div className="field">
+                        <label>Title (optional)</label>
+                        <input type="text" value={title} placeholder="defaults to the table name" onChange={(e) => setTitle(e.target.value)} />
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            ) : addMode === "dump" ? (
               <>
                 <div className="two-col">
                   <div className="field">
@@ -807,7 +1040,10 @@ export function KnowledgePage() {
                     />
                     <div className="field-hint">
                       CSV/TSV, newline-delimited JSON, Parquet or Avro - gzip-compressed, or several files zipped
-                      together. Up to {data.max_upload_mb} MB and {data.max_dump_rows.toLocaleString()} rows.
+                      together. Up to{" "}
+                      {data.max_upload_mb >= 1024 ? `${(data.max_upload_mb / 1024).toFixed(0)} GB` : `${data.max_upload_mb} MB`}
+                      , streamed and indexed in the background - no row limit. For files already in S3, GCS or Azure,
+                      &ldquo;Import from cloud storage&rdquo; above skips the browser entirely.
                     </div>
                   </div>
                 </div>
@@ -935,20 +1171,176 @@ export function KnowledgePage() {
               </div>
             </div>
 
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={uploading || allowedRoles.length === 0 || setId === NEW_SET || (addMode === "dump" && !file)}
-            >
-              {uploading
-                ? addMode === "dump"
-                  ? "Parsing rows and embedding..."
-                  : "Chunking and embedding..."
-                : addMode === "dump"
-                  ? "Import data dump"
-                  : "Ingest document"}
-            </button>
+            <div className="flex-row" style={{ gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                className="btn btn-primary"
+                type="submit"
+                disabled={
+                  uploading ||
+                  allowedRoles.length === 0 ||
+                  setId === NEW_SET ||
+                  (addMode === "dump" && !file) ||
+                  (addMode === "import" && !importUri.trim())
+                }
+              >
+                {uploading
+                  ? uploadProgress
+                    ? `Uploading ${fmtBytes(uploadProgress.sent)} of ${fmtBytes(uploadProgress.total)}...`
+                    : addMode === "import"
+                      ? "Queueing import..."
+                      : "Chunking and embedding..."
+                  : addMode === "import"
+                    ? "Queue import"
+                    : addMode === "dump"
+                      ? "Upload and index data dump"
+                      : file
+                        ? "Upload and index document"
+                        : "Ingest text"}
+              </button>
+              {uploadProgress && (
+                <>
+                  <div style={{ flex: 1, minWidth: 160, height: 8, borderRadius: 4, background: "var(--surface-2, rgba(128,128,128,0.18))", overflow: "hidden" }}>
+                    <div
+                      style={{
+                        height: "100%",
+                        width: `${uploadProgress.total ? Math.min(100, Math.round((uploadProgress.sent / uploadProgress.total) * 100)) : 0}%`,
+                        background: "var(--accent, #4a9d8e)",
+                      }}
+                    />
+                  </div>
+                  <button type="button" className="btn btn-secondary btn-sm" onClick={() => uploadAbort.current?.abort()}>
+                    Cancel upload
+                  </button>
+                </>
+              )}
+            </div>
           </form>
+
+          <h2 style={{ fontSize: 16, margin: "22px 0 4px 0" }}>Ingestion jobs</h2>
+          <p className="cell-muted" style={{ fontSize: 12.5, margin: "0 0 14px 0" }}>
+            Every file upload and cloud import runs as a background job: spooled to disk, then parsed, embedded in
+            batches of {data.ingest.batch_chunks} chunks and written to Couchbase, {data.ingest.concurrency} at a time.
+            A cancelled or failed job removes everything it had indexed. Spool: {fmtBytes(data.ingest.spool_used_bytes)}{" "}
+            in use{data.ingest.spool_free_bytes != null ? `, ${fmtBytes(data.ingest.spool_free_bytes)} free` : ""}.
+          </p>
+          <div className="card" style={{ marginBottom: 24 }}>
+            {jobs.length === 0 ? (
+              <div className="empty-state">No ingestion jobs yet.</div>
+            ) : (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>File</th>
+                      <th>Status</th>
+                      <th style={{ minWidth: 220 }}>Progress</th>
+                      <th style={{ textAlign: "right" }}>Rows</th>
+                      <th style={{ textAlign: "right" }}>Chunks</th>
+                      <th>Started</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {jobs.map((j) => {
+                      const active = JOB_ACTIVE.has(j.status);
+                      const pct =
+                        j.status === "done"
+                          ? 100
+                          : j.status === "uploading" || j.status === "downloading"
+                            ? j.bytes_total
+                              ? Math.min(99, Math.round((j.bytes_received / j.bytes_total) * 100))
+                              : null
+                            : j.progress.percent;
+                      const badge =
+                        j.status === "done"
+                          ? "badge-success"
+                          : j.status === "failed"
+                            ? "badge-danger"
+                            : j.status === "cancelled"
+                              ? "badge-neutral"
+                              : "badge-medium";
+                      return (
+                        <tr key={j.job_id}>
+                          <td>
+                            <div className="cell-mono" style={{ fontSize: 12 }}>
+                              {j.job_id}
+                            </div>
+                            <div className="cell-muted" style={{ fontSize: 11.5 }}>
+                              {j.kind === "import" ? "cloud import" : "upload"}
+                              {j.params.dump ? ` · ${j.params.dump.source} dump` : " · document"}
+                              {j.uploaded_by ? ` · ${j.uploaded_by}` : ""}
+                            </div>
+                          </td>
+                          <td>
+                            <div style={{ fontWeight: 600 }}>{j.params.title || j.filename}</div>
+                            <div className="cell-muted cell-mono" style={{ fontSize: 11.5, wordBreak: "break-all" }}>
+                              {j.source_uri ? j.source_uri.split("?")[0] : j.filename} · {fmtBytes(j.bytes_received || j.bytes_total)}
+                              {j.bytes_total && j.bytes_received < j.bytes_total ? ` of ${fmtBytes(j.bytes_total)}` : ""}
+                            </div>
+                          </td>
+                          <td>
+                            <span className={`badge ${badge}`}>{j.status === "running" ? j.phase : j.status}</span>
+                            {j.error && (
+                              <div className="cell-muted" style={{ fontSize: 11.5, maxWidth: 320, marginTop: 4, color: "var(--red-dim)" }}>
+                                {j.error}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            <div style={{ height: 6, borderRadius: 3, background: "var(--surface-2, rgba(128,128,128,0.18))", overflow: "hidden" }}>
+                              <div
+                                style={{
+                                  height: "100%",
+                                  width: `${pct ?? (active ? 15 : 0)}%`,
+                                  background: j.status === "failed" ? "var(--danger, #c0392b)" : "var(--accent, #4a9d8e)",
+                                  opacity: pct == null && active ? 0.5 : 1,
+                                }}
+                              />
+                            </div>
+                            <div className="cell-muted" style={{ fontSize: 11.5, marginTop: 3 }}>
+                              {pct != null ? `${pct}%` : active ? "working - row count unknown until the file is read through" : ""}
+                              {j.status === "done" && j.document_id ? ` · document ${j.document_id}` : ""}
+                            </div>
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {j.progress.rows_parsed ? j.progress.rows_parsed.toLocaleString() : "-"}
+                            {j.progress.rows_total ? ` / ${j.progress.rows_total.toLocaleString()}` : ""}
+                          </td>
+                          <td className="cell-mono" style={{ textAlign: "right" }}>
+                            {j.progress.chunks_written.toLocaleString()}
+                          </td>
+                          <td className="cell-muted" style={{ fontSize: 12 }}>
+                            {(j.started_at || j.created_at).replace("T", " ").replace("Z", "")}
+                          </td>
+                          <td style={{ whiteSpace: "nowrap" }}>
+                            <div className="flex-row" style={{ gap: 6 }}>
+                              {active ? (
+                                <button className="btn btn-danger-outline btn-sm" disabled={jobBusy === j.job_id} onClick={() => handleJobAction(j, "cancel")}>
+                                  Cancel
+                                </button>
+                              ) : (
+                                <>
+                                  {j.status !== "done" && (
+                                    <button className="btn btn-secondary btn-sm" disabled={jobBusy === j.job_id} onClick={() => handleJobAction(j, "retry")}>
+                                      Retry
+                                    </button>
+                                  )}
+                                  <button className="btn btn-secondary btn-sm" disabled={jobBusy === j.job_id} onClick={() => handleJobAction(j, "delete")}>
+                                    Dismiss
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
 
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Try retrieval as an agent</h2>
           <form className="panel section-gap" onSubmit={handleSearch} style={{ marginBottom: 24 }}>

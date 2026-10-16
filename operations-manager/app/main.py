@@ -51,6 +51,7 @@ from app import (
     knowledge,
     knowledge_sets,
     hijack_detection,
+    ingest_jobs,
     insights,
     llm_cache,
     memory_consolidation,
@@ -93,6 +94,11 @@ from config import (
     KNOWLEDGE_CHUNK_CHARS,
     KNOWLEDGE_CHUNK_OVERLAP,
     KNOWLEDGE_MAX_UPLOAD_MB,
+    KNOWLEDGE_MAX_INLINE_MB,
+    KNOWLEDGE_SPOOL_DIR,
+    KNOWLEDGE_INGEST_CONCURRENCY,
+    KNOWLEDGE_INGEST_BATCH_CHUNKS,
+    KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
     MEMORY_SETTINGS_DOC,
     HIJACK_CHAIN_WINDOW_SECONDS,
     HIJACK_SCAN_INTERVAL_MINUTES,
@@ -197,6 +203,9 @@ KNOWLEDGE_INGEST_TIMEOUT_SECONDS = int(os.getenv("KNOWLEDGE_INGEST_TIMEOUT_SECON
 # Data dumps (app/data_dumps.py): rows parsed per upload, before the
 # per-document chunk cap applies.
 KNOWLEDGE_MAX_DUMP_ROWS = int(os.getenv("KNOWLEDGE_MAX_DUMP_ROWS", "100000"))
+# Whole-request ceiling on a streaming upload (POST /v1/knowledge/uploads):
+# 5 GB at 10 MB/s is ~9 minutes, at 1 MB/s ~90 minutes. Default 6 hours.
+KNOWLEDGE_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("KNOWLEDGE_UPLOAD_TIMEOUT_SECONDS", str(6 * 3600)))
 # Document expiry: how often expired documents are deleted. Retrieval hides
 # an expired chunk the moment it expires regardless; this only reclaims it.
 KNOWLEDGE_EXPIRY_SWEEP_SECONDS = int(os.getenv("KNOWLEDGE_EXPIRY_SWEEP_SECONDS", "300"))
@@ -281,6 +290,14 @@ async def agent_request_limits(request: Request, call_next):
             # for a document near the upload limit takes minutes, not
             # seconds; the dashboard ceiling would cut it off part-way.
             return await _with_deadline(request, call_next, KNOWLEDGE_INGEST_TIMEOUT_SECONDS)
+        if request.method == "POST" and path == "/v1/knowledge/uploads":
+            # A streaming upload runs for as long as the file takes to
+            # arrive - gigabytes over a slow link is hours. The body is
+            # written to disk as it comes and ingestion happens in a
+            # background job afterwards, so there is nothing to protect
+            # here with a deadline; nginx's own send/read timeouts on this
+            # location (ui/nginx.conf.template) bound a stalled connection.
+            return await _with_deadline(request, call_next, KNOWLEDGE_UPLOAD_TIMEOUT_SECONDS)
         return await _with_deadline(request, call_next, DASHBOARD_REQUEST_TIMEOUT_SECONDS)
 
     # Resolve the caller once and stash it, so authenticate() inside the
@@ -807,6 +824,7 @@ async def couchbase_startup():
     await _startup_step("load knowledge sets", load_knowledge_sets())
     await _startup_step("load RAG applications", load_rag_apps())
     spawn(knowledge_expiry_sweeper_loop())
+    await _startup_step("resume knowledge ingestion jobs", resume_ingest_jobs())
 
     if EVAL_SEED_STARTER_DATASET:
         await _startup_step("seed starter eval dataset", seed_starter_dataset())
@@ -5502,6 +5520,18 @@ async def list_knowledge(request: Request):
         "chunk_chars": KNOWLEDGE_CHUNK_CHARS,
         "chunk_overlap": KNOWLEDGE_CHUNK_OVERLAP,
         "max_upload_mb": KNOWLEDGE_MAX_UPLOAD_MB,
+        "max_inline_mb": KNOWLEDGE_MAX_INLINE_MB,
+        "ingest": {
+            "spool_dir": KNOWLEDGE_SPOOL_DIR,
+            "spool_free_bytes": ingest_spool.free_bytes() if ingest_spool else None,
+            "spool_used_bytes": ingest_spool.used_bytes() if ingest_spool else 0,
+            "concurrency": KNOWLEDGE_INGEST_CONCURRENCY,
+            "batch_chunks": KNOWLEDGE_INGEST_BATCH_CHUNKS,
+            "max_chunks_per_document": KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
+            "active_jobs": ingest_runner.active_count() if ingest_runner else 0,
+            "import_schemes": ["https", "s3", "gs", "az", "abfss"],
+        },
+        "jobs": [ingest_jobs.public_job(j) for j in await store.list_knowledge_jobs(limit=ingest_jobs.MAX_RECENT_JOBS)],
         "supported_extensions": list(knowledge.SUPPORTED_EXTENSIONS),
         "dump_extensions": list(data_dumps.DUMP_EXTENSIONS),
         "dump_sources": [{"id": k, "label": v} for k, v in data_dumps.SOURCES.items()],
@@ -5532,8 +5562,12 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
     kset = get_knowledge_set(req.set_id)
     expires_at = resolve_document_expiry(req.ttl_seconds, req.expires_at)
 
-    if len(req.content.encode("utf-8")) > KNOWLEDGE_MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Document is larger than the {KNOWLEDGE_MAX_UPLOAD_MB}MB limit")
+    if len(req.content.encode("utf-8")) > KNOWLEDGE_MAX_INLINE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Inline documents are limited to {KNOWLEDGE_MAX_INLINE_MB}MB - use the streaming upload "
+                   f"(POST /v1/knowledge/uploads, up to {KNOWLEDGE_MAX_UPLOAD_MB}MB) for larger files",
+        )
 
     if req.encoding == "base64":
         try:
@@ -5661,6 +5695,296 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
         document_id, len(chunks), len(text), int((time.time() - start) * 1000),
     )
     return {"document": doc}
+
+
+# ---------------------------------------------------------------------------
+# Streaming uploads, cloud imports and background ingestion jobs
+# (see app/ingest_jobs.py)
+# ---------------------------------------------------------------------------
+ingest_spool: ingest_jobs.Spool | None = None
+ingest_runner: ingest_jobs.IngestRunner | None = None
+
+
+def _ingest_runner() -> ingest_jobs.IngestRunner:
+    global ingest_spool, ingest_runner
+    if ingest_runner is None:
+        ingest_spool = ingest_jobs.Spool(KNOWLEDGE_SPOOL_DIR)
+        ingest_runner = ingest_jobs.IngestRunner(
+            spool=ingest_spool, store=store, embedder_for=embedder_for, get_knowledge_set=get_knowledge_set,
+            chunk_chars=KNOWLEDGE_CHUNK_CHARS, chunk_overlap=KNOWLEDGE_CHUNK_OVERLAP,
+            batch_chunks=KNOWLEDGE_INGEST_BATCH_CHUNKS, max_chunks_per_document=KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
+            max_upload_bytes=KNOWLEDGE_MAX_UPLOAD_MB * 1024 * 1024, concurrency=KNOWLEDGE_INGEST_CONCURRENCY,
+            on_document_ingested=bump_knowledge_generation, spawn=spawn,
+        )
+    return ingest_runner
+
+
+async def resume_ingest_jobs():
+    runner = _ingest_runner()
+    resumed = await runner.resume()
+    logger.info("Knowledge ingestion: spool %s, %d job(s) resumed", KNOWLEDGE_SPOOL_DIR, resumed)
+
+
+def _ingest_params_from_query(
+    *, title: str | None, allowed_roles: str | None, set_id: str | None, dump_source: str | None,
+    table_name: str | None, header: str | None, column_names: str | None, ttl_seconds: int | None,
+    expires_at: str | None, metadata: str | None,
+) -> dict:
+    """Validate the ingest options that ride on a streaming upload as query
+    parameters (the body is the file). Same rules as the inline path."""
+    roles_ = [r.strip() for r in (allowed_roles or "").split(",") if r.strip()]
+    unknown = [r for r in roles_ if r not in ROLES]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown role(s): {unknown}")
+    if not roles_:
+        raise HTTPException(status_code=400, detail="allowed_roles is required - a document no role can read is permanently invisible")
+    kset = get_knowledge_set(set_id)
+    params: dict = {
+        "title": (title or "").strip()[:300],
+        "allowed_roles": roles_,
+        "set_id": kset["set_id"],
+        "expires_at": resolve_document_expiry(ttl_seconds, expires_at),
+        "metadata": {},
+    }
+    if metadata:
+        try:
+            md = json.loads(metadata)
+            if isinstance(md, dict):
+                params["metadata"] = {str(k)[:120]: str(v)[:500] for k, v in list(md.items())[:20]}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="metadata must be a JSON object") from exc
+    if dump_source:
+        src = dump_source.strip().lower()
+        if src not in data_dumps.SOURCES:
+            raise HTTPException(status_code=400, detail=f"Unknown dump source '{src}'")
+        hdr = None if header in (None, "", "auto", "null") else str(header).lower() in ("1", "true", "yes")
+        params["dump"] = {
+            "source": src,
+            "table_name": (table_name or "").strip()[:200] or None,
+            "header": hdr,
+            "column_names": [c.strip() for c in (column_names or "").split(",") if c.strip()],
+        }
+    return params
+
+
+@app.post("/v1/knowledge/uploads", status_code=202)
+async def upload_knowledge_stream(
+    request: Request,
+    filename: str,
+    title: str | None = None,
+    allowed_roles: str | None = None,
+    set_id: str | None = None,
+    dump_source: str | None = None,
+    table_name: str | None = None,
+    header: str | None = None,
+    column_names: str | None = None,
+    ttl_seconds: int | None = None,
+    expires_at: str | None = None,
+    metadata: str | None = None,
+):
+    """Streaming upload: the request body IS the file (no base64, no JSON
+    envelope), written straight to the spool as it arrives, then ingested
+    by a background job. Returns the job at once (202). From a browser,
+    `fetch(url, {method: "POST", body: file})` streams a File; from a
+    shell, `curl --data-binary @export.csv.gz`."""
+    user = require_admin(request)
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    runner = _ingest_runner()
+    params = _ingest_params_from_query(
+        title=title or filename, allowed_roles=allowed_roles, set_id=set_id, dump_source=dump_source,
+        table_name=table_name, header=header, column_names=column_names, ttl_seconds=ttl_seconds,
+        expires_at=expires_at, metadata=metadata,
+    )
+    limit = KNOWLEDGE_MAX_UPLOAD_MB * 1024 * 1024
+    declared = request.headers.get("content-length")
+    bytes_total = int(declared) if declared and declared.isdigit() else None
+    if bytes_total and bytes_total > limit:
+        raise HTTPException(status_code=413, detail=f"That file is larger than the {KNOWLEDGE_MAX_UPLOAD_MB}MB upload limit")
+    free = ingest_spool.free_bytes() if ingest_spool else None
+    if free is not None and bytes_total and free < bytes_total + (64 << 20):
+        raise HTTPException(status_code=507, detail=f"Not enough spool space: {free // (1 << 20)}MB free at {KNOWLEDGE_SPOOL_DIR}, "
+                                                    f"{bytes_total // (1 << 20)}MB needed")
+
+    job = ingest_jobs.new_job(kind="upload", params=params, filename=filename, source_uri=None,
+                              bytes_total=bytes_total, uploaded_by=user.get("username"))
+    await store.upsert_knowledge_job(job)
+    path = ingest_spool.path(job["job_id"])
+    received = 0
+    last_flush = time.time()
+    try:
+        with open(path, "wb") as out:
+            async for block in request.stream():
+                if not block:
+                    continue
+                received += len(block)
+                if received > limit:
+                    raise HTTPException(status_code=413, detail=f"That file is larger than the {KNOWLEDGE_MAX_UPLOAD_MB}MB upload limit")
+                # One blocking write per 1 MB block off the loop; the loop
+                # keeps serving everything else while 5 GB arrives.
+                await asyncio.to_thread(out.write, block)
+                if time.time() - last_flush > ingest_jobs.PROGRESS_FLUSH_SECONDS:
+                    last_flush = time.time()
+                    job["bytes_received"] = received
+                    job["updated_at"] = ingest_jobs.now_iso()
+                    await store.upsert_knowledge_job(job)
+    except BaseException as exc:
+        ingest_spool.remove(job["job_id"])
+        job.update(status="failed", phase="failed", finished_at=ingest_jobs.now_iso(), updated_at=ingest_jobs.now_iso(),
+                   error=(exc.detail if isinstance(exc, HTTPException) else "the upload was interrupted")[:500])
+        await store.upsert_knowledge_job(job)
+        raise
+    if received == 0:
+        ingest_spool.remove(job["job_id"])
+        job.update(status="failed", phase="failed", error="the uploaded body was empty", finished_at=ingest_jobs.now_iso())
+        await store.upsert_knowledge_job(job)
+        raise HTTPException(status_code=400, detail="The uploaded body was empty")
+    job.update(status="queued", phase="queued", bytes_received=received, bytes_total=bytes_total or received,
+               updated_at=ingest_jobs.now_iso())
+    await store.upsert_knowledge_job(job)
+    runner.enqueue(job)
+    await store.log_access(
+        action="knowledge.upload", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW",
+        reason=f"streamed {received} byte(s) of '{filename}' into job {job['job_id']}", latency_ms=0,
+    )
+    return {"job": ingest_jobs.public_job(job)}
+
+
+class KnowledgeImportRequest(BaseModel):
+    """Ingest an object from cloud storage or a URL. `auth` is used for the
+    download only and is never stored on the finished job:
+      https: {"mode": "none"|"bearer"|"header"|"basic", "secret", "header_name", "username"}
+      s3:    {"access_key_id", "secret", "session_token", "region", "endpoint_url"} (all optional - env/IRSA otherwise)
+      gs:    {"service_account_json"} (optional - Application Default Credentials otherwise)
+      az:    {"connection_string"} or {"account", "secret"} (account key or SAS token)"""
+    uri: str
+    auth: dict = Field(default_factory=dict)
+    filename: str | None = None
+    title: str | None = None
+    allowed_roles: list[str] = Field(default_factory=list)
+    set_id: str | None = None
+    dump: dict | None = None
+    ttl_seconds: int | None = None
+    expires_at: str | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
+@app.post("/v1/knowledge/imports", status_code=202)
+async def import_knowledge(req: KnowledgeImportRequest, request: Request):
+    """Queue an import from s3://, gs://, az://, abfss:// or https://. The
+    object is streamed into the spool by the job itself, so the request
+    returns immediately with the job to poll."""
+    user = require_admin(request)
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    runner = _ingest_runner()
+    uri = req.uri.strip()
+    scheme = (uri.split("://", 1)[0] if "://" in uri else "").lower()
+    if scheme not in ("http", "https", "s3", "gs", "az", "abfss", "wasbs"):
+        raise HTTPException(status_code=400, detail="uri must start with https://, s3://, gs://, az:// or abfss://")
+    filename = (req.filename or "").strip() or os.path.basename(uri.split("?", 1)[0].rstrip("/")) or "import"
+    dump = req.dump or {}
+    params = _ingest_params_from_query(
+        title=req.title or filename, allowed_roles=",".join(req.allowed_roles), set_id=req.set_id,
+        dump_source=dump.get("source"), table_name=dump.get("table_name"),
+        header=None if dump.get("header") is None else str(dump.get("header")),
+        column_names=",".join(dump.get("column_names") or []), ttl_seconds=req.ttl_seconds, expires_at=req.expires_at,
+        metadata=json.dumps(req.metadata) if req.metadata else None,
+    )
+    if req.auth:
+        params["auth"] = {str(k)[:40]: str(v)[:8000] for k, v in req.auth.items()}
+    job = ingest_jobs.new_job(kind="import", params=params, filename=filename, source_uri=uri,
+                              bytes_total=None, uploaded_by=user.get("username"))
+    await store.upsert_knowledge_job(job)
+    runner.enqueue(job)
+    await store.log_access(
+        action="knowledge.import", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason=f"import of {uri.split('?')[0][:300]} queued as job {job['job_id']}",
+        latency_ms=0,
+    )
+    return {"job": ingest_jobs.public_job(job)}
+
+
+@app.get("/v1/knowledge/jobs")
+async def list_knowledge_jobs(request: Request, limit: int = 50):
+    require_admin(request)
+    jobs = await store.list_knowledge_jobs(limit=max(1, min(limit, 200)))
+    return {"jobs": [ingest_jobs.public_job(j) for j in jobs], "active": _ingest_runner().active_count()}
+
+
+@app.get("/v1/knowledge/jobs/{job_id}")
+async def get_knowledge_job(job_id: str, request: Request):
+    require_admin(request)
+    job = await store.get_knowledge_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job")
+    return {"job": ingest_jobs.public_job(job)}
+
+
+@app.post("/v1/knowledge/jobs/{job_id}/cancel")
+async def cancel_knowledge_job(job_id: str, request: Request):
+    """Stop a job. Chunks it already wrote are deleted; the spooled file
+    is removed. A job that has finished cannot be cancelled."""
+    user = require_admin(request)
+    job = await store.get_knowledge_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job")
+    if job["status"] not in ingest_jobs.ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Job is already {job['status']}")
+    _ingest_runner().cancel(job_id)
+    if job["status"] in ("uploading",):
+        # The upload handler will see the flag only once the body is in;
+        # mark it now so the UI reflects the intent.
+        job.update(status="cancelled", phase="cancelled", error="cancelled by an operator", finished_at=ingest_jobs.now_iso())
+        await store.upsert_knowledge_job(job)
+    await store.log_access(
+        action="knowledge.job.cancel", role=user.get("role"), subject_label=user.get("username"), query=None,
+        tool_id=None, server_id=None, decision="ALLOW", reason=f"job {job_id} cancelled", latency_ms=0,
+    )
+    return {"job": ingest_jobs.public_job(await store.get_knowledge_job(job_id) or job)}
+
+
+@app.post("/v1/knowledge/jobs/{job_id}/retry")
+async def retry_knowledge_job(job_id: str, request: Request):
+    """Re-run a failed or cancelled job. An upload can be retried only
+    while its spooled file is still there; an import re-downloads but
+    needs the credential again (it is never kept)."""
+    require_admin(request)
+    job = await store.get_knowledge_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job")
+    if job["status"] in ingest_jobs.ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="Job is still active")
+    runner = _ingest_runner()
+    if job["kind"] == "upload" and not ingest_spool.exists(job_id):
+        raise HTTPException(status_code=409, detail="The spooled file is gone - upload it again")
+    if job["kind"] == "import" and job.get("params", {}).get("auth") is None and job.get("status") != "cancelled":
+        pass  # public buckets / presigned URLs need no credential; a failed credential shows up as a new failure
+    if job.get("document_id"):
+        await store.delete_knowledge_document(job["document_id"])
+    job.update(status="queued", phase="queued", document_id=None, error=None, finished_at=None,
+               updated_at=ingest_jobs.now_iso())
+    job["progress"] = {"rows_parsed": 0, "chunks_written": 0, "chunks_estimated": None, "files": 1, "percent": None}
+    if job["kind"] == "import":
+        job["bytes_received"] = 0
+    await store.upsert_knowledge_job(job)
+    runner.enqueue(job)
+    return {"job": ingest_jobs.public_job(job)}
+
+
+@app.delete("/v1/knowledge/jobs/{job_id}")
+async def delete_knowledge_job(job_id: str, request: Request):
+    """Remove a finished job's record (the document it produced stays)."""
+    require_admin(request)
+    job = await store.get_knowledge_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job")
+    if job["status"] in ingest_jobs.ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="Cancel the job before deleting it")
+    ingest_spool.remove(job_id)
+    await store.delete_knowledge_job(job_id)
+    return {"deleted": True, "job_id": job_id}
 
 
 @app.delete("/v1/knowledge/{document_id}")

@@ -1083,11 +1083,60 @@ export interface KnowledgeResponse {
   chunk_chars: number;
   chunk_overlap: number;
   max_upload_mb: number;
+  max_inline_mb: number;
+  ingest: {
+    spool_dir: string;
+    spool_free_bytes: number | null;
+    spool_used_bytes: number;
+    concurrency: number;
+    batch_chunks: number;
+    max_chunks_per_document: number;
+    active_jobs: number;
+    import_schemes: string[];
+  };
+  jobs: KnowledgeJob[];
   supported_extensions: string[];
   dump_extensions: string[];
   dump_sources: Array<{ id: string; label: string }>;
   max_dump_rows: number;
   expiry_sweep_seconds: number;
+}
+
+export type KnowledgeJobStatus = "uploading" | "queued" | "downloading" | "running" | "done" | "failed" | "cancelled";
+
+/** A background ingestion job (streaming upload or cloud import) - see
+ *  operations-manager/app/ingest_jobs.py. */
+export interface KnowledgeJob {
+  job_id: string;
+  kind: "upload" | "import";
+  status: KnowledgeJobStatus;
+  phase: string;
+  filename: string;
+  source_uri: string | null;
+  bytes_total: number | null;
+  bytes_received: number;
+  params: {
+    title?: string;
+    allowed_roles?: string[];
+    set_id?: string;
+    expires_at?: string | null;
+    dump?: { source: string; table_name?: string | null; header?: boolean | null; column_names?: string[] } | null;
+  };
+  progress: {
+    rows_parsed: number;
+    rows_total?: number;
+    chunks_written: number;
+    chunks_estimated: number | null;
+    files: number;
+    percent: number | null;
+  };
+  document_id: string | null;
+  error: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
 }
 
 export interface KnowledgeChunkResult {

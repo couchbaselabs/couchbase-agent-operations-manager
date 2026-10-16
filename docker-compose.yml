@@ -233,7 +233,14 @@ services:
       EVAL_RUN_HISTORY: ${EVAL_RUN_HISTORY:-50}
       KNOWLEDGE_CHUNK_CHARS: ${KNOWLEDGE_CHUNK_CHARS:-1200}
       KNOWLEDGE_CHUNK_OVERLAP: ${KNOWLEDGE_CHUNK_OVERLAP:-200}
-      KNOWLEDGE_MAX_UPLOAD_MB: ${KNOWLEDGE_MAX_UPLOAD_MB:-20}
+      # Streaming uploads / cloud imports (app/ingest_jobs.py): spooled to
+      # the knowledge-spool volume below, ingested by a background job.
+      KNOWLEDGE_MAX_UPLOAD_MB: ${KNOWLEDGE_MAX_UPLOAD_MB:-5120}
+      KNOWLEDGE_MAX_INLINE_MB: ${KNOWLEDGE_MAX_INLINE_MB:-20}
+      KNOWLEDGE_SPOOL_DIR: /app/spool/knowledge
+      KNOWLEDGE_INGEST_CONCURRENCY: ${KNOWLEDGE_INGEST_CONCURRENCY:-1}
+      KNOWLEDGE_INGEST_BATCH_CHUNKS: ${KNOWLEDGE_INGEST_BATCH_CHUNKS:-256}
+      KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT: ${KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT:-2000000}
       AGENT_KEY_ROTATION_GRACE_SECONDS: ${AGENT_KEY_ROTATION_GRACE_SECONDS:-3600}
       HIJACK_CHAIN_WINDOW_SECONDS: ${HIJACK_CHAIN_WINDOW_SECONDS:-120}
       # Local dashboard login (see operations-manager/app/user_auth.py).
@@ -281,6 +288,11 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - hf-cache:/home/appuser/.cache/huggingface
+      # Spool for streaming Knowledge Base uploads and cloud imports - a
+      # job's file lives here until it is fully ingested, so a queued job
+      # survives a container restart. Size it for KNOWLEDGE_MAX_UPLOAD_MB
+      # times the number of uploads in flight.
+      - knowledge-spool:/app/spool/knowledge
       # HTTPS certificate storage, shared with the `ui` service's
       # /etc/nginx/tls below - one certificate, installed once, serves
       # both the API and the dashboard. Starts out populated with the
@@ -407,6 +419,7 @@ services:
 volumes:
   couchbase-data:
   hf-cache:
+  knowledge-spool:
   tls-shared:
   prometheus-data:
   grafana-data:

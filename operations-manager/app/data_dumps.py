@@ -30,6 +30,17 @@ Formats - what Snowflake, Databricks and BigQuery actually export:
 Nothing here talks to Couchbase or embeds anything; app/main.py feeds the
 chunks this returns into the normal ingest path (roles, knowledge set,
 embedding, expiry).
+
+Two entry points:
+
+  * parse_dump(raw_bytes, ...) / chunk_table(parsed, ...) - the original
+    in-memory path, still used by the small inline POST /v1/knowledge
+    upload (bounded by KNOWLEDGE_MAX_INLINE_MB).
+  * open_dump(path, ...) -> DumpReader, and chunk_table_stream(reader, ...)
+    - the streaming path behind background ingestion jobs
+    (app/ingest_jobs.py). Rows are read from the spooled file in batches
+    and never all held at once, so a multi-gigabyte unload costs the same
+    memory as a small one: one batch of rows plus one batch of chunks.
 """
 import csv
 import datetime as _dt
@@ -323,3 +334,326 @@ def chunk_table(parsed: dict, *, source: str, table_name: str, chunk_chars: int,
     if len(chunks) > max_chunks:
         chunks = chunks[:max_chunks]
     return chunks, rows_indexed
+
+
+# ---------------------------------------------------------------------------
+# Streaming reader (background ingestion of large exports)
+# ---------------------------------------------------------------------------
+import os as _os
+import tempfile as _tempfile
+from typing import Iterator
+
+
+class DumpReader:
+    """One export - a single file, a gzip, or a zip of part files - read
+    from disk as an iterator of row dicts. `open()` establishes the format,
+    columns and types from the first part (and a row-count estimate where
+    the format carries one); `rows()` then streams every part in order.
+
+    Memory stays bounded by the batch size regardless of file size: CSV
+    and JSON lines are read line by line, Parquet via row-group batches,
+    Avro record by record, gzip through a streaming decompressor, and zip
+    members through zipfile's streaming reader (compressed members are
+    inflated on the fly; gzip-inside-zip is spooled to a temp file first).
+    """
+
+    def __init__(self, path: str, filename: str, *, header: bool | None = None,
+                 column_names: list[str] | None = None):
+        self.path = path
+        self.name = filename or _os.path.basename(path) or "dump"
+        self.header = header
+        self.column_names = [c.strip() for c in (column_names or []) if c and c.strip()]
+        self.format: str = ""
+        self.columns: list[str] = []
+        self.column_types: dict[str, str] = {}
+        self.total_rows: int | None = None  # known up front for Parquet/Avro only
+        self.files = 1
+        self.notes: list[str] = []
+        self._parts: list[tuple[str, str]] = []  # (member name, "zip"|"file")
+        self._zip: zipfile.ZipFile | None = None
+        self._delimiter: str | None = None
+        self.rows_read = 0
+
+    # -- opening --------------------------------------------------------------
+    def open(self) -> "DumpReader":
+        size = _os.path.getsize(self.path)
+        if size == 0:
+            raise DumpError("That file is empty")
+        with open(self.path, "rb") as fh:
+            magic = fh.read(4)
+        if magic == b"PK\x03\x04" or self.name.lower().endswith(".zip"):
+            try:
+                self._zip = zipfile.ZipFile(self.path)
+            except zipfile.BadZipFile as exc:
+                raise DumpError(f"Couldn't open that zip: {exc}") from exc
+            members = sorted(n for n in self._zip.namelist() if not n.endswith("/"))
+            if any("_delta_log/" in n for n in members):
+                self.notes.append(
+                    "A Delta _delta_log was found and ignored. Raw Delta data files can include rows removed by "
+                    "later table versions - for an exact snapshot, export with df.write.parquet(...) instead."
+                )
+            parts = [n for n in members if "_delta_log/" not in n and not _SKIP_NAMES.search(n)]
+            if not parts:
+                raise DumpError("The zip doesn't contain any data files")
+            self._parts = [(n, "zip") for n in parts]
+            self.files = len(parts)
+        else:
+            self._parts = [(self.name, "file")]
+        # Format, columns and types come from the first part.
+        first_name, kind = self._parts[0]
+        with self._open_part(first_name, kind) as (fh, name):
+            head = fh.read(4096)
+            fmt = _detect_format(head, name)
+            self.format = fmt
+            if fmt == "parquet":
+                self._open_parquet_meta(first_name, kind)
+            elif fmt == "avro":
+                self._open_avro_meta(first_name, kind)
+            elif fmt == "json":
+                self._open_json_meta(head, fh)
+            else:
+                self._open_delimited_meta(head, fh, fmt)
+        if not self.columns:
+            raise DumpError("No columns found in that file")
+        if len(self.columns) > MAX_COLUMNS:
+            self.notes.append(f"Only the first {MAX_COLUMNS} of {len(self.columns)} columns were indexed.")
+            self.columns = self.columns[:MAX_COLUMNS]
+        return self
+
+    class _PartHandle:
+        def __init__(self, fh, name, cleanup=None):
+            self.fh, self.name, self._cleanup = fh, name, cleanup
+
+        def __enter__(self):
+            return self.fh, self.name
+
+        def __exit__(self, *exc):
+            try:
+                self.fh.close()
+            finally:
+                if self._cleanup:
+                    self._cleanup()
+
+    def _open_part(self, name: str, kind: str):
+        """A binary, seekable-enough handle for one part, transparently
+        gunzipped. Returns a context manager yielding (fh, logical name)."""
+        if kind == "zip":
+            raw = self._zip.open(name)  # type: ignore[union-attr]
+        else:
+            raw = open(self.path, "rb")
+        magic = raw.read(2)
+        if hasattr(raw, "seek") and kind != "zip":
+            raw.seek(0)
+        else:
+            raw.close()
+            raw = self._zip.open(name)  # type: ignore[union-attr]
+        if magic == b"\x1f\x8b":
+            logical = re.sub(r"\.gz$", "", name, flags=re.IGNORECASE)
+            if kind == "zip":
+                # zipfile's member stream is not seekable; spool the
+                # gunzipped bytes so Parquet/Avro readers can seek.
+                tmp = _tempfile.NamedTemporaryFile(delete=False, dir=_os.path.dirname(self.path))
+                with gzip.GzipFile(fileobj=raw) as gz:
+                    while True:
+                        block = gz.read(1 << 20)
+                        if not block:
+                            break
+                        tmp.write(block)
+                raw.close()
+                tmp.close()
+                fh = open(tmp.name, "rb")
+                return self._PartHandle(fh, logical, cleanup=lambda: _os.unlink(tmp.name))
+            return self._PartHandle(gzip.GzipFile(fileobj=raw), logical, cleanup=raw.close)
+        if magic == b"\x28\xb5":
+            raise DumpError(f"'{name}' is zstd-compressed - re-export with gzip or no compression")
+        return self._PartHandle(raw, name)
+
+    def _open_delimited_meta(self, head: bytes, fh, fmt: str):
+        sample = _decode(head + fh.read(20000))
+        if fmt == "tsv":
+            self._delimiter = "\t"
+        else:
+            try:
+                self._delimiter = csv.Sniffer().sniff(sample, delimiters=",\t|;").delimiter
+            except csv.Error:
+                self._delimiter = ","
+        header = self.header
+        if header is None and not self.column_names:
+            try:
+                header = csv.Sniffer().has_header(sample)
+            except csv.Error:
+                header = True
+        self.header = bool(header)
+        reader = csv.reader(io.StringIO(sample), delimiter=self._delimiter)
+        first = next(reader, [])
+        if self.column_names:
+            self.columns = list(self.column_names)
+        elif self.header:
+            self.columns = [c.strip() for c in first]
+        else:
+            self.columns = [f"column_{i + 1}" for i in range(len(first))]
+
+    def _open_json_meta(self, head: bytes, fh):
+        text = _decode(head).lstrip()
+        if text.startswith("["):
+            # A single top-level array cannot be streamed line by line; only
+            # a small one is accepted (json.load of the whole part).
+            raise DumpError(
+                "This JSON file is one top-level array. Export newline-delimited JSON (one object per line) "
+                "for large tables - BigQuery: NEWLINE_DELIMITED_JSON; Snowflake: FILE_FORMAT TYPE=JSON; "
+                "Databricks: df.write.json(...)."
+            )
+        sample = head + fh.read(1 << 20)
+        cols: list[str] = []
+        for line in _decode(sample).splitlines()[:2000]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue  # the last line of the sample is usually cut
+            if isinstance(rec, dict):
+                for k in rec:
+                    if k not in cols:
+                        cols.append(k)
+            elif "value" not in cols:
+                cols.append("value")
+        self.columns = cols
+
+    def _open_parquet_meta(self, name: str, kind: str):
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise DumpError("Parquet support needs 'pyarrow', which isn't installed in this image") from exc
+        total = 0
+        for pname, pkind in self._parts:
+            with self._open_part(pname, pkind) as (fh, _):
+                try:
+                    pf = pq.ParquetFile(fh)
+                except Exception as exc:  # noqa: BLE001
+                    raise DumpError(f"Couldn't read Parquet file '{pname}': {exc}") from exc
+                if not self.columns:
+                    self.columns = list(pf.schema_arrow.names)
+                    self.column_types = {f.name: str(f.type) for f in pf.schema_arrow}
+                total += pf.metadata.num_rows
+        self.total_rows = total
+
+    def _open_avro_meta(self, name: str, kind: str):
+        try:
+            import fastavro
+        except ImportError as exc:
+            raise DumpError("Avro support needs 'fastavro', which isn't installed in this image") from exc
+        with self._open_part(name, kind) as (fh, _):
+            try:
+                reader = fastavro.reader(fh)
+            except Exception as exc:  # noqa: BLE001
+                raise DumpError(f"Couldn't read that Avro file: {exc}") from exc
+            schema = reader.writer_schema or {}
+        fields = schema.get("fields") or []
+        self.columns = [f["name"] for f in fields]
+        self.column_types = {
+            f["name"]: (f["type"] if isinstance(f["type"], str) else json.dumps(f["type"])[:60]) for f in fields
+        }
+
+    # -- rows ----------------------------------------------------------------
+    def rows(self) -> Iterator[dict]:
+        for pname, pkind in self._parts:
+            with self._open_part(pname, pkind) as (fh, logical):
+                fmt = self.format
+                if fmt == "parquet":
+                    import pyarrow.parquet as pq
+                    pf = pq.ParquetFile(fh)
+                    for batch in pf.iter_batches(batch_size=4096, columns=[c for c in self.columns if c in pf.schema_arrow.names] or None):
+                        for row in batch.to_pylist():
+                            self.rows_read += 1
+                            yield row
+                elif fmt == "avro":
+                    import fastavro
+                    for rec in fastavro.reader(fh):
+                        self.rows_read += 1
+                        yield rec if isinstance(rec, dict) else {"value": rec}
+                elif fmt == "json":
+                    text = io.TextIOWrapper(fh, encoding="utf-8", errors="replace")
+                    for lineno, line in enumerate(text, start=1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError as exc:
+                            raise DumpError(f"{logical} line {lineno} isn't valid JSON - expected one object per line: {exc}") from exc
+                        self.rows_read += 1
+                        yield rec if isinstance(rec, dict) else {"value": rec}
+                else:
+                    text = io.TextIOWrapper(fh, encoding="utf-8-sig", errors="replace", newline="")
+                    reader = csv.reader(text, delimiter=self._delimiter or ",")
+                    if self.header and not self.column_names:
+                        next(reader, None)
+                    elif self.header and self.column_names:
+                        next(reader, None)
+                    for row in reader:
+                        if not row or (len(row) == 1 and not row[0].strip()):
+                            continue
+                        self.rows_read += 1
+                        yield dict(zip(self.columns, row))
+
+    def close(self):
+        if self._zip is not None:
+            self._zip.close()
+
+
+def open_dump(path: str, filename: str, *, header: bool | None = None, column_names: list[str] | None = None) -> DumpReader:
+    return DumpReader(path, filename, header=header, column_names=column_names).open()
+
+
+def render_row(columns: list[str], row: dict, index: int, budget: int) -> str:
+    parts = []
+    for c in columns:
+        val = _render_value(row.get(c) if isinstance(row, dict) else None)
+        if val != "":
+            parts.append(f"{c}: {val}")
+    line = f"Row {index}: " + "; ".join(parts)
+    if len(line) > budget:
+        line = line[: budget - 3] + "..."
+    return line
+
+
+def table_header(source: str, table_name: str, columns: list[str], chunk_chars: int) -> str:
+    label = SOURCES.get(source, source or "Data")
+    header = f"{label} table {table_name} - columns: {', '.join(columns)}\n"
+    if len(header) > chunk_chars // 2:
+        header = f"{label} table {table_name}\n"
+    return header
+
+
+def schema_chunk(reader: DumpReader, *, source: str, table_name: str, chunk_chars: int, total_rows: int) -> str:
+    label = SOURCES.get(source, source or "Data")
+    types = reader.column_types or {}
+    col_desc = ", ".join(f"{c} ({types[c]})" if c in types else c for c in reader.columns)
+    text = (
+        f"{label} table export: {table_name}\n"
+        f"Rows: {total_rows:,} - format: {reader.format}"
+        + (f" - {reader.files} files" if reader.files > 1 else "")
+        + f"\nColumns ({len(reader.columns)}): {col_desc}"
+    )
+    return text[: max(chunk_chars, 2000)]
+
+
+def chunk_table_stream(reader: DumpReader, *, source: str, table_name: str, chunk_chars: int) -> Iterator[str]:
+    """Row-aware chunks from a DumpReader, one at a time. The schema chunk
+    is NOT included (the row count isn't known until the end for CSV/JSON)
+    - the caller adds schema_chunk() once rows_read is final."""
+    header = table_header(source, table_name, reader.columns, chunk_chars)
+    budget = max(chunk_chars - len(header), 200)
+    current: list[str] = []
+    size = 0
+    for i, row in enumerate(reader.rows(), start=1):
+        line = render_row(reader.columns, row, i, budget)
+        if current and size + len(line) + 1 > budget:
+            yield header + "\n".join(current)
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        yield header + "\n".join(current)

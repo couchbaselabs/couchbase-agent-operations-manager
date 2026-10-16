@@ -24,6 +24,7 @@ import type {
   ApprovalsResponse,
   KnowledgeChunkResult,
   KnowledgeDocument,
+  KnowledgeJob,
   KnowledgeResponse,
   KnowledgeSet,
   EmbeddingModelOption,
@@ -497,6 +498,79 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  /** Streaming upload: the File is the request body (the browser streams
+   *  it; nothing is read into memory), progress comes from XHR's upload
+   *  events, and the answer is a background job to poll. */
+  uploadKnowledgeStream: (
+    file: File,
+    options: {
+      title?: string;
+      allowed_roles: string[];
+      set_id?: string;
+      ttl_seconds?: number;
+      expires_at?: string;
+      dump?: { source: string; table_name?: string; header?: boolean | null; column_names?: string[] };
+    },
+    onProgress?: (sent: number, total: number) => void,
+    signal?: AbortSignal
+  ) =>
+    new Promise<{ job: KnowledgeJob }>((resolve, reject) => {
+      const q = new URLSearchParams();
+      q.set("filename", file.name);
+      if (options.title) q.set("title", options.title);
+      q.set("allowed_roles", options.allowed_roles.join(","));
+      if (options.set_id) q.set("set_id", options.set_id);
+      if (options.ttl_seconds) q.set("ttl_seconds", String(options.ttl_seconds));
+      if (options.expires_at) q.set("expires_at", options.expires_at);
+      if (options.dump) {
+        q.set("dump_source", options.dump.source);
+        if (options.dump.table_name) q.set("table_name", options.dump.table_name);
+        if (options.dump.header !== undefined && options.dump.header !== null) q.set("header", String(options.dump.header));
+        if (options.dump.column_names?.length) q.set("column_names", options.dump.column_names.join(","));
+      }
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/v1/knowledge/uploads?${q.toString()}`);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (ev) => {
+        if (onProgress) onProgress(ev.loaded, ev.lengthComputable ? ev.total : file.size);
+      };
+      xhr.onload = () => {
+        let body: any = null;
+        try {
+          body = JSON.parse(xhr.responseText || "null");
+        } catch {
+          // non-JSON error page
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(body as { job: KnowledgeJob });
+        } else {
+          if (xhr.status === 401) onUnauthorized?.();
+          reject(new ApiError(xhr.status, (body && body.detail) || xhr.statusText || `HTTP ${xhr.status}`));
+        }
+      };
+      xhr.onerror = () => reject(new ApiError(0, "The upload connection failed"));
+      xhr.onabort = () => reject(new ApiError(0, "Upload cancelled"));
+      if (signal) signal.addEventListener("abort", () => xhr.abort());
+      xhr.send(file);
+    }),
+  importKnowledge: (payload: {
+    uri: string;
+    auth?: Record<string, string>;
+    filename?: string;
+    title?: string;
+    allowed_roles: string[];
+    set_id?: string;
+    dump?: { source: string; table_name?: string; header?: boolean | null; column_names?: string[] };
+    ttl_seconds?: number;
+    expires_at?: string;
+  }) => request<{ job: KnowledgeJob }>("/v1/knowledge/imports", { method: "POST", body: JSON.stringify(payload) }),
+  knowledgeJobs: () => request<{ jobs: KnowledgeJob[]; active: number }>("/v1/knowledge/jobs"),
+  cancelKnowledgeJob: (jobId: string) =>
+    request<{ job: KnowledgeJob }>(`/v1/knowledge/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
+  retryKnowledgeJob: (jobId: string) =>
+    request<{ job: KnowledgeJob }>(`/v1/knowledge/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
+  deleteKnowledgeJob: (jobId: string) =>
+    request<{ deleted: boolean }>(`/v1/knowledge/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
   embeddingModels: () =>
     request<{ models: EmbeddingModelOption[]; max_dims: number }>("/v1/knowledge/embedding-models"),
   importEmbeddingModel: (payload: {

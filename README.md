@@ -192,9 +192,11 @@ Where it goes:
 - **Disk:** about 2 GB for the Couchbase image and 2-3 GB for the
   operations-manager image (CPU-only PyTorch), plus Docker build cache,
   the Couchbase data volume (grows with the audit log, caches and
-  Knowledge Base - plan on 20 GB, like the Helm default), and the
-  embedding-model cache (about 100 MB for the default model, up to a few
-  GB if you add local models).
+  Knowledge Base - plan on 20 GB, like the Helm default, and far more if
+  you load multi-gigabyte warehouse exports), the embedding-model cache
+  (about 100 MB for the default model, up to a few GB if you add local
+  models), and the Knowledge Base upload spool (room for the files in
+  flight, up to `KNOWLEDGE_MAX_UPLOAD_MB` each).
 
 On Docker Desktop, raise the memory limit under **Settings → Resources**
 before the first `docker compose up` - Couchbase fails to start, or is
@@ -579,6 +581,14 @@ over.
   decision only, so an experiment never calls a downstream system. Cases
   land in the same datasets as the Evaluations page and run on every
   catalog change.
+- **Knowledge Base** - documents and warehouse table exports, chunked and
+  embedded into knowledge sets with role-filtered retrieval. File uploads
+  stream straight to disk and are indexed by a background **ingestion
+  job** (progress, cancel, retry on the page), so the limit is 5 GB per
+  file rather than what a browser tab can hold; exports already sitting
+  in S3, Cloud Storage or Azure Blob are imported from their URI without
+  passing through the browser at all. See [Loading large data into the
+  Knowledge Base](#loading-large-data-into-the-knowledge-base).
 - **RAG Applications** - register an application over the Knowledge Base,
   try it, and read **Token usage by user**: per caller subject, queries,
   cache hits and hit rate, tokens spent and saved, cost spent and saved,
@@ -899,6 +909,74 @@ the same way; `GET /v1/servers/platforms` lists every preset with its hints.
 A plain bearer token (a Snowflake PAT, a Databricks PAT, a Cloud Run ID
 token) works too with `"mode": "bearer"`. `validate_platform_url` rejects a
 host or path that does not match the preset - choose `generic` to override.
+
+## Loading large data into the Knowledge Base
+
+The Knowledge Base page's inline path (paste text, or `POST /v1/knowledge`
+with base64 content) is bounded by `KNOWLEDGE_MAX_INLINE_MB` (20 MB) because
+it parses and embeds inside the request. Everything else goes through the
+**streaming path**, which is built for multi-gigabyte warehouse exports:
+
+- **`POST /v1/knowledge/uploads`** - the request body *is* the file (no
+  base64, no JSON envelope). The operations manager writes it to its spool
+  directory as it arrives, never holding more than 1 MB in memory, and
+  answers `202` with a job. The page uses this for every file; from a
+  shell, `scripts/kb-upload.py` or plain `curl --data-binary @file`.
+- **`POST /v1/knowledge/imports`** - the same, from an object URI:
+  `s3://` (boto3; a key pair in the request, or the pod's IAM role / IRSA),
+  `gs://` (service-account JSON, or Application Default Credentials),
+  `az://` / `abfss://` (connection string, or account + key/SAS), or
+  `https://` (a presigned/signed URL, or the Databricks Files API with a
+  bearer token). The credential is used for the download only and is never
+  stored on the job or the document.
+- **The job** then parses the file in a stream - CSV/TSV and JSON lines
+  line by line, Parquet by row group, Avro record by record, gzip through
+  a streaming decompressor, zip members one at a time - chunks rows as it
+  goes, embeds in batches of `KNOWLEDGE_INGEST_BATCH_CHUNKS` (256), and
+  bulk-writes each batch. A 1.2-million-row export costs the process about
+  40 MB of memory, whatever its size on disk. Progress (bytes, rows,
+  chunks) is on the job; the document is written last, so nothing partial
+  is ever retrievable, and a cancelled or failed job deletes what it had
+  written. `KNOWLEDGE_INGEST_CONCURRENCY` (1) is how many jobs embed at
+  once - they share the embedding model's inference slots with live
+  discovery, so one is right for most nodes.
+- **Limits:** `KNOWLEDGE_MAX_UPLOAD_MB` (5120) per file, and a safety ceiling
+  of `KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT` (2,000,000 ≈ 2.4 GB of text) per
+  document. The spool needs room for the files in flight: on Docker Compose
+  it is the `knowledge-spool` volume, on Helm `operationsManager.spool`
+  (a 20 GB PVC by default - on an `emptyDir` a job queued when the pod
+  restarts has to be uploaded again, and the page says so). Behind an
+  ingress controller, raise its body-size limit and turn off request
+  buffering for `/v1/knowledge/uploads` (see the comment on
+  `ingress.annotations` in `values.yaml`); the bundled nginx is already set.
+
+```bash
+# stream a local Snowflake unload (progress on stderr, follows the job to completion)
+python3 scripts/kb-upload.py --url https://192.168.111.5:3111 --user admin --insecure \
+  --roles finance_analyst,admin --dump snowflake --table SALES.PUBLIC.ORDERS orders_0_0_0.csv.gz
+
+# import a BigQuery export straight from Cloud Storage
+python3 scripts/kb-upload.py --url https://192.168.111.5:3111 --user admin --insecure \
+  --roles finance_analyst --dump bigquery --table shop.orders \
+  --import gs://my-bucket/orders/orders-000000000000.parquet --gcp-service-account-json ~/sa.json
+
+# the same with curl (dashboard session cookie from /v1/auth/login)
+curl -k -b cookies.txt -X POST \
+  "https://192.168.111.5:3111/v1/knowledge/uploads?filename=orders.csv.gz&allowed_roles=finance_analyst&dump_source=snowflake&table_name=SALES.PUBLIC.ORDERS" \
+  -H "Content-Type: application/octet-stream" --data-binary @orders.csv.gz
+curl -k -b cookies.txt https://192.168.111.5:3111/v1/knowledge/jobs/<job_id>
+```
+
+What each warehouse should export: Snowflake `COPY INTO @stage ... FILE_FORMAT
+= (TYPE = CSV COMPRESSION = GZIP) HEADER = TRUE` (or `TYPE = PARQUET`),
+Databricks `df.write.parquet(...)` to a Volume or cloud path (not a raw Delta
+folder - its data files can include removed rows), BigQuery `EXPORT DATA
+OPTIONS (uri = 'gs://.../*.parquet', format = 'PARQUET')`. Newline-delimited
+JSON works everywhere; a single top-level JSON array does not stream and is
+refused with a message saying so. Sizing the Couchbase side: every chunk is
+one document with a 384-1024-float vector, so a 2-million-chunk export is on
+the order of 5-10 GB in the `knowledge` collection plus its Search index -
+raise the data and index quotas (`couchbase.ramQuotaMB` on Helm) accordingly.
 
 ## Notes
 

@@ -26,3 +26,10 @@ fastavro==1.13.1
 # Prometheus exporter for GET /metrics (app/metrics.py) - scraped by
 # Prometheus / Grafana, see MONITORING.md.
 prometheus_client==0.26.0
+# Cloud imports for the Knowledge Base (app/ingest_jobs.py): stream a
+# Snowflake/Databricks/BigQuery export straight from S3, Cloud Storage or
+# Azure Blob into the ingestion spool. https:// (presigned URLs, the
+# Databricks Files API) needs none of these.
+boto3==1.42.17
+google-cloud-storage==3.9.0
+azure-storage-blob==12.29.0

@@ -2574,6 +2574,65 @@ class CouchbaseStore:
     async def upsert_knowledge_chunk(self, chunk: dict):
         await asyncio.to_thread(self.knowledge.upsert, f"kchunk::{chunk['chunk_id']}", chunk)
 
+    async def upsert_knowledge_chunks(self, chunks: list[dict]) -> None:
+        """Bulk write for background ingestion - one SDK multi-op per batch
+        instead of one round trip per chunk. Raises on any failed key so a
+        job never records chunks it did not actually store."""
+        if not chunks:
+            return
+
+        def _run():
+            result = self.knowledge.upsert_multi({f"kchunk::{c['chunk_id']}": c for c in chunks})
+            if not result.all_ok:
+                failed = [k for k, r in result.exceptions.items()] if getattr(result, "exceptions", None) else []
+                raise RuntimeError(f"{len(failed) or 'some'} chunk write(s) failed: {failed[:3]}")
+
+        await asyncio.to_thread(_run)
+
+    # -- Knowledge ingestion jobs (see app/ingest_jobs.py) --------------------
+
+    async def upsert_knowledge_job(self, job: dict):
+        await asyncio.to_thread(self.knowledge.upsert, f"kjob::{job['job_id']}", job)
+
+    async def get_knowledge_job(self, job_id: str) -> dict | None:
+        def _get():
+            try:
+                return self.knowledge.get(f"kjob::{job_id}").content_as[dict]
+            except DocumentNotFoundException:
+                return None
+
+        return await asyncio.to_thread(_get)
+
+    async def delete_knowledge_job(self, job_id: str) -> bool:
+        def _run():
+            try:
+                self.knowledge.remove(f"kjob::{job_id}")
+                return True
+            except DocumentNotFoundException:
+                return False
+
+        return await asyncio.to_thread(_run)
+
+    async def list_knowledge_jobs(self, limit: int = 50, active_only: bool = False) -> list[dict]:
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["knowledge_collection"]
+
+        def _run():
+            where = 'j.doc_type = "knowledge_job"'
+            if active_only:
+                where += ' AND j.status IN ["uploading", "queued", "downloading", "running"]'
+            q = (
+                f"SELECT j.* FROM `{bucket}`.`{scope}`.`{coll}` j WHERE {where} "
+                f"ORDER BY j.created_at DESC LIMIT $limit"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"limit": limit}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_knowledge_jobs query failed: %s", exc)
+            return []
+
     async def list_knowledge_documents(self, limit: int = 200) -> list[dict]:
         bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
         coll = COUCHBASE_CONFIG["knowledge_collection"]
