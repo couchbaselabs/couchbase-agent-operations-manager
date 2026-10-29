@@ -26,9 +26,14 @@ discovered = client.discover("look up a customer's open support tickets")
 tool_id = discovered["tools"][0]["tool_id"]
 
 # 2. Invoke the one you picked - re-checked against Couchbase, then
-#    proxied to its real MCP server.
-result = client.invoke(tool_id, arguments={})
-print(result["result"])`;
+#    proxied to its real MCP server. Pass what its input_schema asks for
+#    (client.catalog() carries the schema) - an invoke with {} passes
+#    authorization here and then fails inside the downstream server.
+result = client.invoke(tool_id, arguments={"customer_id": "C-4821"})
+print(result["result"])
+
+# examples/all_in_one.py in the SDK download walks every call below,
+# end to end, in one traced run.`;
 
 const CACHING_CODE = `# Route model calls through the same gateway to get response caching -
 # a repeat or near-duplicate prompt costs zero tokens.
@@ -39,7 +44,15 @@ print(answer["usage"]["total_tokens"], answer["cost_usd"])
 
 # Ask it again, worded differently - semantic matching catches the paraphrase.
 answer2 = client.complete("Can a customer get a refund on a month-old order?")
-print(answer2["cache"]["status"])  # "hit_semantic" - zero tokens spent`;
+print(answer2["cache"]["status"])  # "hit_semantic" - zero tokens spent
+
+# Which model answers is the appliance's call by default - the global
+# policy, or the per-role / per-agent override assigned to your key on
+# Providers & policy. Pin one for every call from this client...
+client = AOMClient(base_url=..., api_key=..., provider="openai", model="gpt-4o-mini")
+# ...or for a single call. The response says what actually served it.
+answer3 = client.complete("Draft the reply.", provider="anthropic")
+print(answer3["provider"], answer3["model"], answer3["policy"])`;
 
 const CONTEXT_CACHE_CODE = `# complete() caches what an LLM generates. context_get()/context_set()
 # cache what YOU fetch - a warehouse row, an API response, a catalog

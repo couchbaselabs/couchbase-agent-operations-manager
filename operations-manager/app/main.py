@@ -623,6 +623,11 @@ def cached_dashboard_response(fn):
 LLM_CACHE_SETTINGS_DOC = "settings::llm_cache"
 llm_config: dict = llm_cache.normalize_config(LLM_CACHE_DEFAULTS)
 llm_config_version: str = llm_cache.config_fingerprint(llm_config)
+# Per-role / per-agent overrides of the global policy above - see
+# llm_cache.resolve_policy. Kept in their own settings doc so saving the
+# global form never clobbers them and vice versa.
+LLM_POLICIES_DOC = "settings::llm_cache_policies"
+llm_policies: list[dict] = []
 llm_catalog_version: str = ""
 last_llm_sweep_at: str | None = None
 
@@ -862,6 +867,7 @@ async def couchbase_startup():
     spawn(hijack_monitor_loop())
 
     await _startup_step("load LLM cache config", load_llm_config())
+    await _startup_step("load LLM cache policies", load_llm_policies())
     await _startup_step("refresh catalog version", refresh_catalog_version())
     spawn(llm_cache_sweeper_loop())
 
@@ -1763,6 +1769,29 @@ async def save_llm_config(cfg: dict):
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
+
+
+async def load_llm_policies():
+    global llm_policies
+    stored = await store.get_setting(LLM_POLICIES_DOC)
+    llm_policies = llm_cache.normalize_policies(stored.get("policies") if stored else [], llm_config)
+    if llm_policies:
+        logger.info("LLM cache policy overrides loaded (%d)", len(llm_policies))
+
+
+async def save_llm_policies(policies: list) -> list[dict]:
+    global llm_policies
+    llm_policies = llm_cache.normalize_policies(policies, llm_config)
+    await store.upsert_setting(
+        LLM_POLICIES_DOC,
+        {
+            "doc_type": "settings",
+            "setting_id": "llm_cache_policies",
+            "policies": llm_policies,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+    return llm_policies
 
 
 async def load_context_config():
@@ -3420,6 +3449,10 @@ class PurgeCacheRequest(BaseModel):
     namespace: str | None = None
 
 
+class LLMPoliciesRequest(BaseModel):
+    policies: list[dict]
+
+
 @app.get("/v1/llm/providers")
 async def llm_providers():
     """The selectable LLMs - Claude, ChatGPT and Gemini - with their models
@@ -3433,6 +3466,8 @@ async def get_llm_config():
     return {
         "config": llm_config,
         "config_version": llm_config_version,
+        "policies": llm_policies,
+        "policy_override_fields": list(llm_cache.POLICY_OVERRIDE_FIELDS),
         "defaults": llm_cache.DEFAULT_CACHE_CONFIG,
         "cache_scopes": list(llm_cache.CACHE_SCOPES),
         "eviction_policies": list(llm_cache.EVICTION_POLICIES),
@@ -3462,6 +3497,41 @@ async def put_llm_config(req: LLMConfigRequest):
         "config_version": llm_config_version,
         "entries_invalidated": invalidated,
     }
+
+
+@app.get("/v1/llm/policies")
+async def get_llm_policies(request: Request):
+    """The per-role / per-agent overrides of the global cache policy, in
+    resolution order within each match type (see llm_cache.resolve_policy)."""
+    require_admin(request)
+    return {
+        "policies": llm_policies,
+        "override_fields": list(llm_cache.POLICY_OVERRIDE_FIELDS),
+        "match_types": list(llm_cache.POLICY_MATCH_TYPES),
+    }
+
+
+@app.put("/v1/llm/policies")
+async def put_llm_policies(req: LLMPoliciesRequest, request: Request):
+    """Replace the whole override list. Each entry is re-validated against
+    the current global policy (llm_cache.normalize_policy). An override
+    whose provider/model changed has its own cached entries purged when
+    `invalidate_on_model_change` is on - the global sweep deliberately
+    leaves policy-written entries alone (they are stored as overrides), so
+    this is the only place that rule is applied to them."""
+    require_admin(request)
+    before = {p["policy_id"]: p for p in llm_policies}
+    policies = await save_llm_policies(req.policies)
+    invalidated = 0
+    if llm_config.get("invalidate_on_model_change"):
+        after = {p["policy_id"]: p for p in policies}
+        for pid, old in before.items():
+            new = after.get(pid)
+            old_pm = (old["config"].get("provider"), old["config"].get("model"))
+            new_pm = (new["config"].get("provider"), new["config"].get("model")) if new else None
+            if old_pm != new_pm and any(old_pm):
+                invalidated += await store.purge_cache_by_policy(pid)
+    return {"policies": policies, "entries_invalidated": invalidated}
 
 
 @app.post("/v1/llm/complete")
@@ -3494,7 +3564,12 @@ async def llm_complete(
         query=req.prompt[:200], started=time.time(),
     )
 
-    cfg = dict(llm_config)
+    # The caller's effective policy: an override matched on its agent
+    # identity, else on its role, else the global config as-is.
+    cfg, policy = llm_cache.resolve_policy(
+        llm_config, llm_policies, role, caller_identity(request).get("agent_id")
+    )
+    policy_id = policy["policy_id"] if policy else None
     if req.namespace:
         cfg["namespace"] = req.namespace
         cfg = llm_cache.normalize_config(cfg)
@@ -3575,6 +3650,7 @@ async def llm_complete(
                 "model": model,
                 "role": role,
                 "subject": subject,
+                "policy_id": policy_id,
                 "entry_id": hit["entry_id"],
                 "namespace": cfg["namespace"],
                 "scope_key": scope,
@@ -3604,12 +3680,14 @@ async def llm_complete(
                     "aom.cost_usd": 0.0,
                     "aom.tokens_saved": hit.get("total_tokens", 0),
                     "aom.namespace": cfg["namespace"],
+                    "aom.cache_policy": policy_id,
                 },
             )
             return {
                 "provider": provider,
                 "model": model,
                 "role": role,
+                "policy": llm_cache.policy_summary(policy),
                 "response": hit.get("response", ""),
                 "cache": {
                     "status": outcome,
@@ -3644,7 +3722,7 @@ async def llm_complete(
             "doc_type": "llm_cache_event",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "outcome": "error", "provider": provider, "model": model, "role": role, "subject": subject,
-            "namespace": cfg["namespace"], "scope_key": scope,
+            "policy_id": policy_id, "namespace": cfg["namespace"], "scope_key": scope,
             "prompt_preview": req.prompt.strip()[:240],
             "latency_ms": latency_ms, "reason": str(exc)[:400],
         })
@@ -3656,6 +3734,7 @@ async def llm_complete(
                 "gen_ai.request.model": model,
                 "aom.cache_status": "error",
                 "aom.namespace": cfg["namespace"],
+                "aom.cache_policy": policy_id,
             },
             error=str(exc),
         )
@@ -3680,7 +3759,13 @@ async def llm_complete(
         await _store_cache_entry(
             eid, cfg, provider, model, scope, req.prompt, result,
             prompt_tokens, completion_tokens, cost_usd, latency_ms,
-            override=(provider != cfg["provider"] or model != cfg["model"]),
+            # Relative to the *global* selection: the sweeper evaluates
+            # against llm_config, and an entry a policy routed to another
+            # model must not be thrown away when the global model changes.
+            # Policy-level model changes purge by policy_id instead (see
+            # put_llm_policies).
+            override=(provider != llm_config["provider"] or model != llm_config["model"]),
+            policy_id=policy_id,
         )
         await store.increment_lifetime_stats(cost_spent_delta=cost_usd, provider=provider, model=model)
 
@@ -3689,6 +3774,7 @@ async def llm_complete(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "outcome": "bypass" if bypass_reason else "miss",
         "provider": provider, "model": model, "role": role, "subject": subject,
+        "policy_id": policy_id,
         "entry_id": None if bypass_reason else eid,
         "namespace": cfg["namespace"], "scope_key": scope, "similarity": None,
         "prompt_preview": redact_text_for_storage(req.prompt.strip()[:240]),
@@ -3717,6 +3803,7 @@ async def llm_complete(
             "aom.cache_entry_id": None if bypass_reason else eid,
             "aom.cost_usd": cost_usd,
             "aom.namespace": cfg["namespace"],
+            "aom.cache_policy": policy_id,
             "aom.stub": bool(result.get("stub")),
         },
     )
@@ -3725,6 +3812,7 @@ async def llm_complete(
         "provider": provider,
         "model": model,
         "role": role,
+        "policy": llm_cache.policy_summary(policy),
         "response": result["text"],
         "cache": {
             "status": "bypass" if bypass_reason else "miss",
@@ -3816,7 +3904,7 @@ async def _record_cache_hit(entry: dict, cfg: dict, semantic: bool) -> int:
 
 async def _store_cache_entry(
     eid, cfg, provider, model, scope, prompt, result,
-    prompt_tokens, completion_tokens, cost_usd, latency_ms, override=False,
+    prompt_tokens, completion_tokens, cost_usd, latency_ms, override=False, policy_id=None,
 ):
     embedding = None
     if cfg.get("semantic_enabled") and embeddings is not None:
@@ -3856,6 +3944,7 @@ async def _store_cache_entry(
         # default. Such entries survive a change to the selected model - see
         # llm_cache.evaluate_entry.
         "override": bool(override),
+        "policy_id": policy_id,
         "stub": bool(result.get("stub")),
     }
     ttl = int(cfg.get("ttl_seconds") or 0)
@@ -3923,14 +4012,16 @@ async def llm_dashboard():
     window_hours = 24
     trend_hours = 12
     window_since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - window_hours * 3600))
-    lifetime, agg_rows, recent_events, cached_entries = await asyncio.gather(
+    lifetime, agg_rows, usage_rows, recent_events, cached_entries = await asyncio.gather(
         store.get_lifetime_stats(),
         store.llm_dashboard_aggregate_since(window_since),
+        store.llm_usage_by_role_since(window_since),
         store.recent_llm_events(limit=50),
         store.count_cache_entries(),
     )
     dashboard_data = llm_cache.build_dashboard_aggregate(
-        agg_rows, trend_hours=trend_hours, lifetime_by_model=lifetime.get("by_model")
+        agg_rows, trend_hours=trend_hours, lifetime_by_model=lifetime.get("by_model"),
+        usage_rows=usage_rows,
     )
 
     # recent_events ("Recent cache events") is a small fixed-count fetch,
@@ -3947,6 +4038,10 @@ async def llm_dashboard():
         "provider_label": provider_spec["label"],
         "model": llm_config["model"],
         "api_key_configured": bool((LLM_API_KEYS.get(llm_config["provider"]) or "").strip()),
+        # Overrides routing some roles/agents to other providers or models -
+        # the reason the breakdown below can carry more than one row.
+        "policies_active": sum(1 for p in llm_policies if p.get("enabled", True)),
+        "policies_total": len(llm_policies),
         "semantic_enabled": llm_config["semantic_enabled"],
         "similarity_threshold": llm_config["similarity_threshold"],
         "ttl_seconds": llm_config["ttl_seconds"],

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { AgentIdentity, AgentOidcConfig, AgentsResponse, ToolDoc } from "../api/types";
 
@@ -52,6 +53,12 @@ export function SettingsAgentsPage() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: "", role: "", owner: "", description: "", expires_at: "" });
   const [scope, setScope] = useState<string[]>([]);
+  // Inline role creation from the picker: "Create new role..." opens a
+  // small sub-form that POSTs to /v1/roles (deny-by-default, like the
+  // Roles & RBAC page) and then selects the new role for this agent.
+  const NEW_ROLE = "__new_role__";
+  const [newRole, setNewRole] = useState<{ id: string; description: string } | null>(null);
+  const [creatingRole, setCreatingRole] = useState(false);
 
   const [showOidc, setShowOidc] = useState(false);
   const [oidc, setOidc] = useState<AgentOidcConfig | null>(null);
@@ -93,6 +100,10 @@ export function SettingsAgentsPage() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
+    if (newRole) {
+      setError("Create the new role (or cancel it) before issuing the agent key.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -368,8 +379,13 @@ export function SettingsAgentsPage() {
             <div className="field">
               <label>Role</label>
               <select
-                value={form.role}
+                value={newRole ? NEW_ROLE : form.role}
                 onChange={(e) => {
+                  if (e.target.value === NEW_ROLE) {
+                    setNewRole({ id: "", description: "" });
+                    return;
+                  }
+                  setNewRole(null);
                   setForm({ ...form, role: e.target.value });
                   setScope([]);
                 }}
@@ -377,7 +393,65 @@ export function SettingsAgentsPage() {
                 {data.roles.map((r) => (
                   <option key={r.id} value={r.id}>{r.id} &mdash; {r.description}</option>
                 ))}
+                <option value={NEW_ROLE}>+ Create new role...</option>
               </select>
+              {newRole && (
+                <div className="panel" style={{ marginTop: 10, padding: 12, background: "var(--bg-elevated)" }}>
+                  <div className="field" style={{ marginBottom: 8 }}>
+                    <label>New role id</label>
+                    <input
+                      value={newRole.id}
+                      placeholder="e.g. supplier_agent"
+                      onChange={(e) => setNewRole({ ...newRole, id: e.target.value })}
+                    />
+                    <div className="field-hint">
+                      Lowercase letters, digits and underscores; starts with a letter. Immutable once created.
+                    </div>
+                  </div>
+                  <div className="field" style={{ marginBottom: 8 }}>
+                    <label>Description</label>
+                    <input
+                      value={newRole.description}
+                      placeholder="What this role is for"
+                      onChange={(e) => setNewRole({ ...newRole, description: e.target.value })}
+                    />
+                  </div>
+                  <div className="flex-row" style={{ gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={creatingRole || !newRole.id.trim()}
+                      onClick={async () => {
+                        setCreatingRole(true);
+                        setError(null);
+                        try {
+                          const res = await api.createRole(newRole.id.trim(), newRole.description.trim());
+                          setData((d) => (d ? { ...d, roles: res.roles.map((r) => ({ id: r.id, description: r.description })) } : d));
+                          setForm((f) => ({ ...f, role: res.role.id }));
+                          setScope([]);
+                          setNewRole(null);
+                          setNotice(
+                            `Role "${res.role.id}" created. It starts deny-by-default - grant it tools under Roles & RBAC.`
+                          );
+                        } catch (e: any) {
+                          setError(e.message || "Failed to create role");
+                        } finally {
+                          setCreatingRole(false);
+                        }
+                      }}
+                    >
+                      {creatingRole ? "Creating..." : "Create role"}
+                    </button>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => setNewRole(null)} disabled={creatingRole}>
+                      Cancel
+                    </button>
+                  </div>
+                  <div className="field-hint" style={{ marginTop: 8 }}>
+                    A new role can reach no tools until you allow some on <Link to="/roles">Roles &amp; RBAC</Link> -
+                    the agent's key will discover nothing until then.
+                  </div>
+                </div>
+              )}
             </div>
             <div className="field">
               <label>Expires (optional)</label>

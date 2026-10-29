@@ -216,6 +216,101 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+# ---------------------------------------------------------------------------
+# Per-role / per-agent policy overrides
+# ---------------------------------------------------------------------------
+# The global config above is the default every caller gets. A policy
+# override narrows that for one role or one agent identity: a different
+# provider/model, a different TTL, caching off entirely. It carries only the
+# fields it sets - everything else keeps following the global policy, so a
+# later change to the global TTL still reaches an agent whose override only
+# picked a model.
+#
+# Resolution order: a policy matched on the caller's agent identity wins
+# over one matched on its role, which wins over the global default. Within
+# the same match type the first enabled policy in stored order applies.
+# Operational knobs (max_entries, eviction, sweep interval, invalidation
+# rules, bypass patterns) are deliberately not overridable: those describe
+# the one cache, not one caller's view of it.
+POLICY_MATCH_TYPES = ("role", "agent")
+POLICY_OVERRIDE_FIELDS = (
+    "enabled", "provider", "model", "max_output_tokens", "temperature",
+    "semantic_enabled", "similarity_threshold", "ttl_seconds",
+    "max_reuse_hits", "cache_scope", "namespace",
+)
+
+
+def _policy_id(name: str, match_type: str, match_value: str) -> str:
+    material = f"{match_type}:{match_value}:{name}:{time.time_ns()}"
+    return "llmpolicy-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def normalize_policy(raw: dict | None, base: dict | None = None) -> dict | None:
+    """Coerce one submitted override into its stored shape, or None when
+    it has nothing to match on. `config` keeps only overridable fields and
+    only the ones actually supplied; the values are validated by running
+    them through normalize_config over `base` (the global policy), so a
+    bad model name resolves the same way it would at the top level."""
+    raw = raw or {}
+    match = raw.get("match") or {}
+    match_type = str(match.get("type") or "").strip()
+    match_value = str(match.get("value") or "").strip()[:200]
+    if match_type not in POLICY_MATCH_TYPES or not match_value:
+        return None
+
+    supplied = {k: v for k, v in (raw.get("config") or {}).items() if k in POLICY_OVERRIDE_FIELDS}
+    # A model supplied without a provider is ambiguous; a provider supplied
+    # without a model means "that provider's default".
+    if "model" in supplied and "provider" not in supplied:
+        supplied.pop("model")
+    merged = normalize_config({**(base or DEFAULT_CACHE_CONFIG), **supplied})
+    config = {k: merged[k] for k in supplied}
+
+    name = str(raw.get("name") or f"{match_type} {match_value}").strip()[:120]
+    return {
+        "policy_id": str(raw.get("policy_id") or "").strip() or _policy_id(name, match_type, match_value),
+        "name": name,
+        "match": {"type": match_type, "value": match_value},
+        "enabled": bool(raw.get("enabled", True)),
+        "config": config,
+    }
+
+
+def normalize_policies(raw: list | None, base: dict | None = None) -> list[dict]:
+    out, seen = [], set()
+    for item in raw or []:
+        pol = normalize_policy(item, base)
+        if pol and pol["policy_id"] not in seen:
+            seen.add(pol["policy_id"])
+            out.append(pol)
+    return out[:200]
+
+
+def resolve_policy(global_cfg: dict, policies: list[dict], role: str | None, agent_id: str | None):
+    """The effective cache config for one caller, and the override that
+    produced it (None when the global policy applies as-is)."""
+    chosen = None
+    for match_type, value in (("agent", agent_id), ("role", role)):
+        if not value:
+            continue
+        for pol in policies or []:
+            if pol.get("enabled", True) and pol["match"]["type"] == match_type and pol["match"]["value"] == value:
+                chosen = pol
+                break
+        if chosen:
+            break
+    if not chosen:
+        return dict(global_cfg), None
+    return normalize_config({**global_cfg, **(chosen.get("config") or {})}), chosen
+
+
+def policy_summary(policy: dict | None) -> dict | None:
+    """What a caller is told about the override that shaped its call."""
+    if not policy:
+        return None
+    return {"policy_id": policy["policy_id"], "name": policy["name"], "match": dict(policy["match"])}
+
+
 def config_fingerprint(cfg: dict) -> str:
     """Identity of the settings that affect what a cached answer *means*.
 
@@ -623,7 +718,8 @@ def build_hourly_series(hourly_events: list[dict], *, buckets: int = 12) -> list
 
 
 def build_dashboard_aggregate(
-    rows: list[dict], *, trend_hours: int = 12, lifetime_by_model: dict | None = None
+    rows: list[dict], *, trend_hours: int = 12, lifetime_by_model: dict | None = None,
+    usage_rows: list[dict] | None = None,
 ) -> dict:
     """Build the ENTIRE live dashboard payload - 'summary' (donut + stat
     cards), 'model_breakdown' ('Savings by provider & model'), and
@@ -750,12 +846,28 @@ def build_dashboard_aggregate(
         "avg_miss_latency_ms": round(miss_latency_sum / misses) if misses else 0,
     }
 
+    # Which roles drove each (provider, model) in the window - from
+    # CouchbaseStore.llm_usage_by_role_since, a separate GROUP BY so the
+    # main aggregate's covering index stays untouched. Agents under
+    # different policy overrides reach different models, and this is what
+    # shows who is on which.
+    used_by: dict[tuple, dict[str, int]] = {}
+    for u in usage_rows or []:
+        key = (u.get("provider") or "unknown", u.get("model") or "unknown")
+        role = u.get("role") or "unknown"
+        used_by.setdefault(key, {})[role] = used_by.get(key, {}).get(role, 0) + int(u.get("n") or 0)
+
     lifetime_by_model = lifetime_by_model or {}
     breakdown = []
     for (provider, model), row in model_totals.items():
+        roles = used_by.get((provider, model), {})
         row = dict(
             row, provider=provider, model=model,
             provider_label=PROVIDERS.get(provider, {}).get("label", provider),
+            used_by=[
+                {"role": r, "requests": n}
+                for r, n in sorted(roles.items(), key=lambda kv: kv[1], reverse=True)
+            ],
         )
         row["hit_rate_pct"] = round((row["hits"] / row["requests"]) * 100, 1) if row["requests"] else 0.0
         lifetime_row = lifetime_by_model.get(f"{provider}::{model}")

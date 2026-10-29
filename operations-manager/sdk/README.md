@@ -92,14 +92,21 @@ for tool in discovered["tools"]:
     print(tool["tool_id"], tool["name"])
 
 # 2. Invoke the one you picked - re-checked against Couchbase independently,
-#    then proxied to its real MCP server.
-result = client.invoke(discovered["tools"][0]["tool_id"], arguments={})
+#    then proxied to its real MCP server. Pass the arguments its input_schema
+#    asks for (client.catalog() carries the schema; discover() does not) -
+#    an invoke with {} passes authorization here and then fails *inside* the
+#    downstream MCP server, which comes back as a 502 AOMServerError.
+tool = discovered["tools"][0]
+result = client.invoke(tool["tool_id"], arguments={"customer_id": "C-4821"})
 print(result["result"])
 
 # 3. Route model calls through the same gateway to get response caching -
-#    a repeat or near-duplicate prompt costs zero tokens.
+#    a repeat or near-duplicate prompt costs zero tokens. Which model answers
+#    is the appliance's call by default (the global policy, or the per-role /
+#    per-agent override assigned to your key) - see "Choosing the provider
+#    and model" below to pin one from the client instead.
 answer = client.complete("Summarize this ticket thread in two sentences.")
-print(answer["response"], answer["cache"]["status"])
+print(answer["response"], answer["cache"]["status"], answer["provider"], answer["model"])
 
 # 4. Remember things about this user across sessions.
 client.add_memory("user-42", "Prefers responses in metric units.", memory_type="profile")
@@ -164,6 +171,39 @@ an exact hash for a byte-for-byte repeat, or by vector similarity for a
 paraphrase - and only reaches the provider on a genuine miss. See "Why
 route model calls through the SDK too" on the appliance's **Tools ->
 Developer SDK** page for the cost/latency math behind this.
+
+## Choosing the provider and model
+
+Three places can decide which LLM answers a `complete()` call, in
+precedence order:
+
+1. **The call itself** - `client.complete(prompt, provider="openai", model="gpt-4o-mini")`.
+2. **The client** - `AOMClient(..., provider="openai", model="gpt-4o-mini")` sets
+   the default for every `complete()` that client makes. Set `provider`
+   alone to get that provider's default model; `model` without `provider`
+   is rejected, because a model id only means something within its provider.
+3. **The appliance's policy** - what you get when neither is set. The
+   operator configures a global default on **LLM Caching -> Providers &
+   policy**, and can assign per-role or per-agent-identity overrides there
+   (a different provider/model, caching off, a different TTL). An override
+   matched on your agent identity beats one matched on your role.
+
+```python
+client = AOMClient(BASE_URL, api_key=API_KEY, provider="google", model="gemini-2.5-flash")
+
+answer = client.complete("Classify this ticket's urgency.")       # Gemini, per the client default
+answer = client.complete("Draft the reply.", provider="anthropic")  # Claude's default model, this call only
+print(answer["provider"], answer["model"], answer["policy"])        # what actually served it
+```
+
+`response["policy"]` names the operator override that applied (`{"policy_id",
+"name", "match": {"type": "role"|"agent", "value"}}`), or `None` when the
+global policy did. Cache entries are keyed by provider and model, so a
+prompt answered by one model is never replayed as another's answer.
+
+The dashboard's **Savings by provider & model** table shows every
+provider/model agents have used in the last 24h, with the roles that
+drove each one.
 
 ## Context caching
 

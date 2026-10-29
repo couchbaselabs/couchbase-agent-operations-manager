@@ -97,6 +97,7 @@ SECONDARY_INDEXES = (
     ("idx_access_log_topology", COUCHBASE_CONFIG["access_log_collection"],
      "timestamp, action, decision, `role`, server_id", ""),
     ("idx_llm_cache_log_topology", COUCHBASE_CONFIG["llm_cache_log_collection"], "timestamp, `role`, provider", ""),
+    ("idx_llm_cache_log_usage", COUCHBASE_CONFIG["llm_cache_log_collection"], "timestamp, provider, model, `role`", ""),
     ("idx_context_cache_log_timestamp", COUCHBASE_CONFIG["context_cache_log_collection"], "timestamp", ""),
     ("idx_context_cache_log_agg", COUCHBASE_CONFIG["context_cache_log_collection"],
      "timestamp, outcome, `namespace`, subject, latency_saved_ms, latency_ms, value_bytes", ""),
@@ -1313,6 +1314,29 @@ class CouchbaseStore:
             logger.warning("llm_role_provider_aggregate_since query failed: %s", exc)
             return []
 
+    async def llm_usage_by_role_since(self, since: str) -> list[dict]:
+        """GROUP BY (provider, model, role) request counts over the window -
+        the 'Used by' column of the dashboard's 'Savings by provider &
+        model' table. Covered by idx_llm_cache_log_usage (couchbase-init/
+        init.sh) so it runs as an index scan like the main aggregate."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["llm_cache_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT e.provider AS provider, e.model AS model, e.`role` AS `role`, COUNT(1) AS n "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since AND e.provider IS NOT MISSING AND e.model IS NOT MISSING "
+                f"GROUP BY e.provider, e.model, e.`role`"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"since": since}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm_usage_by_role_since query failed: %s", exc)
+            return []
+
     async def llm_dashboard_aggregate_since(self, since: str) -> list[dict]:
         """One GROUP BY query - by (hour, provider, model, outcome) - that
         supplies everything the LLM Caching dashboard needs: the 24h
@@ -1432,6 +1456,26 @@ class CouchbaseStore:
 
     async def count_context_entries(self) -> int:
         return await self._count(COUCHBASE_CONFIG["context_cache_collection"])
+
+    async def purge_cache_by_policy(self, policy_id: str) -> int:
+        """Delete every LLM cache entry written under one policy override -
+        used when that override's provider/model changes (see
+        put_llm_policies in app/main.py)."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["llm_cache_collection"]
+
+        def _run():
+            q = f"DELETE FROM `{bucket}`.`{scope}`.`{coll}` c WHERE c.policy_id = $policy_id RETURNING META(c).id"
+            rows = list(self.cluster.query(
+                q, QueryOptions(named_parameters={"policy_id": policy_id}, metrics=False)
+            ).rows())
+            return len(rows)
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("purge_cache_by_policy(%s) failed: %s", policy_id, exc)
+            return 0
 
     async def purge_context_cache(self, namespace: str | None = None, agent: str | None = None) -> int:
         """Manual invalidation. With no arguments this is 'purge everything';

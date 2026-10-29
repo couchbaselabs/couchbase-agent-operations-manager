@@ -271,9 +271,34 @@ export interface LLMCacheConfig {
   sweep_interval_minutes: number;
 }
 
+/** The subset of LLMCacheConfig a per-role / per-agent override may set. */
+export type LLMPolicyOverrideField =
+  | "enabled"
+  | "provider"
+  | "model"
+  | "max_output_tokens"
+  | "temperature"
+  | "semantic_enabled"
+  | "similarity_threshold"
+  | "ttl_seconds"
+  | "max_reuse_hits"
+  | "cache_scope"
+  | "namespace";
+
+export interface LLMCachePolicy {
+  policy_id: string;
+  name: string;
+  match: { type: "role" | "agent"; value: string };
+  enabled: boolean;
+  /** Only the fields this override sets; everything else inherits the global policy. */
+  config: Partial<Pick<LLMCacheConfig, LLMPolicyOverrideField>>;
+}
+
 export interface LLMConfigResponse {
   config: LLMCacheConfig;
   config_version: string;
+  policies: LLMCachePolicy[];
+  policy_override_fields: LLMPolicyOverrideField[];
   defaults: LLMCacheConfig;
   cache_scopes: string[];
   eviction_policies: string[];
@@ -365,6 +390,8 @@ export interface LLMModelBreakdownRow {
   tokens_spent: number;
   cost_saved_usd: number;
   cost_spent_usd: number;
+  /** Roles that sent requests to this provider/model in the window, busiest first. */
+  used_by: Array<{ role: string; requests: number }>;
 }
 
 export interface LLMDashboardResponse {
@@ -377,6 +404,8 @@ export interface LLMDashboardResponse {
   provider_label: string;
   model: string;
   api_key_configured: boolean;
+  policies_active: number;
+  policies_total: number;
   semantic_enabled: boolean;
   similarity_threshold: number;
   ttl_seconds: number;

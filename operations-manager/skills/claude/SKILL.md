@@ -79,6 +79,12 @@ client = AOMClient(
     # can act on.
     agent_id="<short name for this agent>",
     session_id=conversation_id,
+    # Optional: pin the LLM every complete() from this client uses. Leave
+    # both unset to let the appliance's policy decide - the operator's
+    # global default, or a per-role / per-agent override assigned to this
+    # key. `model` without `provider` is rejected.
+    provider=os.environ.get("AOM_LLM_PROVIDER"),   # "anthropic" | "openai" | "google"
+    model=os.environ.get("AOM_LLM_MODEL"),
 )
 ```
 
@@ -105,8 +111,18 @@ client-side code should still follow the intended flow.
 ```python
 discovered = client.discover("look up a customer's open support tickets")
 tool = discovered["tools"][0]
-result = client.invoke(tool["tool_id"], arguments={})
+result = client.invoke(tool["tool_id"], arguments={"customer_id": customer_id})
 ```
+
+Always pass the arguments the tool's `input_schema` requires. `discover()`
+returns ids and descriptions only; `client.catalog()` returns the same
+tools *with* their schemas, so join the two when the codebase needs to
+build arguments programmatically (`examples/all_in_one.py` in the SDK
+shows this). An invoke with `{}` passes authorization at the gateway and
+then fails inside the downstream MCP server - the SDK reports that as a
+502 `AOMServerError` whose message carries the downstream cause (a 401
+from the tool server, a connection refusal, a validation error), so read
+it rather than retrying.
 
 Check `result["hijack_warning"]` before trusting `result["result"]` in
 anything user-facing - a non-null value means the appliance's hijack
@@ -163,7 +179,18 @@ repeated or near-duplicate prompts cost zero tokens:
 ```python
 answer = client.complete("Summarize this ticket thread in two sentences.")
 print(answer["response"], answer["cache"]["status"])  # hit_exact/hit_semantic/miss/bypass
+print(answer["provider"], answer["model"], answer["policy"])  # what actually served it
 ```
+
+Which provider and model answer is decided, in precedence order, by the
+call (`complete(..., provider=, model=)`), then the client defaults
+(`AOMClient(provider=, model=)`), then the appliance's policy: the
+operator's global default, or a per-role / per-agent-identity override
+assigned to this key on **LLM Caching -> Providers & policy**. Prefer
+leaving it to the policy unless the codebase has a real reason to pin a
+model - that keeps the choice in the operator's hands and visible on the
+dashboard's "Savings by provider & model" table. `answer["policy"]` names
+the override that applied, or is `None` under the global policy.
 
 Use `bypass_cache=True` for prompts that must always reach the live
 model (anything time-sensitive - "what's today's date").

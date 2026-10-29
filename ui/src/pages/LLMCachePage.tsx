@@ -127,8 +127,12 @@ export function LLMCachePage() {
           <h1 className="page-title">LLM Cache Dashboard</h1>
           <p className="page-subtitle">
             {data
-              ? `${data.events_examined} request(s) in the last 24h - serving ${data.provider_label} (${data.model})${
+              ? `${data.events_examined} request(s) in the last 24h - default ${data.provider_label} (${data.model})${
                   data.api_key_configured ? "" : " in offline stub mode"
+                }${
+                  data.policies_active
+                    ? ` - ${data.policies_active} per-agent override(s) routing some roles or agents elsewhere`
+                    : ""
                 }`
               : "Loading..."}
           </p>
@@ -230,6 +234,7 @@ export function LLMCachePage() {
                     <tr>
                       <th>Provider</th>
                       <th>Model</th>
+                      <th>Used by</th>
                       <th>Requests</th>
                       <th>Hit rate</th>
                       <th>Tokens saved</th>
@@ -242,6 +247,22 @@ export function LLMCachePage() {
                       <tr key={`${r.provider}:${r.model}`}>
                         <td style={{ fontWeight: 600 }}>{r.provider_label}</td>
                         <td className="cell-mono cell-muted">{r.model}</td>
+                        <td>
+                          {(r.used_by || []).length === 0 ? (
+                            <span className="cell-muted">-</span>
+                          ) : (
+                            (r.used_by || []).map((u) => (
+                              <span
+                                key={u.role}
+                                className="badge badge-neutral"
+                                title={`${u.requests} request(s) in the last 24h`}
+                                style={{ marginRight: 4, marginBottom: 2 }}
+                              >
+                                {u.role}
+                              </span>
+                            ))
+                          )}
+                        </td>
                         <td>{r.requests}</td>
                         <td>{r.hit_rate_pct}%</td>
                         <td>{compactNumber(r.tokens_saved)}</td>

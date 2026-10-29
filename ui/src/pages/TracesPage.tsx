@@ -223,19 +223,32 @@ export function TracesPage() {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("");
+  const [roleFilter, setRoleFilter] = useState("");
   const [windowHours, setWindowHours] = useState(24);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setData(await api.traces({ status: statusFilter || undefined, windowHours }));
+      setData(await api.traces({ status: statusFilter || undefined, role: roleFilter || undefined, windowHours }));
     } catch (e: any) {
       setError(e.message || "Failed to load traces");
     } finally {
       setLoading(false);
     }
-  }, [statusFilter, windowHours]);
+  }, [statusFilter, roleFilter, windowHours]);
+
+  // Roles that actually ran something in the window, taken from the
+  // per-role aggregate rather than a hardcoded list - so a custom role
+  // shows up here as soon as it has a trace. by_role is not narrowed by
+  // the role filter, so the other roles stay selectable while one is
+  // picked; the current selection is kept even if its runs age out.
+  const roleOptions = Array.from(
+    new Set([
+      ...(data?.by_role || []).map((r) => r.role).filter((r): r is string => !!r),
+      ...(roleFilter ? [roleFilter] : []),
+    ]),
+  ).sort();
 
   useEffect(() => {
     load();
@@ -298,6 +311,17 @@ export function TracesPage() {
                 <option value="">All runs</option>
                 <option value="error">Errors only</option>
                 <option value="ok">Clean only</option>
+              </select>
+            </div>
+            <div className="field" style={{ margin: 0 }}>
+              <label>Role</label>
+              <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+                <option value="">All roles</option>
+                {roleOptions.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
               </select>
             </div>
             <div className="field" style={{ margin: 0 }}>

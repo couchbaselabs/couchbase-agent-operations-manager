@@ -433,6 +433,14 @@ data:
       -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, \`role\`, provider)")
     echo "${IDX_LLM_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_topology: ${IDX_LLM_TOPOLOGY_OUTPUT}"
 
+    # Covering index for the LLM Cache dashboard's "Used by" column (see
+    # app/couchbase_client.py's llm_usage_by_role_since): GROUP BY (provider,
+    # model, role) over the window. Separate from idx_llm_cache_log_agg so that
+    # index - and the main aggregate it covers - is left exactly as it was.
+    IDX_LLM_USAGE_OUTPUT=$(${CURL} -u "${CB_USER}:${CB_PASS}" ${CB_QUERY}/query/service \
+      -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_usage ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, provider, model, \`role\`)")
+    echo "${IDX_LLM_USAGE_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_usage: ${IDX_LLM_USAGE_OUTPUT}"
+
     # Secondary index on context_cache_log.timestamp and a covering index for
     # the Context Cache dashboard's aggregate query - same reasoning as the two
     # llm_cache_log indexes above, see app/couchbase_client.py's

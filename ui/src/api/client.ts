@@ -47,6 +47,7 @@ import type {
   CaCertificateInfo,
   ServerCertificateInfo,
   LLMCacheConfig,
+  LLMCachePolicy,
   LLMCacheEntry,
   LLMCompleteResponse,
   LLMConfigResponse,
@@ -335,6 +336,12 @@ export const api = {
     request<{ config: LLMCacheConfig; config_version: string; entries_invalidated: number }>("/v1/llm/config", {
       method: "PUT",
       body: JSON.stringify({ config }),
+    }),
+  llmPolicies: () => request<{ policies: LLMCachePolicy[] }>("/v1/llm/policies"),
+  saveLlmPolicies: (policies: LLMCachePolicy[]) =>
+    request<{ policies: LLMCachePolicy[]; entries_invalidated: number }>("/v1/llm/policies", {
+      method: "PUT",
+      body: JSON.stringify({ policies }),
     }),
   llmDashboard: () => request<LLMDashboardResponse>("/v1/llm/dashboard"),
   llmCacheEntries: (limit = 100) =>

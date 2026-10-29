@@ -33,6 +33,10 @@ Optional environment:
                                printed by stage 2 - most tools have required fields, and an
                                invoke with {} fails *downstream*, which surfaces here as a 502.
     AOM_RAG_APP=app-id         a RAG application registered on the appliance (stage 8)
+    AOM_LLM_PROVIDER=openai    pin the provider (and optionally AOM_LLM_MODEL) for every complete()
+    AOM_LLM_MODEL=gpt-4o-mini  this client makes. Unset, the appliance's policy decides - the
+                               global default or the per-role / per-agent override for this key -
+                               and stage 4 prints which one applied.
 """
 import json
 import os
@@ -59,6 +63,8 @@ QUERY = os.environ.get("AOM_QUERY", "look up a customer's open support tickets")
 TOOL_ID = os.environ.get("AOM_TOOL_ID")
 TOOL_ARGS = json.loads(os.environ.get("AOM_TOOL_ARGS", "{}"))
 RAG_APP = os.environ.get("AOM_RAG_APP")
+LLM_PROVIDER = os.environ.get("AOM_LLM_PROVIDER") or None
+LLM_MODEL = os.environ.get("AOM_LLM_MODEL") or None
 
 USER_ID = "user-42"
 SESSION_ID = f"all-in-one-{int(time.time())}"
@@ -184,6 +190,13 @@ def completion(client: AOMClient) -> None:
             return
         print(f"call {n}: cache={ans['cache']['status']:<13} tokens={ans['usage']['total_tokens']:<5} "
               f"cost=${ans['cost_usd']:.5f}")
+    # Who answered, and why: the client default if one was set, otherwise
+    # the appliance's policy - `policy` names a per-role / per-agent
+    # override when one applied, and is None under the global default.
+    pol = ans.get("policy")
+    print(f"served by {ans['provider']} / {ans['model']}"
+          + (f" via override '{pol['name']}' ({pol['match']['type']} {pol['match']['value']})" if pol
+             else " via the global policy" if not LLM_PROVIDER else " (client default)"))
     print("answer:", ans["response"][:200])
 
 
@@ -278,6 +291,8 @@ def main() -> None:
         verify=VERIFY,
         agent_id="all-in-one-example",
         session_id=SESSION_ID,
+        provider=LLM_PROVIDER,
+        model=LLM_MODEL,
     )
     print(client)
 

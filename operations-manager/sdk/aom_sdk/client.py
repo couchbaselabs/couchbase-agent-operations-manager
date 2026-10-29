@@ -86,6 +86,17 @@ class AOMClient:
     session_id:
         An optional conversation/session identifier, attached to every call
         so runs belonging to one session can be found together.
+    provider, model:
+        Optional defaults for every :meth:`complete` call this client
+        makes - ``provider`` is one of the appliance's provider ids
+        (``anthropic``, ``openai``, ``google``), ``model`` one of that
+        provider's model ids. Left unset, the appliance's cache policy
+        decides: the global default, or the per-role / per-agent override
+        the operator assigned to this key. A per-call ``provider``/``model``
+        on :meth:`complete` beats the client default, which beats the
+        policy; whichever applied is reported back in the response.
+        Setting ``model`` without ``provider`` is an error - a model id
+        only means something within its provider.
 
     Tracing
     -------
@@ -112,20 +123,27 @@ class AOMClient:
         verify: "bool | str" = True,
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required, e.g. AOMClient('https://localhost:8090')")
+        if model and not provider:
+            raise ValueError("model requires provider - a model id only means something within its provider")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.verify = verify
         self.agent_id = agent_id
         self.session_id = session_id
+        self.provider = provider
+        self.model = model
         self._trace_id: Optional[str] = None
         self._session = session or requests.Session()
 
     def __repr__(self) -> str:
-        return f"AOMClient(base_url={self.base_url!r}, authenticated={bool(self.api_key)})"
+        extra = f", provider={self.provider!r}, model={self.model!r}" if self.provider else ""
+        return f"AOMClient(base_url={self.base_url!r}, authenticated={bool(self.api_key)}{extra})"
 
     # -- internals ----------------------------------------------------------
     def _headers(self, auth: bool) -> Dict[str, str]:
@@ -311,7 +329,19 @@ class AOMClient:
         a prompt that must always reach the live model. Set
         ``semantic=False`` for exact-match-only caching on this call - use it
         for prompts that embed fetched data, where a near-identical prompt
-        can carry different facts."""
+        can carry different facts.
+
+        ``provider``/``model`` on this call override the client-level
+        defaults given to :class:`AOMClient`, which override the
+        appliance's policy (global, or the per-role / per-agent override
+        assigned to this key). ``response["provider"]`` and
+        ``response["model"]`` say what actually served the call, and
+        ``response["policy"]`` names the operator override that applied
+        (``None`` when the global policy did)."""
+        if model and not provider and not self.provider:
+            raise ValueError("model requires provider - a model id only means something within its provider")
+        provider = provider or self.provider
+        model = model or (self.model if provider == self.provider else None)
         return self._request(
             "POST", "/v1/llm/complete", auth=True,
             json_body={

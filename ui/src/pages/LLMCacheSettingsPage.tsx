@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
+import { PolicyOverridesPanel } from "../components/llm/PolicyOverridesPanel";
 import type { LLMCacheConfig, LLMCompleteResponse, LLMProvider, Role } from "../api/types";
 
 const TTL_PRESETS = [
@@ -28,6 +29,7 @@ export function LLMCacheSettingsPage() {
   const [roles, setRoles] = useState<Role[]>([]);
   const [config, setConfig] = useState<LLMCacheConfig | null>(null);
   const [cachedEntries, setCachedEntries] = useState(0);
+  const [cacheScopes, setCacheScopes] = useState<string[]>(["global", "per_role", "per_subject"]);
   const [lastSweep, setLastSweep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -47,6 +49,7 @@ export function LLMCacheSettingsPage() {
       setProviders(p.providers);
       setConfig(c.config);
       setCachedEntries(c.cached_entries);
+      setCacheScopes(c.cache_scopes);
       setLastSweep(c.last_sweep_at);
       setRoles(r.roles);
     } catch (e: any) {
@@ -122,8 +125,8 @@ export function LLMCacheSettingsPage() {
         <div>
           <h1 className="page-title">LLM Providers &amp; Cache Policy</h1>
           <p className="page-subtitle">
-            Pick the model agents call through this gateway, and decide when a cached answer stops counting as an
-            answer. {cachedEntries} entr(ies) cached
+            Pick the model agents call through this gateway by default, override it per role or per agent identity,
+            and decide when a cached answer stops counting as an answer. {cachedEntries} entr(ies) cached
             {lastSweep ? ` - last invalidation sweep ${lastSweep.replace("T", " ").replace("Z", "")}` : ""}.
           </p>
         </div>
@@ -482,6 +485,15 @@ export function LLMCacheSettingsPage() {
               </div>
             </div>
           </div>
+
+          {/* ---------------- per-agent overrides ---------------- */}
+          <PolicyOverridesPanel
+            globalConfig={config}
+            providers={providers}
+            roles={roles}
+            cacheScopes={cacheScopes}
+            onChanged={load}
+          />
 
           {/* ---------------- test console ---------------- */}
           <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>Test Agent API Key</h2>
