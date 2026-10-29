@@ -894,6 +894,8 @@ export interface LimitVerdict {
 
 export interface GovernanceUsageRow {
   subject: string;
+  agent?: string;
+  agent_id?: string;
   role: string;
   limits: LimitVerdict[];
 }

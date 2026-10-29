@@ -167,7 +167,7 @@ async def ingest_all(store, embeddings):
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Failed to ingest catalog for registered server '%s' (%s): %s",
-                server_doc.get("server_id"), server_doc.get("mcp_url"), exc,
+                server_doc.get("server_id"), server_doc.get("mcp_url"), mcp_client.exception_text(exc),
             )
 
 

@@ -3081,17 +3081,26 @@ async def invoke(
         }
     except Exception as exc:  # noqa: BLE001
         latency_ms = int((time.time() - start) * 1000)
+        # The MCP client raises ExceptionGroups whose own message is just
+        # "unhandled errors in a TaskGroup"; flatten to the real cause so
+        # the 502 detail, the audit log and the trace span all say what
+        # happened (connection refused, 401, tool error, timeout...).
+        cause = mcp_client.exception_text(exc)
+        logger.error(
+            "Downstream MCP call failed for tool '%s' on server '%s' (%s): %s",
+            req.tool_id, tool.get("server_id"), server_doc.get("mcp_url"), cause, exc_info=exc,
+        )
         await store.log_access(
             action="invoke", role=role, subject_label=subject, query=None, tool_id=req.tool_id,
-            server_id=tool.get("server_id"), decision="ERROR", reason=str(exc), latency_ms=latency_ms,
+            server_id=tool.get("server_id"), decision="ERROR", reason=cause, latency_ms=latency_ms,
         )
         await record_span(
             result_ctx, kind="tool_result", name=f"result {req.tool_id}", started=downstream_started,
             status="error", role=role, subject=subject,
             attributes={"aom.tool_id": req.tool_id, "aom.server_id": tool.get("server_id")},
-            error=str(exc),
+            error=cause,
         )
-        raise HTTPException(status_code=502, detail=f"Downstream MCP call failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Downstream MCP call failed: {cause}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -5371,17 +5380,41 @@ async def get_governance_config(request: Request):
     which is also why `enforce` defaults off."""
     require_admin(request)
 
-    usage = []
-    for api_key, seeded_role in SEED_API_KEYS.items():
-        subject = f"...{api_key[-4:]}"
-        entry = {"subject": subject, "role": seeded_role, "limits": []}
+    async def _usage_entry(subject: str, role: str | None, **extra) -> dict:
+        entry = {"subject": subject, "role": role, "limits": [], **extra}
         for family in ("requests", "tool_calls", "tokens", "spend"):
             if not governance.limit_for(governance_config, family):
                 continue
             raw = await store.read_counter(governance.counter_key(family, subject))
             used = governance.from_spend_units(raw) if family == "spend" else raw
-            entry["limits"].append(governance.evaluate(governance_config, family, used, seeded_role))
-        usage.append(entry)
+            entry["limits"].append(governance.evaluate(governance_config, family, used, role))
+        return entry
+
+    usage = []
+    seen: set[str] = set()
+    for api_key, seeded_role in SEED_API_KEYS.items():
+        subject = f"...{api_key[-4:]}"
+        seen.add(subject)
+        usage.append(await _usage_entry(subject, seeded_role))
+    # Every agent identity counts against its own key prefix (see
+    # authenticate -> identity["key_prefix"]), so list those callers too:
+    # with a fleet of agents the seeded role keys are the least interesting
+    # rows on this page.
+    for agent in await store.list_agents(limit=500):
+        if agent.get("status") == "revoked":
+            continue
+        for key in agent.get("keys") or []:
+            subject = key.get("key_prefix")
+            if key.get("status") not in (None, "active", "rotated") or not subject or subject in seen:
+                continue
+            seen.add(subject)
+            usage.append(await _usage_entry(
+                subject, agent.get("role"), agent=agent.get("name"), agent_id=agent.get("agent_id"),
+            ))
+    # Busiest callers first so the table is useful at a glance.
+    def _load(entry: dict) -> float:
+        return max([float(l.get("used") or 0) / float(l.get("limit") or 1) for l in entry["limits"]] or [0.0])
+    usage.sort(key=_load, reverse=True)
 
     return {
         "config": governance.public_config(governance_config),

@@ -32,6 +32,29 @@ logger = logging.getLogger("operations-manager.mcp_client")
 DEFAULT_TIMEOUT_SECONDS = 30
 
 
+def exception_text(exc: BaseException) -> str:
+    """Flatten an ExceptionGroup to its innermost message(s).
+
+    The MCP Python client runs its transport under anyio task groups, so
+    any failure past the TCP connect - a refused connection, a 401 from the
+    downstream, a JSON-RPC error, a read timeout - surfaces as
+    `ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)")`.
+    That string is what callers would otherwise see in a 502 and in the
+    audit log, and it says nothing about what actually went wrong. Walk the
+    group and report the leaves instead.
+    """
+    seen: list[str] = []
+    stack: list[BaseException] = [exc]
+    while stack:
+        e = stack.pop()
+        subs = getattr(e, "exceptions", None)
+        if subs:
+            stack.extend(subs)
+        else:
+            seen.append(f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__)
+    return "; ".join(dict.fromkeys(seen)) or exc.__class__.__name__
+
+
 async def list_tools(mcp_url: str, headers: dict | None = None, timeout_seconds: int | None = None) -> list[dict]:
     """Return [{name, description, input_schema}, ...] for one MCP server."""
     timeout = timeout_seconds or DEFAULT_TIMEOUT_SECONDS

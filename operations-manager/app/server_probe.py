@@ -41,19 +41,9 @@ def _step(name: str, ok: bool, detail: str, **extra) -> dict:
     return {"step": name, "ok": ok, "detail": detail, **extra}
 
 
-def _exception_text(exc: BaseException) -> str:
-    """Flatten an ExceptionGroup (anyio task groups raise these) to the
-    innermost message."""
-    seen = []
-    stack = [exc]
-    while stack:
-        e = stack.pop()
-        subs = getattr(e, "exceptions", None)
-        if subs:
-            stack.extend(subs)
-        else:
-            seen.append(f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__)
-    return "; ".join(dict.fromkeys(seen)) or exc.__class__.__name__
+# Shared with the invoke path so the probe and a failed invoke describe the
+# same downstream failure the same way.
+_exception_text = mcp_client.exception_text
 
 
 async def probe(server_doc: dict, *, secret: str | None = None, timeout_seconds: int | None = None) -> dict:

@@ -1,0 +1,205 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
+</head><body><canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const W=1920,H=1080,c=document.getElementById('c'),g=c.getContext('2d');
+const RED='#EA2328',RED2='#FF4A4E',INK='#0B0B0D',PAPER='#F4F4F5',GREY='#8A8A92';
+const DISPLAY='"Inter Display","Inter",system-ui,sans-serif',MONO='"DejaVu Sans Mono",monospace';
+// ---- deterministic rng
+function rng(seed){let s=seed>>>0||1;return()=>{s^=s<<13;s>>>=0;s^=s>>>17;s^=s<<5;s>>>=0;return (s>>>0)/4294967296}}
+// ---- easing
+const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const seg=(t,a,b)=>clamp((t-a)/(b-a));
+const outExpo=x=>x>=1?1:1-Math.pow(2,-10*x);
+const inExpo=x=>x<=0?0:Math.pow(2,10*x-10);
+const outBack=x=>{const c1=1.70158,c3=c1+1;return 1+c3*Math.pow(x-1,3)+c1*Math.pow(x-1,2)};
+const outQuint=x=>1-Math.pow(1-x,5);
+const inOutQuint=x=>x<.5?16*x*x*x*x*x:1-Math.pow(-2*x+2,5)/2;
+const lerp=(a,b,x)=>a+(b-a)*x;
+const fmt=n=>Math.round(n).toLocaleString('en-US');
+// ---- drawing helpers
+function bg(col=INK){g.fillStyle=col;g.fillRect(0,0,W,H)}
+function txt(s,x,y,{size=120,weight=900,color=PAPER,align='center',font=DISPLAY,ls=0,alpha=1,base='middle'}={}){
+  g.save();g.globalAlpha=alpha;g.fillStyle=color;g.font=`${weight} ${size}px ${font}`;g.textAlign=align;g.textBaseline=base;
+  if(ls){g.letterSpacing=ls+'px'}
+  g.fillText(s,x,y);g.restore();
+}
+function slam(s,x,y,p,o={}){ // slam-in with overshoot + chromatic split
+  if(p<=0)return;const e=outBack(clamp(p));const sc=lerp(1.8,1,e);
+  g.save();g.translate(x,y);g.scale(sc,sc);
+  if(p<.35){const d=(1-p/.35)*18;g.globalCompositeOperation='screen';
+    txt(s,-d,0,{...o,color:'#FF2A3A',alpha:.9});txt(s,d,0,{...o,color:'#2AE0FF',alpha:.9});g.globalCompositeOperation='source-over'}
+  txt(s,0,0,{...o,alpha:clamp(p*4)*(o.alpha??1)});g.restore();
+}
+function shake(t,amt,f=37){return [Math.sin(t*f*2.1)*amt,Math.cos(t*f*1.7)*amt]}
+function logo(x,y,r){ // Couchbase mark
+  g.save();g.translate(x,y);const s=r/12;g.scale(s,s);g.translate(-12,-12);
+  g.fillStyle=RED;g.beginPath();g.arc(12,12,12,0,Math.PI*2);g.fill();
+  g.fillStyle='#fff';const p=new Path2D('M20.111 14.104a1.467 1.458 0 0 1-1.235 1.503c-1.422.244-4.385.398-6.875.398s-5.454-.15-6.877-.398c-.814-.14-1.235-.787-1.235-1.503V9.417a1.57 1.56 0 0 1 1.235-1.505 15.72 15.619 0 0 1 2.156-.14.537.533 0 0 1 .523.543v3.303c1.463 0 2.727-.086 4.201-.086 1.474 0 2.727.086 4.196.086V8.342a.535.532 0 0 1 .494-.569h.027a15.995 15.891 0 0 1 2.156.14 1.57 1.56 0 0 1 1.234 1.504z');
+  g.fill(p);g.restore();
+}
+function grain(t,a=.06){const r=rng(Math.floor(t*60)+7);g.save();g.globalAlpha=a;for(let i=0;i<260;i++){g.fillStyle=r()>.5?'#fff':'#000';g.fillRect(r()*W,r()*H,r()*3+1,r()*3+1)}g.restore()}
+function wipe(p,col=RED,dir=1){ // diagonal red wipe across the frame, p 0..1 in, then out
+  if(p<=0||p>=1)return;g.save();const x=dir>0?lerp(-W*1.3,W*1.3,inOutQuint(p)):lerp(W*1.3,-W*1.3,inOutQuint(p));
+  g.fillStyle=col;g.beginPath();g.moveTo(x,0);g.lineTo(x+W*.9,0);g.lineTo(x+W*.9-300,H);g.lineTo(x-300,H);g.closePath();g.fill();g.restore();
+}
+function flashFrame(p,col='#fff'){if(p>0&&p<1){g.save();g.globalAlpha=(1-p)*.8;g.fillStyle=col;g.fillRect(0,0,W,H);g.restore()}}
+function tag(s,x,y,color=RED,fg='#fff',size=30,pad=18,alpha=1,angle=0){g.save();g.globalAlpha=alpha;g.translate(x,y);g.rotate(angle);g.font=`800 ${size}px ${DISPLAY}`;const w=g.measureText(s).width;g.fillStyle=color;g.fillRect(-w/2-pad,-size*.75,w+pad*2,size*1.5);g.fillStyle=fg;g.textAlign='center';g.textBaseline='middle';g.fillText(s,0,2);g.restore()}
+function glitchSlices(t,n,amt,seed){const r=rng(seed+Math.floor(t*30));for(let i=0;i<n;i++){const y=r()*H,h=r()*60+8,dx=(r()-.5)*amt;const img=g.getImageData(0,y,W,h);g.putImageData(img,dx,y)}}
+function drawLines(t,alpha){g.save();g.globalAlpha=alpha;g.strokeStyle='#1C1C22';g.lineWidth=1;for(let x=0;x<=W;x+=120){g.beginPath();g.moveTo(x,0);g.lineTo(x,H);g.stroke()}for(let y=0;y<=H;y+=120){g.beginPath();g.moveTo(0,y);g.lineTo(W,y);g.stroke()}g.restore()}
+
+// ================= SCENES =================
+// 0 — 2.8 : pulse → swarm, "AGENTS ARE EVERYWHERE"
+function s0(t){bg();const p=seg(t,0,2.8);drawLines(t,.6);
+  const r=rng(11);const N=380;const burst=outExpo(seg(t,.25,1.6));
+  for(let i=0;i<N;i++){const a=r()*Math.PI*2,d=(r()*.8+.2)*1100,sp=r()*.5+.75;const x=W/2+Math.cos(a)*d*burst*sp,y=H/2+Math.sin(a)*d*burst*sp*.62;
+    const s=2+r()*5;g.fillStyle=r()>.85?RED:'#D4D4DA';g.globalAlpha=lerp(1,.35,burst);g.fillRect(x,y,s,s);
+    if(r()>.93&&burst>.2){g.strokeStyle=RED;g.globalAlpha=.25;g.beginPath();g.moveTo(x,y);g.lineTo(W/2+(r()-.5)*400,H/2+(r()-.5)*200);g.stroke()}}
+  g.globalAlpha=1;
+  const pr=seg(t,0,.3);g.fillStyle=RED;g.beginPath();g.arc(W/2,H/2,lerp(0,70,outBack(pr))*(1-seg(t,.25,.5)),0,Math.PI*2);g.fill();
+  if(t<1.9){slam('AGENTS',W/2,H/2-80,seg(t,.55,.95),{size:240,ls:-10});
+  slam('ARE EVERYWHERE.',W/2,H/2+120,seg(t,.85,1.25),{size:150,ls:-4,color:RED2});}
+  else{ // stat beat: <5% → 40%
+    const p=seg(t,1.9,2.9);const v=lerp(5,40,outQuint(p));
+    txt(Math.round(v)+'%',W/2-30,H/2-40,{size:380,ls:-20,color:RED,alpha:clamp(p*6)});
+    txt('OF ENTERPRISE APPS SHIP AI AGENTS IN 2026',W/2,H/2+200,{size:52,weight:800,color:PAPER,ls:3,alpha:seg(t,2.1,2.4)});
+    txt('up from under 5% a year ago  ·  Gartner',W/2,H/2+275,{size:32,weight:500,color:GREY,alpha:seg(t,2.3,2.6)});
+    flashFrame(seg(t,1.9,2.1),'#fff');}
+}
+// 2.8 — 6.3 : chaos stamps
+const STAMPS=[['21,000+ PUBLIC MCP SERVERS',-.05],['ONLY 8.5% USE OAUTH',.05],['82% HAVE UNKNOWN AGENTS RUNNING',-.03],['65% HAD AN AGENT INCIDENT',.06],['61% → DATA EXPOSURE',-.05],['PROMPT INJECTION',.04],['OVER-PRIVILEGED',-.02],['NO AUDIT TRAIL',.05]];
+const CALLS=['invoke  delete_table(prod)','invoke  send_email(all_users)','discover  *  (no filter)','invoke  exec_shell("rm -rf")','auth  —  none','tool.description  ←  "ignore previous…"','invoke  read_secrets()','cost  $$$  (no cache)','identity  ?  unknown','invoke  wire_transfer()'];
+function s1(t){const lt=t-2.8;bg('#000');const r=rng(99);
+  // scrolling terminal of calls
+  g.save();g.font=`500 30px ${MONO}`;g.textBaseline='middle';const sp=lt*2200;for(let i=0;i<40;i++){const y=(i*52-sp%52)+((i*52+sp)%H*0);const yy=((i*52+ (H+sp))%(H+60))-30;const txtI=CALLS[(i+Math.floor(sp/52))%CALLS.length];g.fillStyle=i%7===0?RED:'#3A3A42';g.globalAlpha=.9;g.textAlign='left';g.fillText(txtI,60+((i*131)%700),yy);g.fillText(txtI,1000+((i*97)%600),(yy+H/2)%H)}g.restore();
+  // stamps hit every .33s
+  for(let i=0;i<STAMPS.length;i++){const st=i*.36,p=seg(lt,st,st+.18);if(p<=0)continue;const [s,ang]=STAMPS[i];const rr=rng(i*13+5);const x=lerp(300,W-300,rr()),y=lerp(200,H-200,rr());const sc=lerp(2.2,1,outExpo(p));g.save();g.translate(x,y);g.scale(sc,sc);tag(s,0,0,i%2?PAPER:RED,i%2?INK:'#fff',52,26,clamp(p*5)*(lt-st<1.2?1:.55),ang);g.restore()}
+  const [sx,sy]=shake(lt,lt>.2?7:0);g.save();g.translate(sx,sy);g.restore();
+  if(lt>1.6){g.save();g.globalAlpha=.7*seg(lt,1.6,1.8);g.fillStyle='#000';g.fillRect(0,0,W,H);g.restore()}
+  // hard numbers (verified)
+  const big=(num,label,src,x,y,st)=>{const p=seg(lt,st,st+.3);if(p<=0)return;slam(num,x,y,p,{size:230,ls:-12});txt(label,x,y+150,{size:40,weight:800,color:RED2,ls:4,alpha:clamp(p*3)});txt(src,x,y+205,{size:26,weight:600,color:GREY,alpha:clamp(p*3)})};
+  big('82%','RUN UNKNOWN AI AGENTS','Cloud Security Alliance, 2026',W/4+40,H/2-80,1.7);
+  big('65%','HAD AN AGENT INCIDENT','Cloud Security Alliance, 2026',W*3/4-40,H/2-80,2.0);
+  if(lt>2.55){const p=seg(lt,2.55,2.85);g.save();g.globalAlpha=seg(lt,2.55,2.7)*.85;g.fillStyle='#000';g.fillRect(0,0,W,H);g.restore();slam('WHO IS WATCHING',W/2,H/2-90,p,{size:180,ls:-8});slam("YOUR AGENTS?",W/2,H/2+110,seg(lt,2.7,3.0),{size:170,ls:-6,color:RED2});
+    txt('21,000+ public MCP servers  ·  only 8.5% use OAuth  ·  Nordic APIs / Astrix',W/2,H/2+290,{size:34,weight:600,color:GREY,alpha:seg(lt,3.0,3.3)})}
+  glitchSlices(lt,6,90,3);
+}
+// 6.3 — 9.6 : reveal lockup
+function s2(t){const lt=t-6.3;bg(PAPER);
+  const e=outExpo(seg(lt,.05,.9));
+  // giant red block swipes from left
+  g.fillStyle=RED;g.fillRect(0,0,W*e,H);
+  // logo drops in
+  const lp=outBack(seg(lt,.35,.95));if(lp>0){g.save();g.translate(0,lerp(-500,0,lp));logo(380,H/2,170);g.restore()}
+  const tp=seg(lt,.6,1.2),tp2=seg(lt,.75,1.35),tp3=seg(lt,.9,1.5);
+  const x0=600;
+  const line=(s,y,p,size)=>{if(p<=0)return;g.save();g.beginPath();g.rect(x0,y-size*.62,W,size*1.3);g.clip();txt(s,x0+lerp(-120,0,outExpo(p)),y,{size,align:'left',color:'#fff',ls:-4,alpha:clamp(p*3)});g.restore()};
+  line('COUCHBASE',H/2-200,tp,110);line('AGENT OPERATIONS',H/2-60,tp2,130);line('MANAGER',H/2+80,tp3,130);
+  txt('The control plane for your AI agents.',x0+6,H/2+200,{size:46,weight:600,align:'left',color:'#FFD6D7',alpha:seg(lt,1.4,1.8)});
+  // exit: invert flash
+  flashFrame(seg(lt,3.1,3.3),'#fff');
+}
+// 9.6 — 12.6 : TOOLS — gated discovery
+function s3(t){const lt=t-9.6;bg();drawLines(t,.5);
+  const r=rng(21);const cx=W/2,cy=H/2+60;
+  // left agents, right MCP servers, gate in middle
+  const gp=outBack(seg(lt,.1,.6));g.save();g.translate(cx,cy);g.scale(gp,gp);g.fillStyle=RED;g.fillRect(-90,-170,180,340);g.fillStyle='#fff';g.font=`800 26px ${DISPLAY}`;g.textAlign='center';g.textBaseline='middle';g.fillText('RBAC',0,-40);g.fillText('+',0,0);g.fillText('VECTOR',0,40);g.restore();
+  for(let i=0;i<7;i++){const y=cy-240+i*80;const p=outExpo(seg(lt,.3+i*.05,.8+i*.05));
+    // agent dot → gate
+    g.fillStyle='#D4D4DA';g.fillRect(lerp(-40,260,p),y-6,12,12);g.strokeStyle='#2A2A32';g.lineWidth=2;g.beginPath();g.moveTo(260,y);g.lineTo(cx-90,y);g.stroke();
+    // pulse travelling
+    const q=(lt*1.6+i*.21)%1;const px=lerp(260,cx-90,q);if(p>.9){g.fillStyle=RED2;g.beginPath();g.arc(px,y,6,0,7);g.fill()}
+    // right side: tools; some blocked
+    const blocked=i===1||i===4||i===5;const p2=outExpo(seg(lt,.9+i*.05,1.3+i*.05));
+    g.strokeStyle=blocked?'#3A1A1C':'#2A2A32';g.beginPath();g.moveTo(cx+90,y);g.lineTo(lerp(cx+90,W-260,p2),y);g.stroke();
+    if(p2>.95){if(blocked){tag('DENIED',W-330,y,'#2A0A0C',RED2,20,10)}else{const q2=(lt*1.6+i*.37)%1;g.fillStyle='#fff';g.beginPath();g.arc(lerp(cx+90,W-260,q2),y,6,0,7);g.fill();g.fillStyle='#D4D4DA';g.fillRect(W-260,y-6,12,12)}}}
+  txt('AGENTS',260,cy-320,{size:28,weight:700,color:GREY,ls:4});txt('MCP TOOLS',W-260,cy-320,{size:28,weight:700,color:GREY,ls:4});
+  slam('DISCOVER. AUTHORIZE. PROXY.',W/2,150,seg(lt,.05,.4),{size:96,ls:-3});
+  txt('Every tool call re-checked against Couchbase before it leaves the building.',W/2,250,{size:34,weight:500,color:GREY,alpha:seg(lt,.5,.9)});
+  // hijack detector hit
+  const hp=seg(lt,1.9,2.1);if(hp>0){const sc=lerp(3,1,outExpo(hp));g.save();g.translate(W/2,H-110);g.scale(sc,sc);tag('⚠  TOOL HIJACKING DETECTED  ·  BLOCKED',0,0,RED,'#fff',44,30,clamp(hp*4));g.restore();if(lt<2.4)flashFrame(seg(lt,1.9,2.2),RED)}
+  grain(t,.04);
+}
+// 12.6 — 15.6 : MODELS — one endpoint, caching counter
+function s4(t){const lt=t-12.6;bg(PAPER);
+  const [sx,sy]=shake(lt,lt<.25?10:0);g.save();g.translate(sx,sy);
+  slam('ONE ENDPOINT.',W/2,170,seg(lt,0,.35),{size:150,ls:-6,color:INK});
+  const names=['CLAUDE','CHATGPT','GEMINI'];for(let i=0;i<3;i++){const p=outBack(seg(lt,.35+i*.12,.75+i*.12));if(p<=0)continue;g.save();g.translate(W/2+(i-1)*520,330);g.scale(p,p);tag(names[i],0,0,INK,'#fff',48,36);g.restore()}
+  // real-world scale: Google alone, 9.7T (2024) → 480T (2025) → 3.2Q (2026) tokens per month
+  const cp=seg(lt,.9,2.1);const ex=lerp(Math.log10(9.7e12),Math.log10(3.2e15),outQuint(cp));const tok=Math.pow(10,ex);
+  const label=tok>=1e15?(tok/1e15).toFixed(1)+' QUADRILLION':(tok/1e12).toFixed(0)+' TRILLION';
+  g.save();g.beginPath();g.rect(0,420,W,460);g.clip();
+  txt(label,W/2,600,{size:cp>=1?210:170,ls:-10,color:RED,alpha:seg(lt,.9,1.0)});
+  g.restore();
+  const yr=cp<.33?'2024':cp<.8?'2025':'2026';
+  txt('TOKENS PER MONTH  ·  GOOGLE ALONE  ·  '+yr,W/2,770,{size:44,weight:800,color:INK,ls:8,alpha:seg(lt,1.0,1.3)});
+  if(lt>2.15){const sc=lerp(2.5,1,outExpo(seg(lt,2.15,2.4)));g.save();g.translate(W/2,880);g.scale(sc,sc);tag('CACHE IT. OR PAY FOR IT TWICE.',0,0,RED,'#fff',54,34,clamp((lt-2.15)*6));g.restore()}
+  else txt('88.8% hit rate  ·  215.9M tokens saved  ·  396 hrs latency avoided — one AOM instance, 24h',W/2,870,{size:36,weight:600,color:'#55555E',alpha:seg(lt,1.4,1.8)});
+  txt('Sundar Pichai, Google I/O 2026',W/2,960,{size:24,weight:600,color:'#8A8A92',alpha:seg(lt,1.2,1.5)});
+  // cache HIT flashes
+  const r=rng(5);for(let i=0;i<14;i++){const st=1.2+i*.11,p=seg(lt,st,st+.3);if(p<=0||p>=1)continue;tag('HIT',lerp(120,W-120,r()),lerp(430,870,r()),RED,'#fff',24,10,(1-p)*.9,(r()-.5)*.3)}
+  g.restore();
+  wipe(seg(lt,2.72,3.1),RED,1);
+}
+// 15.6 — 18.6 : MEMORY — remembers every user (live figures)
+function s5(t){const lt=t-15.6;bg();
+  // scrolling memory cards from right
+  const r=rng(77);const entries=['Prefers Customer 360 summary first','Session rollup · 18 entries → 1','Checks inventory before priority list','Semantic · importance 0.29','Consolidated from 996 earlier entries','Recalled 0× · superseded','Retail & E-Commerce copilot','User sim-operator-14'];
+  g.save();g.font=`500 28px ${MONO}`;g.textBaseline='middle';g.textAlign='left';for(let i=0;i<22;i++){const sp=lt*(260+i*17);const x=(W+400-(sp+i*531)%(W+900));const y=70+i*48;g.fillStyle='#1A1A20';g.fillRect(x,y-20,520,40);g.fillStyle=i%5===0?RED2:'#4A4A55';g.fillText(entries[i%entries.length],x+14,y)}g.restore();
+  g.save();g.globalAlpha=.78;g.fillStyle=INK;g.fillRect(0,0,W,H);g.restore();
+  slam('REMEMBERS',W/2,210,seg(lt,.05,.4),{size:180,ls:-8});
+  slam('EVERY USER.',W/2,380,seg(lt,.2,.55),{size:150,ls:-6,color:RED2});
+  const stats=[[54274,'MEMORY ENTRIES'],[54138,'SUPERSEDED'],[117,'CONSOLIDATED'],[29,'USERS']];
+  for(let i=0;i<4;i++){const p=seg(lt,.7+i*.12,1.9+i*.12);if(p<=0)continue;const x=W/2+(i-1.5)*440;
+    txt(fmt(outQuint(p)*stats[i][0]),x,640,{size:118,ls:-6,color:i===2?RED2:'#fff',font:DISPLAY});txt(stats[i][1],x,750,{size:28,weight:700,color:GREY,ls:5,alpha:clamp(p*3)})}
+  txt('live from one AOM instance  ·  consolidation pass every 60 minutes',W/2,860,{size:30,weight:600,color:RED2,alpha:seg(lt,1.5,1.9)});
+  txt('per-user memory  ·  consolidation  ·  context cache  ·  knowledge base for RAG',W/2,930,{size:34,weight:600,color:'#8A8A92',alpha:seg(lt,1.7,2.1)});
+  grain(t,.04);wipe(seg(lt,2.72,3.1),PAPER,-1);
+}
+// 18.6 — 21.6 : OVERSIGHT — audit log avalanche
+const AUD=['allow  sim-operator-14  invoke  check_inventory','deny   agent-7         invoke  drop_collection','trace  run_4f2a  7 spans  412ms','eval   regression gate  PASS  98.2%','rotate agent-key  overlap 24h','deny   unknown         discover  *','allow  oidc:erik       invoke  customer_360','approval  held  → 202  wire_transfer','siem   forwarded  1,204 events','allow  sim-operator-1   recall  semantic'];
+function s6(t){const lt=t-18.6;bg(PAPER);
+  g.save();g.font=`600 30px ${MONO}`;g.textBaseline='middle';g.textAlign='left';const sp=lt*1800;for(let i=0;i<34;i++){const yy=(i*40-(sp%40));const line=AUD[(i+Math.floor(sp/40))%AUD.length];const deny=line.startsWith('deny');g.fillStyle=deny?RED:'#B8B8C0';g.fillText(line,80,yy);g.fillText(AUD[(i*3+Math.floor(sp/40))%AUD.length],1080,yy)}g.restore();
+  g.save();g.globalAlpha=.72;g.fillStyle=PAPER;g.fillRect(0,0,W,H);g.restore();
+  slam('EVERY DECISION.',W/2,300,seg(lt,.05,.4),{size:170,ls:-7,color:INK});
+  slam('ON THE RECORD.',W/2,470,seg(lt,.25,.6),{size:150,ls:-6,color:RED});
+  const items=['TRACES','EVALS','RBAC','AUDIT','APPROVALS','IDENTITY'];for(let i=0;i<items.length;i++){const p=outBack(seg(lt,.8+i*.1,1.2+i*.1));if(p<=0)continue;g.save();g.translate(W/2+(i-2.5)*290,700);g.scale(p,p);tag(items[i],0,0,i%2?INK:RED,'#fff',40,28);g.restore()}
+  txt('append-only audit log  ·  SIEM forwarding  ·  regression gate  ·  key rotation + OIDC',W/2,860,{size:34,weight:600,color:'#55555E',alpha:seg(lt,1.5,1.9)});
+  flashFrame(seg(lt,2.85,3.05),INK);
+}
+// 21.6 — 24.4 : deploy stamps
+function s7(t){const lt=t-21.6;bg();drawLines(t,.5);
+  const rows=[['SELF-HOSTED.',0],['COUCHBASE ENTERPRISE.',.3],['DOCKER COMPOSE OR HELM.',.6],['PYTHON SDK. CLAUDE · CHATGPT · GEMINI SKILLS.',.9]];
+  for(let i=0;i<rows.length;i++){const p=seg(lt,rows[i][1],rows[i][1]+.3);if(p<=0)continue;const y=240+i*190;g.save();g.beginPath();g.rect(0,y-100,W,200);g.clip();
+    const e=outExpo(p);g.fillStyle=i%2?PAPER:RED;g.fillRect(lerp(-W,0,e),y-80,W,160);txt(rows[i][0],W/2+lerp(-200,0,e),y,{size:i===3?74:110,ls:-4,color:i%2?INK:'#fff'});g.restore()}
+  const [sx,sy]=shake(lt,lt%.3<.05?6:0);
+  txt('five containers  ·  up in minutes  ·  bring your own cluster for production',W/2,990,{size:34,weight:600,color:GREY,alpha:seg(lt,1.3,1.7)});
+  glitchSlices(lt,lt>2.4?10:0,120,9);wipe(seg(lt,2.45,2.8),RED,1);
+}
+// 24.4 — 30 : final lockup + hold
+function s8(t){const lt=t-24.4;bg(RED);
+  // concentric rings pulse
+  for(let i=0;i<6;i++){const p=((lt*.55+i*.18)%1);g.strokeStyle='rgba(255,255,255,'+(.25*(1-p))+')';g.lineWidth=3;g.beginPath();g.arc(W/2,H/2-60,p*1400,0,7);g.stroke()}
+  const lp=outBack(seg(lt,.05,.6));g.save();g.translate(W/2,H/2-230);g.scale(lp,lp);g.fillStyle='#fff';g.beginPath();g.arc(0,0,122,0,7);g.fill();logo(0,0,110);g.restore();
+  const e1=seg(lt,.4,.85),e2=seg(lt,.55,1.0),e3=seg(lt,1.0,1.5);
+  g.save();g.beginPath();g.rect(0,H/2-120,W,420);g.clip();
+  txt('COUCHBASE',W/2,H/2-20+lerp(80,0,outExpo(e1)),{size:76,weight:800,color:'#FFD6D7',ls:14,alpha:clamp(e1*3)});
+  txt('AGENT OPERATIONS MANAGER',W/2,H/2+100+lerp(120,0,outExpo(e2)),{size:116,ls:-4,color:'#fff',alpha:clamp(e2*3)});
+  g.restore();
+  txt('Govern every tool. Cache every model. Remember every user.',W/2,H/2+250,{size:44,weight:600,color:'#fff',alpha:e3});
+  // bottom bar
+  const bp=seg(lt,1.6,2.1);g.fillStyle='rgba(0,0,0,.35)';g.fillRect(0,H-120*outExpo(bp),W,120);
+  txt('github.com/couchbaselabs/couchbase-agent-operations-manager',W/2,H-60,{size:34,weight:600,color:'#fff',font:MONO,alpha:bp});
+  // fade to black at the very end
+  const f=seg(lt,4.9,5.6);if(f>0){g.fillStyle='rgba(0,0,0,'+f+')';g.fillRect(0,0,W,H)}
+}
+const SCENES=[[0,2.8,s0],[2.8,6.3,s1],[6.3,9.6,s2],[9.6,12.6,s3],[12.6,15.6,s4],[15.6,18.6,s5],[18.6,21.6,s6],[21.6,24.4,s7],[24.4,30.01,s8]];
+function seek(t){g.setTransform(1,0,0,1,0,0);g.globalAlpha=1;g.globalCompositeOperation='source-over';for(const [a,b,fn] of SCENES){if(t>=a&&t<b){fn(t);break}}
+  // letterbox-free global: subtle vignette
+  const v=g.createRadialGradient(W/2,H/2,500,W/2,H/2,1300);v.addColorStop(0,'rgba(0,0,0,0)');v.addColorStop(1,'rgba(0,0,0,.35)');g.fillStyle=v;g.fillRect(0,0,W,H);
+}
+window.seek=seek;
+// preview in a browser: play
+if(!navigator.webdriver){let st=performance.now();(function f(){seek(((performance.now()-st)/1000)%30);requestAnimationFrame(f)})()}
+</script></body></html>

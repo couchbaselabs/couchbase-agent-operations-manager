@@ -324,7 +324,16 @@ export function SettingsLimitsPage() {
                   <tbody>
                     {data.usage.map((row) => (
                       <tr key={row.subject}>
-                        <td className="cell-mono">{row.subject}</td>
+                        <td>
+                          {row.agent ? (
+                            <>
+                              <div style={{ fontWeight: 600 }}>{row.agent}</div>
+                              <div className="cell-mono cell-muted" style={{ fontSize: 11 }}>{row.subject}</div>
+                            </>
+                          ) : (
+                            <span className="cell-mono">{row.subject}</span>
+                          )}
+                        </td>
                         <td className="cell-muted">{row.role}</td>
                         {["requests", "tool_calls", "tokens", "spend"].map((family) => {
                           const verdict = row.limits.find((l) => l.family === family);
