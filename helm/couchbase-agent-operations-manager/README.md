@@ -188,9 +188,7 @@ operations-manager Pod as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and
   provider without a key answers cache misses from a labelled
   deterministic stub, so caching, the savings dashboard and invalidation
   all work with no outbound access - you can install first and add keys
-  later. Databricks Model Serving works the same way:
-  `providerApiKeys.databricks` plus `databricks.host` (and optionally
-  `databricks.servingEndpoints`) - the token is ignored without the host.
+  later.
 - **Pass them on every upgrade.** Unlike the generated Couchbase password
   and agent API keys, provider keys aren't read back from the existing
   Secret: a `helm upgrade` without `-f secrets.values.yaml` (or

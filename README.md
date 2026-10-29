@@ -698,14 +698,13 @@ spent at all.
 
 ### Choosing the LLM
 
-Claude, ChatGPT, Gemini and Databricks Model Serving are all selectable
-from **LLM Caching -> Providers & Policy**, each with its own model list
-and list-price estimates (`operations-manager/app/llm_cache.py`). Set
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` in `.env` to
-proxy calls for real. For Databricks, set `DATABRICKS_HOST` (the
-workspace URL) and `DATABRICKS_TOKEN`; each "model" is a serving endpoint
-name, and `DATABRICKS_SERVING_ENDPOINTS` (comma-separated) adds your own
-custom or provisioned-throughput endpoints to the list. On Kubernetes, see
+Claude, ChatGPT and Gemini are all selectable from **LLM Caching ->
+Providers & Policy**, each with its own model list and list-price
+estimates (`operations-manager/app/llm_cache.py`). The bundled default is
+ChatGPT's low-cost `gpt-5.6-luna` (`LLM_CACHE_PROVIDER` /
+`LLM_CACHE_MODEL` in `.env`), so a fresh install spends as little as
+possible once a key is set. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or
+`GEMINI_API_KEY` in `.env` to proxy calls for real. On Kubernetes, see
 [LLM provider API keys](./helm/couchbase-agent-operations-manager/README.md#llm-provider-api-keys)
 in the chart README. Keys are read at startup, so restart
 operations-manager after adding or changing one

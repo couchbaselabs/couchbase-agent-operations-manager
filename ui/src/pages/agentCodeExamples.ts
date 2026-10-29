@@ -380,7 +380,7 @@ if __name__ == "__main__":
         },
         {
           "title": "Check the appliance settings it relies on",
-          "body": "Providers & Policy needs the `databricks` provider enabled (`DATABRICKS_TOKEN` and `DATABRICKS_HOST` on the operations manager), or drop `provider=` in the script to use the appliance default. Without a live provider key, `complete()` answers from an offline stub. Optionally, cap this agent's call rate and spend under Limits & Budgets, and review Guardrails & PII for what Databricks results are allowed to contain."
+          "body": "The script follows the appliance's LLM policy (the global default on Providers & Policy, or a per-role / per-agent override for this key); set `LLM_PROVIDER`/`LLM_MODEL` in the environment to pin one. Without a live provider key, `complete()` answers from an offline stub. Optionally, cap this agent's call rate and spend under Limits & Budgets, and review Guardrails & PII for what Databricks results are allowed to contain."
         },
         {
           "title": "Verify",
@@ -416,8 +416,9 @@ through AOM's LLM gateway. Two ways to reach the data:
     export DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/abc123def456
     export DATABRICKS_TOKEN=dapi...
 
-The appliance needs the \`databricks\` LLM provider enabled - see LLM Caching ->
-Providers & Policy. Drop provider= below to use the appliance's default model.
+Which LLM answers is the appliance's call (LLM Caching -> Providers & Policy:
+the global default, or a per-role / per-agent override for this key). Set
+LLM_PROVIDER and LLM_MODEL to pin one for this script instead.
 
 Caching layers:
   1. Context Cache  - table schemas (DESCRIBE TABLE, 6 h) and query results
@@ -440,8 +441,8 @@ from aom_sdk import (
 )
 
 NAMESPACE = "databricks-lakehouse"
-LLM_PROVIDER = "databricks"
-LLM_MODEL = os.environ.get("DATABRICKS_LLM_MODEL", "databricks-meta-llama-3-3-70b-instruct")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER") or None   # None = appliance policy decides
+LLM_MODEL = os.environ.get("LLM_MODEL") or None
 TABLES = [t.strip() for t in os.environ.get("DATABRICKS_TABLES", "main.sales.orders").split(",") if t.strip()]
 MCP_SERVER = os.environ.get("DATABRICKS_MCP_SERVER", "")      # AOM Server ID; empty = direct
 QUERY_TOOL = os.environ.get("DATABRICKS_QUERY_TOOL", "execute_sql")

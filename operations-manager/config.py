@@ -303,9 +303,6 @@ LLM_API_KEYS = {
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
     "openai": os.getenv("OPENAI_API_KEY", ""),
     "google": os.getenv("GEMINI_API_KEY", ""),
-    # Databricks needs a workspace URL as well as a token; without
-    # DATABRICKS_HOST the provider is treated as unconfigured (offline stub).
-    "databricks": os.getenv("DATABRICKS_TOKEN", "") if os.getenv("DATABRICKS_HOST", "").strip() else "",
 }
 
 # Runtime cache policy lives in Couchbase (settings::llm_cache) because it is
@@ -314,8 +311,8 @@ LLM_API_KEYS = {
 # settings collection - after that, the stored document wins.
 LLM_CACHE_DEFAULTS = {
     "enabled": os.getenv("LLM_CACHE_ENABLED", "true").lower() != "false",
-    "provider": os.getenv("LLM_CACHE_PROVIDER", "anthropic"),
-    "model": os.getenv("LLM_CACHE_MODEL", "claude-sonnet-4-5"),
+    "provider": os.getenv("LLM_CACHE_PROVIDER", "openai"),
+    "model": os.getenv("LLM_CACHE_MODEL", "gpt-5.6-luna"),
     "ttl_seconds": int(os.getenv("LLM_CACHE_TTL_SECONDS", "3600")),
     "max_entries": int(os.getenv("LLM_CACHE_MAX_ENTRIES", "5000")),
     "similarity_threshold": float(os.getenv("LLM_CACHE_SIMILARITY_THRESHOLD", "0.94")),

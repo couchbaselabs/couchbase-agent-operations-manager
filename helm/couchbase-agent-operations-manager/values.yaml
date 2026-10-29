@@ -235,8 +235,8 @@ operationsManager:
 
   llmCache:
     enabled: true
-    provider: anthropic
-    model: claude-sonnet-4-5
+    provider: openai
+    model: gpt-5.6-luna
     ttlSeconds: 3600
     maxEntries: 5000
     semanticEnabled: true
@@ -250,9 +250,6 @@ operationsManager:
     anthropic: ""
     openai: ""
     gemini: ""
-    # Databricks Model Serving: a personal access token or service
-    # principal token. Needs databricks.host below as well.
-    databricks: ""
     # Hosted embedding models for Knowledge Base knowledge sets (optional;
     # OpenAI and Gemini embeddings reuse the keys above).
     voyage: ""
@@ -264,13 +261,6 @@ operationsManager:
   # recently used is unloaded). The largest local models need ~2GB of RAM
   # each - raise resources.limits.memory before raising this.
   embeddingMaxLoadedModels: 2
-
-  databricks:
-    # Workspace URL, e.g. https://dbc-1234abcd-5678.cloud.databricks.com
-    host: ""
-    # Extra serving endpoints (custom or provisioned throughput) to offer
-    # as models, comma-separated.
-    servingEndpoints: ""
 
   audit:
     logRetentionHours: 720
