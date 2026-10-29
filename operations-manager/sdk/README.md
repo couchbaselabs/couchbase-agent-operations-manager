@@ -400,7 +400,8 @@ servers, so each one works on a fresh install with no real credentials:
 
 | Example | What it shows |
 |---|---|
-| `quickstart.py` | Discover, invoke, complete, remember - the whole gateway in one file. |
+| `all_in_one.py` | **Start here.** Every agent-facing call in one traced run - catalog, schema-aware discover/invoke, cached completions, context cache, memory, knowledge, RAG - each stage skipping cleanly when it isn't set up. |
+| `quickstart.py` | Discover, invoke, complete - the minimal four-call version. |
 | `traced_run.py` | Grouping an agent's work into one traced run. |
 | `approvals.py` | A tool held for human approval, polled and then executed. |
 | `knowledge_and_guardrails.py` | Role-filtered retrieval, and what a refused payload looks like. |
@@ -412,7 +413,16 @@ servers, so each one works on a fresh install with no real credentials:
 
 ```bash
 AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \
-    AOM_VERIFY_SSL=false python examples/quickstart.py
+    AOM_VERIFY_SSL=false python examples/all_in_one.py
+```
+
+Most tools have required arguments (see the `input_schema` the example
+prints). Pass them as JSON, otherwise the invoke stage explains what is
+missing rather than sending `{}` and failing inside the downstream server:
+
+```bash
+AOM_TOOL_ID=tat_help::get_neighbor_chunks AOM_TOOL_ARGS='{"query": "ct slip header"}' \
+    python examples/all_in_one.py
 ```
 
 ## Full API reference
