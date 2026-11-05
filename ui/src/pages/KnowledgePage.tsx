@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { EmbeddingModelOption, KnowledgeChunkResult, KnowledgeJob, KnowledgeResponse } from "../api/types";
+import type {
+  EmbeddingModelOption,
+  KnowledgeChunkResult,
+  KnowledgeJob,
+  KnowledgeResponse,
+  KnowledgeStorageResponse,
+} from "../api/types";
 import { usePoll } from "../hooks/usePoll";
 import { WarehouseSyncsPanel } from "../components/knowledge/WarehouseSyncsPanel";
 
@@ -27,6 +33,65 @@ const IMPORT_HELP: Record<string, string> = {
 };
 
 const NEW_SET = "__new__";
+// Sentinel for "type a new name" in the bucket / scope / collection pickers.
+const NEW_NAME = "__new__";
+
+const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_%.-]{0,250}$/;
+
+function ChooseOrCreate({
+  label,
+  options,
+  choice,
+  newName,
+  placeholder,
+  hint,
+  onChoice,
+  onNewName,
+  disabled,
+}: {
+  label: string;
+  options: { value: string; label: string; disabled?: boolean; title?: string }[];
+  choice: string;
+  newName: string;
+  placeholder: string;
+  hint?: string;
+  onChoice: (v: string) => void;
+  onNewName: (v: string) => void;
+  disabled?: boolean;
+}) {
+  const creating = choice === NEW_NAME;
+  const bad = creating && newName.trim() !== "" && !NAME_PATTERN.test(newName.trim());
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <select value={choice} onChange={(e) => onChoice(e.target.value)} disabled={disabled}>
+        {options.map((o) => (
+          <option key={o.value} value={o.value} disabled={o.disabled} title={o.title}>
+            {o.label}
+          </option>
+        ))}
+        <option value={NEW_NAME}>+ Create a new {label.toLowerCase()}...</option>
+      </select>
+      {creating && (
+        <input
+          type="text"
+          value={newName}
+          placeholder={placeholder}
+          onChange={(e) => onNewName(e.target.value)}
+          style={{ marginTop: 6 }}
+          autoFocus
+        />
+      )}
+      {bad ? (
+        <div className="error-note" style={{ marginTop: 4 }}>
+          Letters, digits, '-', '_' and '%' only; must start with a letter or digit.
+        </div>
+      ) : hint ? (
+        <div className="field-hint">{hint}</div>
+      ) : null}
+    </div>
+  );
+}
 
 // Expiry choices for a new document, and for changing one later.
 const EXPIRY_OPTIONS: Array<{ value: string; label: string; seconds?: number }> = [
@@ -145,6 +210,19 @@ export function KnowledgePage() {
   const [newSetDescription, setNewSetDescription] = useState("");
   const [creatingSet, setCreatingSet] = useState(false);
   const [searchSetId, setSearchSetId] = useState("default");
+
+  // Where the new set keeps its chunks: an existing bucket/scope/collection
+  // on the cluster, or new ones AOM creates. See /v1/knowledge/storage.
+  const [storage, setStorage] = useState<KnowledgeStorageResponse | null>(null);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [bucketChoice, setBucketChoice] = useState("");
+  const [bucketNew, setBucketNew] = useState("");
+  const [bucketRamMb, setBucketRamMb] = useState(256);
+  const [scopeChoice, setScopeChoice] = useState("");
+  const [scopeNew, setScopeNew] = useState("");
+  const [collectionChoice, setCollectionChoice] = useState("");
+  const [collectionNew, setCollectionNew] = useState("");
 
   const [importKind, setImportKind] = useState<"huggingface" | "openai_compatible">("huggingface");
   const [importName, setImportName] = useState("");
@@ -419,6 +497,75 @@ export function KnowledgePage() {
     }
   }
 
+  const loadStorage = useCallback(async () => {
+    setStorageLoading(true);
+    setStorageError(null);
+    try {
+      const res = await api.getKnowledgeStorage();
+      setStorage(res);
+      setBucketRamMb(res.default_bucket_ram_quota_mb || 256);
+      // Start on the appliance's own knowledge collection, the same place
+      // the default set uses - sharing it is the safe, zero-setup choice.
+      setBucketChoice((c) => c || res.default.bucket);
+      setScopeChoice((c) => c || res.default.scope);
+      setCollectionChoice((c) => c || res.default.collection);
+    } catch (e: any) {
+      setStorageError(e.message || "Could not list the cluster's buckets");
+    } finally {
+      setStorageLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (setId === NEW_SET && !storage && !storageLoading && !storageError) void loadStorage();
+  }, [setId, storage, storageLoading, storageError, loadStorage]);
+
+  const effectiveBucket = bucketChoice === NEW_NAME ? bucketNew.trim() : bucketChoice;
+  const effectiveScope = scopeChoice === NEW_NAME ? scopeNew.trim() : scopeChoice;
+  const effectiveCollection = collectionChoice === NEW_NAME ? collectionNew.trim() : collectionChoice;
+  const storageBucket = storage?.buckets.find((b) => b.name === bucketChoice) || null;
+  const storageScope = storageBucket?.scopes.find((sc) => sc.name === scopeChoice) || null;
+  const storageCollection = storageScope?.collections.find((c) => c.name === collectionChoice) || null;
+  const storageCreates = [
+    bucketChoice === NEW_NAME ? "bucket" : null,
+    scopeChoice === NEW_NAME ? "scope" : null,
+    collectionChoice === NEW_NAME ? "collection" : null,
+  ].filter(Boolean) as string[];
+  const storageValid =
+    !!effectiveBucket &&
+    !!effectiveScope &&
+    !!effectiveCollection &&
+    (bucketChoice !== NEW_NAME || NAME_PATTERN.test(effectiveBucket)) &&
+    (scopeChoice !== NEW_NAME || NAME_PATTERN.test(effectiveScope)) &&
+    (collectionChoice !== NEW_NAME || NAME_PATTERN.test(effectiveCollection)) &&
+    !storageCollection?.reserved;
+
+  function chooseBucket(v: string) {
+    setBucketChoice(v);
+    const b = storage?.buckets.find((x) => x.name === v);
+    if (v === NEW_NAME || !b) {
+      // A brand-new bucket only has _default; anything else is created.
+      setScopeChoice(NEW_NAME);
+      setCollectionChoice(NEW_NAME);
+      return;
+    }
+    const sc = b.scopes.find((x) => x.aom) || b.scopes.find((x) => x.name !== "_default") || b.scopes[0];
+    setScopeChoice(sc ? sc.name : NEW_NAME);
+    const c = sc?.collections.find((x) => x.default_knowledge) || sc?.collections.find((x) => !x.reserved);
+    setCollectionChoice(c ? c.name : NEW_NAME);
+  }
+
+  function chooseScope(v: string) {
+    setScopeChoice(v);
+    const sc = storageBucket?.scopes.find((x) => x.name === v);
+    if (v === NEW_NAME || !sc) {
+      setCollectionChoice(NEW_NAME);
+      return;
+    }
+    const c = sc.collections.find((x) => x.default_knowledge) || sc.collections.find((x) => !x.reserved);
+    setCollectionChoice(c ? c.name : NEW_NAME);
+  }
+
   async function handleCreateSet() {
     setCreatingSet(true);
     setError(null);
@@ -428,11 +575,19 @@ export function KnowledgePage() {
         name: newSetName,
         model_id: newSetModel,
         description: newSetDescription,
+        bucket: effectiveBucket,
+        scope: effectiveScope,
+        collection: effectiveCollection,
+        create_missing: true,
+        bucket_ram_quota_mb: bucketRamMb,
       });
       const local = res.set.provider === "local";
+      const created = res.storage_created?.length
+        ? ` Created the ${res.storage_created.join(", ")} ${res.storage_created.length > 1 ? "" : ""}on the cluster.`
+        : "";
       setNotice(
         `Created knowledge set "${res.set.name}" on ${res.set.model_label} (${res.set.dims} dimensions) with its own ` +
-          `vector index.` +
+          `vector index, stored in ${res.set.location_label}.${created}` +
           (local && !models.find((m) => m.id === res.set.model_id)?.is_default
             ? " The model is downloading in the background - the first upload may wait for it to finish."
             : "")
@@ -440,6 +595,13 @@ export function KnowledgePage() {
       setNewSetName("");
       setNewSetModel("");
       setNewSetDescription("");
+      setBucketChoice("");
+      setBucketNew("");
+      setScopeChoice("");
+      setScopeNew("");
+      setCollectionChoice("");
+      setCollectionNew("");
+      setStorage(null);
       setSetId(res.set.set_id);
       await load();
     } catch (e: any) {
@@ -807,6 +969,113 @@ export function KnowledgePage() {
                   </div>
                 )}
 
+                <div className="field" style={{ marginBottom: 6 }}>
+                  <label>Where this set stores its chunks</label>
+                  <div className="field-hint" style={{ marginTop: 0 }}>
+                    Chunks and their vectors are written to a Couchbase bucket, scope and collection of your choosing;
+                    pick existing ones or have AOM create them. The set&rsquo;s vector index is built there, and
+                    retrieval still applies the same RBAC pre-filter wherever the chunks live. The document list
+                    itself stays in AOM&rsquo;s own collection.
+                  </div>
+                </div>
+                {storageError ? (
+                  <div className="error-note" style={{ marginBottom: 12 }}>
+                    {storageError}{" "}
+                    <button className="btn btn-secondary btn-sm" type="button" onClick={() => void loadStorage()}>
+                      Retry
+                    </button>
+                  </div>
+                ) : !storage ? (
+                  <div className="cell-muted" style={{ marginBottom: 12 }}>Listing buckets on the cluster...</div>
+                ) : (
+                  <div className="three-col-fields" style={{ marginBottom: 12 }}>
+                    <ChooseOrCreate
+                      label="Bucket"
+                      options={storage.buckets.map((b) => ({
+                        value: b.name,
+                        label: `${b.name}${b.aom ? " (AOM's own)" : ""}${b.ram_quota_mb ? ` · ${b.ram_quota_mb} MB` : ""}`,
+                        disabled: !!b.error,
+                        title: b.error,
+                      }))}
+                      choice={bucketChoice}
+                      newName={bucketNew}
+                      placeholder="e.g. knowledge"
+                      hint={
+                        bucketChoice === NEW_NAME
+                          ? "A new Couchbase bucket (type: Couchbase, no flush). Needs cluster-admin credentials."
+                          : undefined
+                      }
+                      onChoice={chooseBucket}
+                      onNewName={setBucketNew}
+                    />
+                    <ChooseOrCreate
+                      label="Scope"
+                      options={
+                        storageBucket
+                          ? storageBucket.scopes.map((sc) => ({
+                              value: sc.name,
+                              label: `${sc.name}${sc.aom ? " (AOM's own)" : ""}`,
+                            }))
+                          : []
+                      }
+                      choice={scopeChoice}
+                      newName={scopeNew}
+                      placeholder="e.g. rag"
+                      onChoice={chooseScope}
+                      onNewName={setScopeNew}
+                      disabled={!effectiveBucket}
+                    />
+                    <ChooseOrCreate
+                      label="Collection"
+                      options={
+                        storageScope
+                          ? storageScope.collections.map((c) => ({
+                              value: c.name,
+                              label:
+                                `${c.name}` +
+                                (c.default_knowledge ? " (default set lives here)" : "") +
+                                (c.reserved ? " (AOM internal)" : "") +
+                                (c.sets.length && !c.default_knowledge ? ` · used by ${c.sets.join(", ")}` : ""),
+                              disabled: c.reserved,
+                              title: c.reserved ? "Holds the operations manager's own state" : undefined,
+                            }))
+                          : []
+                      }
+                      choice={collectionChoice}
+                      newName={collectionNew}
+                      placeholder="e.g. contracts_chunks"
+                      hint={
+                        collectionChoice !== NEW_NAME && storageCollection?.sets.length
+                          ? "Already used by another set; that's fine - each set only ever searches its own index."
+                          : undefined
+                      }
+                      onChoice={setCollectionChoice}
+                      onNewName={setCollectionNew}
+                      disabled={!effectiveScope}
+                    />
+                  </div>
+                )}
+                {storage && bucketChoice === NEW_NAME && (
+                  <div className="field" style={{ maxWidth: 260 }}>
+                    <label>New bucket RAM quota (MB)</label>
+                    <input
+                      type="number"
+                      min={64}
+                      max={1000000}
+                      step={64}
+                      value={bucketRamMb}
+                      onChange={(e) => setBucketRamMb(Math.max(64, parseInt(e.target.value || "0", 10) || 64))}
+                    />
+                    <div className="field-hint">Per node. 256 MB is plenty for a few hundred thousand chunks.</div>
+                  </div>
+                )}
+                {storage && storageValid && (
+                  <div className="cell-muted cell-mono" style={{ fontSize: 12.5, marginBottom: 12 }}>
+                    {effectiveBucket}.{effectiveScope}.{effectiveCollection}
+                    {storageCreates.length ? ` - AOM will create the ${storageCreates.join(", ")}` : " - exists"}
+                  </div>
+                )}
+
                 <div className="field">
                   <label>Description (optional)</label>
                   <input
@@ -819,10 +1088,16 @@ export function KnowledgePage() {
                 <button
                   className="btn btn-secondary"
                   type="button"
-                  disabled={creatingSet || !newSetName.trim() || !newSetModel || newSetModel === IMPORT_MODEL}
+                  disabled={
+                    creatingSet || !newSetName.trim() || !newSetModel || newSetModel === IMPORT_MODEL || !storageValid
+                  }
                   onClick={handleCreateSet}
                 >
-                  {creatingSet ? "Creating set and vector index..." : "Create knowledge set"}
+                  {creatingSet
+                    ? storageCreates.length
+                      ? `Creating ${storageCreates.join(", ")}, set and vector index...`
+                      : "Creating set and vector index..."
+                    : "Create knowledge set"}
                 </button>
               </div>
             )}
@@ -1420,6 +1695,7 @@ export function KnowledgePage() {
                     <th style={{ textAlign: "right" }}>Dims</th>
                     <th style={{ textAlign: "right" }}>Documents</th>
                     <th style={{ textAlign: "right" }}>Chunks</th>
+                    <th>Storage</th>
                     <th>Vector index</th>
                     <th>RAG apps</th>
                     <th></th>
@@ -1444,6 +1720,9 @@ export function KnowledgePage() {
                       <td className="cell-mono" style={{ textAlign: "right" }}>{s.dims}</td>
                       <td className="cell-mono" style={{ textAlign: "right" }}>{s.document_count}</td>
                       <td className="cell-mono" style={{ textAlign: "right" }}>{s.chunk_count}</td>
+                      <td className="cell-muted cell-mono" style={{ fontSize: 12 }} title="bucket.scope.collection">
+                        {s.location_label}
+                      </td>
                       <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>{s.index_name}</td>
                       <td className="cell-muted cell-mono" style={{ fontSize: 12 }}>
                         {s.rag_apps.length ? s.rag_apps.join(", ") : "-"}

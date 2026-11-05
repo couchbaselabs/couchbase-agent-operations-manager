@@ -71,7 +71,7 @@ from app import (
     warehouse_sync,
 )
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
-from app.couchbase_client import CouchbaseStore, set_siem_config_provider
+from app.couchbase_client import CouchbaseStore, default_knowledge_location, set_siem_config_provider
 from app.embeddings import ToolEmbeddings
 from app import rbac_policy
 from app.rbac_policy import ROLES, normalize_tool_policies
@@ -5708,6 +5708,15 @@ class KnowledgeSetRequest(BaseModel):
     model_id: str
     set_id: str | None = None
     description: str = ""
+    # Where the set keeps its chunks: any bucket/scope/collection on the
+    # cluster. Omitted parts default to the operations manager's own
+    # knowledge collection. With `create_missing`, AOM creates whichever of
+    # the three doesn't exist yet (a new bucket gets `bucket_ram_quota_mb`).
+    bucket: str | None = None
+    scope: str | None = None
+    collection: str | None = None
+    create_missing: bool = True
+    bucket_ram_quota_mb: int = 256
 
 
 @app.get("/v1/knowledge")
@@ -5874,12 +5883,12 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
                 # On every chunk, so retrieval can hide an expired chunk on its
                 # own without a lookup of the parent document.
                 chunk_doc["expires_at"] = expires_at
-            await store.upsert_knowledge_chunk(chunk_doc)
+            await store.upsert_knowledge_chunk(chunk_doc, kset.get("location"))
     except BaseException:
         # A failure or a request timeout part-way through would otherwise
         # leave chunks that retrieval still returns but that belong to no
         # listed document - so nobody could see or delete them.
-        spawn(store.delete_knowledge_document(document_id))
+        spawn(store.delete_knowledge_document(document_id, kset.get("location")))
         raise
 
     doc = knowledge.build_document_doc(
@@ -6541,7 +6550,7 @@ async def search_knowledge_route(
         raise HTTPException(status_code=502, detail=f"Embedding with {kset['model_id']} failed: {exc}") from exc
     results = await store.search_knowledge(
         role, vector, top_k=max(1, min(req.top_k, 25)), document_id=req.document_id,
-        index_name=kset["index_name"], vector_field=kset["vector_field"],
+        index_name=kset["index_name"], vector_field=kset["vector_field"], location=kset.get("location"),
     )
     # Each set has its own index, so this only ever drops something if an
     # index were misconfigured - the same belt-and-braces re-check the role
@@ -7368,6 +7377,7 @@ def _default_knowledge_set() -> dict:
         model["id"] if model else EMBEDDING_CONFIG["model_name"],
         int(EMBEDDING_CONFIG["vector_dim"]),
         COUCHBASE_CONFIG["knowledge_index"],
+        default_knowledge_location(),
     )
 
 
@@ -7426,6 +7436,8 @@ def public_knowledge_sets(documents: list[dict] | None = None) -> list[dict]:
             "provider": provider,
             "provider_label": embedding_models.PROVIDERS.get(provider, (provider, ""))[0],
             "available": embedding_models.is_available(model) if model else True,
+            "location": s.get("location") or default_knowledge_location(),
+            "location_label": knowledge_sets.location_label(s.get("location"), default_knowledge_location()),
             "document_count": counts.get(s["set_id"], {}).get("documents", 0),
             "chunk_count": counts.get(s["set_id"], {}).get("chunks", 0),
             "rag_apps": sorted(a for a, app in rag_apps_registry.items()
@@ -7442,12 +7454,23 @@ async def load_knowledge_sets():
         if set_id == knowledge_sets.DEFAULT_SET_ID or not embedding_models.resolve(s.get("model_id", "")):
             logger.warning("Skipping invalid stored knowledge set '%s'", set_id)
             continue
+        # Sets stored before storage locations existed live in the
+        # appliance's own knowledge collection.
+        s.setdefault("location", default_knowledge_location())
         sets[set_id] = s
     knowledge_sets_registry = sets
-    # Idempotent: recreates a set's index if the cluster lost it (a restore,
-    # a fresh Search node), and is a no-op otherwise.
+    # Idempotent: recreates a set's collection/GSI indexes and vector index
+    # if the cluster lost them (a restore, a fresh Search node), and is a
+    # no-op otherwise. A location that can't be reached is logged, not
+    # fatal - the set stays listed so the operator can see what's wrong.
     for s in sets.values():
-        await store.ensure_knowledge_index(s["index_name"], s["vector_field"], s["dims"])
+        try:
+            await store.ensure_knowledge_location(s["location"], create=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Knowledge set '%s' storage %s unavailable: %s",
+                           s["set_id"], knowledge_sets.location_label(s["location"], default_knowledge_location()), exc)
+            store.register_knowledge_location(s["location"])
+        await store.ensure_knowledge_index(s["index_name"], s["vector_field"], s["dims"], s["location"])
     logger.info("Knowledge sets loaded (%d besides the default)", len(sets))
 
 
@@ -7471,6 +7494,35 @@ async def list_embedding_models(request: Request):
     }
 
 
+@app.get("/v1/knowledge/storage")
+async def list_knowledge_storage(request: Request):
+    """Buckets, scopes and collections on the cluster, for choosing where a
+    knowledge set keeps its chunks. Each collection says which sets (if
+    any) already use it, so an operator can share one or pick a fresh one."""
+    require_admin(request)
+    if not store.connected:
+        raise HTTPException(status_code=503, detail="Couchbase is not connected")
+    try:
+        buckets = await store.list_knowledge_storage()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not list buckets: {exc}") from exc
+    in_use: dict[str, list[str]] = {}
+    for s in all_knowledge_sets().values():
+        in_use.setdefault(
+            knowledge_sets.location_label(s.get("location"), default_knowledge_location()), []
+        ).append(s["set_id"])
+    for b in buckets:
+        for sc in b["scopes"]:
+            for c in sc["collections"]:
+                c["sets"] = in_use.get(f"{b['name']}.{sc['name']}.{c['name']}", [])
+    return {
+        "buckets": buckets,
+        "default": default_knowledge_location(),
+        "can_create": True,
+        "default_bucket_ram_quota_mb": 256,
+    }
+
+
 @app.post("/v1/knowledge/sets")
 async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
     """Create a knowledge set: pick its embedding model, and AOM creates the
@@ -7491,14 +7543,19 @@ async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
         env = embedding_models.PROVIDERS[model["provider"]][1]
         raise HTTPException(status_code=400, detail=f"{model['label']} needs {env} set on the operations manager")
     try:
+        location = knowledge_sets.validate_location(
+            {"bucket": req.bucket, "scope": req.scope, "collection": req.collection}, default_knowledge_location(),
+        )
         kset = knowledge_sets.new_set(
             name=req.name, set_id=req.set_id, model=model, base_index_name=COUCHBASE_CONFIG["knowledge_index"],
-            description=req.description, created_by=user.get("username"),
+            description=req.description, created_by=user.get("username"), location=location,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if kset["set_id"] in all_knowledge_sets():
         raise HTTPException(status_code=409, detail=f"Knowledge set '{kset['set_id']}' already exists")
+    if not (64 <= req.bucket_ram_quota_mb <= 1_000_000):
+        raise HTTPException(status_code=400, detail="bucket_ram_quota_mb must be between 64 and 1,000,000")
 
     embedder = embedding_models.SetEmbedder(
         kset["model_id"], default_embeddings=embeddings, default_model_id=EMBEDDING_CONFIG["model_name"],
@@ -7509,8 +7566,24 @@ async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"{model['label']} test call failed: {exc}") from exc
 
-    if not await store.ensure_knowledge_index(kset["index_name"], kset["vector_field"], kset["dims"]):
+    # The storage location first - bucket, scope and collection created if
+    # asked to - then the set's vector index inside it.
+    try:
+        created = await store.ensure_knowledge_location(
+            location, create=req.create_missing, bucket_ram_mb=req.bucket_ram_quota_mb,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=f"{exc} (tick 'create it' to have AOM create it)") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not prepare {knowledge_sets.location_label(location, default_knowledge_location())}: {exc}",
+        ) from exc
+    if not await store.ensure_knowledge_index(kset["index_name"], kset["vector_field"], kset["dims"], location):
         raise HTTPException(status_code=502, detail=f"Could not create vector index '{kset['index_name']}' in Couchbase")
+    kset["storage_created"] = [k for k, v in created.items() if v]
 
     knowledge_sets_registry[kset["set_id"]] = kset
     _set_embedders[kset["set_id"]] = embedder
@@ -7524,8 +7597,12 @@ async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Warming local embedding model '%s' failed: %s", model["id"], exc)
         spawn(_warm())
-    logger.info("Knowledge set '%s' created on %s by %s", kset["set_id"], model["id"], user.get("username"))
-    return {"set": next(s for s in public_knowledge_sets() if s["set_id"] == kset["set_id"])}
+    logger.info("Knowledge set '%s' created on %s at %s by %s", kset["set_id"], model["id"],
+                knowledge_sets.location_label(location, default_knowledge_location()), user.get("username"))
+    return {
+        "set": next(s for s in public_knowledge_sets() if s["set_id"] == kset["set_id"]),
+        "storage_created": kset["storage_created"],
+    }
 
 
 @app.delete("/v1/knowledge/sets/{set_id}")
@@ -7542,9 +7619,15 @@ async def delete_knowledge_set(set_id: str, request: Request):
     users = [a for a, app in rag_apps_registry.items() if app.get("set_id") == set_id]
     if users:
         raise HTTPException(status_code=409, detail=f"RAG application(s) {users} use this set - move or delete them first")
-    await store.delete_knowledge_index(kset["index_name"])
+    await store.delete_knowledge_index(kset["index_name"], kset.get("location"))
     knowledge_sets_registry.pop(set_id, None)
     _set_embedders.pop(set_id, None)
+    # The collection itself is left alone: it may hold other data, and
+    # deleting storage is an operator's call, not a side effect.
+    others = [s for s in knowledge_sets_registry.values()
+              if knowledge_sets.location_label(s.get("location"), default_knowledge_location())
+              == knowledge_sets.location_label(kset.get("location"), default_knowledge_location())]
+    store.unregister_knowledge_location(kset.get("location"), still_used=bool(others))
     await save_knowledge_sets()
     bump_knowledge_generation()
     return {"deleted": True, "set_id": set_id}
@@ -7711,7 +7794,8 @@ async def set_knowledge_expiry(document_id: str, req: KnowledgeExpiryRequest, re
     if not doc:
         raise HTTPException(status_code=404, detail="No such document")
     expires_at = resolve_document_expiry(req.ttl_seconds, req.expires_at)
-    updated = await store.update_knowledge_expiry(document_id, expires_at)
+    location = all_knowledge_sets().get(doc.get("set_id") or knowledge_sets.DEFAULT_SET_ID, {}).get("location")
+    updated = await store.update_knowledge_expiry(document_id, expires_at, location)
     bump_knowledge_generation()
     await store.log_access(
         action="knowledge_expiry", role=user.get("role"), subject_label=user.get("username"),

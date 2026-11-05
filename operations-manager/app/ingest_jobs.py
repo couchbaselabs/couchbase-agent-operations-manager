@@ -550,7 +550,7 @@ class IngestRunner:
                 if expires_at:
                     chunk_doc["expires_at"] = expires_at
                 docs.append(chunk_doc)
-            await self.store.upsert_knowledge_chunks(docs)
+            await self.store.upsert_knowledge_chunks(docs, kset.get("location"))
 
         index = first_index
         batch: list[tuple[int, str]] = []

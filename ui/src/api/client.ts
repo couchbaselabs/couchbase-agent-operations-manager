@@ -30,6 +30,7 @@ import type {
   WarehouseSyncsResponse,
   WarehouseSyncTestResult,
   KnowledgeSet,
+  KnowledgeStorageResponse,
   EmbeddingModelOption,
   RagApp,
   RagAppsResponse,
@@ -624,8 +625,22 @@ export const api = {
     request<{ deleted: boolean; model_id: string }>(`/v1/knowledge/embedding-models/${modelId}`, {
       method: "DELETE",
     }),
-  createKnowledgeSet: (payload: { name: string; model_id: string; set_id?: string; description?: string }) =>
-    request<{ set: KnowledgeSet }>("/v1/knowledge/sets", { method: "POST", body: JSON.stringify(payload) }),
+  getKnowledgeStorage: () => request<KnowledgeStorageResponse>("/v1/knowledge/storage"),
+  createKnowledgeSet: (payload: {
+    name: string;
+    model_id: string;
+    set_id?: string;
+    description?: string;
+    bucket?: string;
+    scope?: string;
+    collection?: string;
+    create_missing?: boolean;
+    bucket_ram_quota_mb?: number;
+  }) =>
+    request<{ set: KnowledgeSet; storage_created: string[] }>("/v1/knowledge/sets", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   deleteKnowledgeSet: (setId: string) =>
     request<{ deleted: boolean; set_id: string }>(`/v1/knowledge/sets/${encodeURIComponent(setId)}`, {
       method: "DELETE",

@@ -15,6 +15,16 @@ chunk field `embedding`. Every chunk written before sets existed has no
 its own index (`<knowledge_index>__<key>`) over its own vector field
 (`embedding__<key>`), sized to its model's dimension.
 
+Every set also has a storage location - the bucket, scope and collection
+its chunks (text + vectors) are written to. The default set uses the
+appliance's own `knowledge` collection; any other set may use that too, or
+any other bucket/scope/collection on the cluster, chosen or created from
+the Knowledge Base page. The set's vector index is created in the
+location's bucket and scope and maps only that collection. Document
+metadata rows (what the Documents table lists) always stay in the
+appliance's own collection, so the operator catalog is one place however
+many collections hold chunks.
+
 Nothing in here talks to Couchbase; persistence is one settings document
 (see app/main.py) and the index lifecycle is in app/couchbase_client.py.
 """
@@ -23,6 +33,37 @@ import time
 
 DEFAULT_SET_ID = "default"
 SET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,31}$")
+# Couchbase bucket names: letters, digits, `.`, `-`, `_`, `%`, up to 100
+# chars. Scope and collection names: letters, digits, `-`, `_`, `%`, up to
+# 251 chars, and may not start with `_` or `%` (except the built-in
+# `_default`).
+BUCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._%-]{1,100}$")
+SCOPE_COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_%-]{0,250}$")
+
+
+def validate_location(location: dict | None, default: dict) -> dict:
+    """Normalize and validate a storage location, filling missing parts
+    from `default` (the appliance's own). Raises ValueError on a name
+    Couchbase would refuse."""
+    loc = {
+        "bucket": ((location or {}).get("bucket") or default["bucket"]).strip(),
+        "scope": ((location or {}).get("scope") or default["scope"]).strip(),
+        "collection": ((location or {}).get("collection") or default["collection"]).strip(),
+    }
+    if not BUCKET_NAME_PATTERN.match(loc["bucket"]):
+        raise ValueError("bucket name may use letters, digits, '.', '-', '_' and '%' (max 100 characters)")
+    for part in ("scope", "collection"):
+        if loc[part] != "_default" and not SCOPE_COLLECTION_NAME_PATTERN.match(loc[part]):
+            raise ValueError(
+                f"{part} name may use letters, digits, '-', '_' and '%', must not start with '_' or '%' "
+                f"(max 251 characters)"
+            )
+    return loc
+
+
+def location_label(location: dict | None, default: dict) -> str:
+    loc = location or default
+    return f"{loc['bucket']}.{loc['scope']}.{loc['collection']}"
 
 
 def slugify(name: str) -> str:
@@ -36,7 +77,7 @@ def storage_key(set_id: str) -> str:
     return re.sub(r"[^a-z0-9_]", "_", set_id)
 
 
-def default_set(model_id: str, dims: int, index_name: str) -> dict:
+def default_set(model_id: str, dims: int, index_name: str, location: dict) -> dict:
     return {
         "set_id": DEFAULT_SET_ID,
         "name": "Default",
@@ -45,6 +86,7 @@ def default_set(model_id: str, dims: int, index_name: str) -> dict:
         "dims": dims,
         "index_name": index_name,
         "vector_field": "embedding",
+        "location": dict(location),
         "builtin": True,
         "created_at": None,
         "created_by": None,
@@ -52,7 +94,7 @@ def default_set(model_id: str, dims: int, index_name: str) -> dict:
 
 
 def new_set(*, name: str, set_id: str | None, model: dict, base_index_name: str, description: str,
-            created_by: str | None) -> dict:
+            created_by: str | None, location: dict) -> dict:
     name = (name or "").strip()[:80]
     if not name:
         raise ValueError("name is required")
@@ -70,6 +112,7 @@ def new_set(*, name: str, set_id: str | None, model: dict, base_index_name: str,
         "dims": int(model["dims"]),
         "index_name": f"{base_index_name}__{key}",
         "vector_field": f"embedding__{key}",
+        "location": dict(location),
         "builtin": False,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "created_by": created_by,

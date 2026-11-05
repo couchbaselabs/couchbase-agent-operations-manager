@@ -1097,12 +1097,49 @@ export interface KnowledgeSet {
   dims: number;
   index_name: string;
   vector_field: string;
+  location: KnowledgeLocation;
+  location_label: string;
   builtin: boolean;
   document_count: number;
   chunk_count: number;
   rag_apps: string[];
   created_at: string | null;
   created_by: string | null;
+}
+
+/** Where a knowledge set keeps its chunks on the cluster. */
+export interface KnowledgeLocation {
+  bucket: string;
+  scope: string;
+  collection: string;
+}
+
+export interface KnowledgeStorageCollection {
+  name: string;
+  reserved: boolean;
+  default_knowledge: boolean;
+  sets: string[];
+}
+
+export interface KnowledgeStorageScope {
+  name: string;
+  aom: boolean;
+  collections: KnowledgeStorageCollection[];
+}
+
+export interface KnowledgeStorageBucket {
+  name: string;
+  ram_quota_mb: number | null;
+  aom: boolean;
+  scopes: KnowledgeStorageScope[];
+  error?: string;
+}
+
+export interface KnowledgeStorageResponse {
+  buckets: KnowledgeStorageBucket[];
+  default: KnowledgeLocation;
+  can_create: boolean;
+  default_bucket_ram_quota_mb: number;
 }
 
 export interface KnowledgeResponse {

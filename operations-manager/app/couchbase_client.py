@@ -65,6 +65,29 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
+# A knowledge storage location: where one knowledge set keeps its chunks.
+# `{"bucket": ..., "scope": ..., "collection": ...}` - see
+# app/knowledge_sets.py. The appliance's own knowledge collection is the
+# default; any other bucket/scope/collection on the same cluster can hold a
+# set, and gets that set's vector index and GSI indexes created in it.
+def default_knowledge_location() -> dict:
+    return {
+        "bucket": COUCHBASE_CONFIG["bucket"],
+        "scope": COUCHBASE_CONFIG["scope"],
+        "collection": COUCHBASE_CONFIG["knowledge_collection"],
+    }
+
+
+def location_key(location: dict | None) -> str:
+    loc = location or default_knowledge_location()
+    return f"{loc['bucket']}.{loc['scope']}.{loc['collection']}"
+
+
+def _keyspace(location: dict | None) -> str:
+    loc = location or default_knowledge_location()
+    return f"`{loc['bucket']}`.`{loc['scope']}`.`{loc['collection']}`"
+
+
 # Every collection this service reads or writes. Created on startup if
 # missing (see CouchbaseStore._ensure_collections) so a bring-your-own
 # cluster only needs the bucket and scope to exist.
@@ -163,6 +186,13 @@ class CouchbaseStore:
         self.counters = None
         self.approvals = None
         self.knowledge = None
+        # Collection handles for knowledge sets stored outside the
+        # appliance's own knowledge collection, keyed by location_key().
+        self._knowledge_collections: dict = {}
+        # Every location a knowledge set currently uses, keyed the same way,
+        # so document-wide operations (delete, expiry) can reach chunks
+        # wherever a set put them. Registered by main.py as sets load.
+        self._knowledge_locations: dict = {}
         self.connected = False
 
     async def connect(self, retries: int = 30, delay_seconds: float = 5.0):
@@ -345,6 +375,209 @@ class CouchbaseStore:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not ensure index (%s): %s", statement, exc)
 
+    # -- Knowledge storage locations ------------------------------------------
+    # A knowledge set may keep its chunks in any bucket/scope/collection on
+    # the cluster, not only the appliance's own `knowledge` collection. These
+    # browse what exists, create what an operator asked for, and hand back
+    # the collection handle the knowledge methods below write through.
+
+    def register_knowledge_location(self, location: dict | None) -> None:
+        loc = dict(location or default_knowledge_location())
+        self._knowledge_locations[location_key(loc)] = loc
+
+    def unregister_knowledge_location(self, location: dict | None, still_used: bool) -> None:
+        if not still_used and location_key(location) != location_key(None):
+            self._knowledge_locations.pop(location_key(location), None)
+            self._knowledge_collections.pop(location_key(location), None)
+
+    def knowledge_locations(self) -> list[dict]:
+        """Every distinct location in use, the appliance's own first."""
+        out = [default_knowledge_location()]
+        for key, loc in self._knowledge_locations.items():
+            if key != location_key(None):
+                out.append(loc)
+        return out
+
+    def _knowledge_collection(self, location: dict | None):
+        """The SDK collection handle for a location. The default location
+        is the handle opened at connect time; others are opened on first use
+        and cached (an SDK Collection object is cheap and long-lived)."""
+        if not location or location_key(location) == location_key(None):
+            return self.knowledge
+        key = location_key(location)
+        handle = self._knowledge_collections.get(key)
+        if handle is None:
+            handle = (
+                self.cluster.bucket(location["bucket"])
+                .scope(location["scope"])
+                .collection(location["collection"])
+            )
+            self._knowledge_collections[key] = handle
+        return handle
+
+    def _knowledge_scope(self, location: dict | None):
+        if not location or location_key(location) == location_key(None):
+            return self.scope
+        return self.cluster.bucket(location["bucket"]).scope(location["scope"])
+
+    async def list_knowledge_storage(self) -> list[dict]:
+        """Buckets on the cluster with their scopes and collections, for
+        the Knowledge Base's storage picker. Collections the appliance uses
+        for its own state (everything in its scope other than `knowledge`)
+        are marked reserved so they can't be chosen for chunks."""
+        if not self.connected:
+            return []
+        own_bucket, own_scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        reserved = {c for c in ALL_COLLECTIONS if c != COUCHBASE_CONFIG["knowledge_collection"]}
+
+        def _run():
+            buckets = []
+            for settings in self.cluster.buckets().get_all_buckets():
+                name = settings.name if hasattr(settings, "name") else settings["name"]
+                bucket_type = getattr(settings, "bucket_type", None)
+                bucket_type = getattr(bucket_type, "value", bucket_type) or ""
+                if str(bucket_type).lower() in ("memcached",):
+                    continue
+                ram_mb = getattr(settings, "ram_quota_mb", None)
+                entry = {"name": name, "ram_quota_mb": ram_mb, "aom": name == own_bucket, "scopes": []}
+                try:
+                    scopes = self.cluster.bucket(name).collections().get_all_scopes()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not list scopes of bucket '%s': %s", name, exc)
+                    entry["error"] = str(exc)[:200]
+                    buckets.append(entry)
+                    continue
+                for scope in scopes:
+                    if scope.name.startswith("_") and scope.name != "_default":
+                        continue
+                    entry["scopes"].append({
+                        "name": scope.name,
+                        "aom": name == own_bucket and scope.name == own_scope,
+                        "collections": [
+                            {
+                                "name": c.name,
+                                "reserved": name == own_bucket and scope.name == own_scope and c.name in reserved,
+                                "default_knowledge": (
+                                    name == own_bucket and scope.name == own_scope
+                                    and c.name == COUCHBASE_CONFIG["knowledge_collection"]
+                                ),
+                            }
+                            for c in scope.collections
+                        ],
+                    })
+                buckets.append(entry)
+            buckets.sort(key=lambda b: (not b["aom"], b["name"]))
+            return buckets
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_knowledge_storage failed: %s", exc)
+            raise
+
+    async def ensure_knowledge_location(self, location: dict, create: bool = True, bucket_ram_mb: int = 256) -> dict:
+        """Make a storage location usable for knowledge chunks: create the
+        bucket, scope and collection if asked to and missing, then the GSI
+        indexes delete/expiry/listing rely on. Returns what was created.
+        Raises (with a readable message) when something is missing and
+        `create` is False, or creation is not permitted for these credentials."""
+        own_bucket, own_scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        if (
+            location["bucket"] == own_bucket and location["scope"] == own_scope
+            and location["collection"] in ALL_COLLECTIONS
+            and location["collection"] != COUCHBASE_CONFIG["knowledge_collection"]
+        ):
+            raise ValueError(
+                f"'{location['collection']}' holds the operations manager's own state and can't store knowledge chunks"
+            )
+
+        def _run():
+            from couchbase.management.buckets import BucketType, CreateBucketSettings
+            from couchbase.exceptions import BucketAlreadyExistsException, ScopeAlreadyExistsException
+
+            created = {"bucket": False, "scope": False, "collection": False}
+            bucket_mgr = self.cluster.buckets()
+            existing_buckets = {
+                (b.name if hasattr(b, "name") else b["name"]) for b in bucket_mgr.get_all_buckets()
+            }
+            if location["bucket"] not in existing_buckets:
+                if not create:
+                    raise LookupError(f"Bucket '{location['bucket']}' does not exist")
+                try:
+                    bucket_mgr.create_bucket(CreateBucketSettings(
+                        name=location["bucket"], bucket_type=BucketType.COUCHBASE,
+                        ram_quota_mb=int(bucket_ram_mb), flush_enabled=False,
+                    ))
+                    created["bucket"] = True
+                    logger.info("Created bucket '%s' (%d MB) for knowledge storage", location["bucket"], bucket_ram_mb)
+                except BucketAlreadyExistsException:
+                    pass
+                # A new bucket takes a moment to come up on every node;
+                # opening it before then fails with a timeout.
+                deadline = time.time() + 60
+                while True:
+                    try:
+                        b = self.cluster.bucket(location["bucket"])
+                        b.wait_until_ready(timedelta(seconds=10))
+                        break
+                    except Exception:  # noqa: BLE001
+                        if time.time() > deadline:
+                            raise
+                        time.sleep(1)
+            bucket = self.cluster.bucket(location["bucket"])
+            mgr = bucket.collections()
+            scopes = {s.name: {c.name for c in s.collections} for s in mgr.get_all_scopes()}
+            if location["scope"] not in scopes:
+                if not create:
+                    raise LookupError(f"Scope '{location['bucket']}.{location['scope']}' does not exist")
+                try:
+                    mgr.create_scope(location["scope"])
+                    created["scope"] = True
+                    logger.info("Created scope '%s.%s'", location["bucket"], location["scope"])
+                except ScopeAlreadyExistsException:
+                    pass
+                scopes[location["scope"]] = set()
+            if location["collection"] not in scopes[location["scope"]]:
+                if not create:
+                    raise LookupError(
+                        f"Collection '{location['bucket']}.{location['scope']}.{location['collection']}' does not exist"
+                    )
+                try:
+                    mgr.create_collection(location["scope"], location["collection"])
+                    created["collection"] = True
+                    logger.info("Created collection '%s'", location_key(location))
+                except CollectionAlreadyExistsException:
+                    pass
+            # The collection exists on the manager before it is reachable
+            # over KV on every node; probe until it is.
+            handle = bucket.scope(location["scope"]).collection(location["collection"])
+            deadline = time.time() + 30
+            while True:
+                try:
+                    handle.exists("__startup_probe__")
+                    break
+                except Exception:  # noqa: BLE001
+                    if time.time() > deadline:
+                        raise
+                    time.sleep(0.5)
+            ks = _keyspace(location)
+            suffix = hashlib.sha1(location_key(location).encode()).hexdigest()[:8]
+            for statement in (
+                f"CREATE PRIMARY INDEX IF NOT EXISTS ON {ks}",
+                f"CREATE INDEX IF NOT EXISTS idx_knowledge_by_document_{suffix} ON {ks}(document_id)",
+                f"CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_{suffix} ON {ks}(doc_type, set_id)",
+            ):
+                try:
+                    self.cluster.query(statement, QueryOptions(metrics=False)).execute()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not ensure index (%s): %s", statement, exc)
+            return created
+
+        created = await asyncio.to_thread(_run)
+        self._knowledge_collections.pop(location_key(location), None)
+        self.register_knowledge_location(location)
+        return created
+
     # -- Search (FTS) vector index -----------------------------------------
 
     def _index_definition(self) -> dict:
@@ -406,11 +639,11 @@ class CouchbaseStore:
             "sourceParams": {},
         }
 
-    def _search_admin_url(self, index_name: str) -> str:
+    def _search_admin_url(self, index_name: str, bucket: str | None = None, scope: str | None = None) -> str:
         host = COUCHBASE_CONFIG["search_host"]
         port = COUCHBASE_CONFIG["search_port"]
-        bucket = COUCHBASE_CONFIG["bucket"]
-        scope = COUCHBASE_CONFIG["scope"]
+        bucket = bucket or COUCHBASE_CONFIG["bucket"]
+        scope = scope or COUCHBASE_CONFIG["scope"]
         scheme = COUCHBASE_CONFIG["search_scheme"]
         return f"{scheme}://{host}:{port}/api/bucket/{bucket}/scope/{scope}/index/{index_name}"
 
@@ -2489,16 +2722,20 @@ class CouchbaseStore:
     # `knowledge_chunk` carries the text and the vector retrieval runs over.
 
     def _knowledge_index_definition(
-        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None
+        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None,
+        location: dict | None = None,
     ) -> dict:
         """The default set's index, or - with all three arguments - one
         knowledge set's index: same mapping, its own vector field and
-        dimension (see app/knowledge_sets.py)."""
+        dimension (see app/knowledge_sets.py). `location` is the
+        bucket/scope/collection the set's chunks live in; the index is
+        created in that bucket and scope and maps only that collection."""
         index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
         dims = int(dims or EMBEDDING_CONFIG["vector_dim"])
-        bucket = COUCHBASE_CONFIG["bucket"]
-        scope = COUCHBASE_CONFIG["scope"]
-        collection = COUCHBASE_CONFIG["knowledge_collection"]
+        loc = location or default_knowledge_location()
+        bucket = loc["bucket"]
+        scope = loc["scope"]
+        collection = loc["collection"]
         type_key = f"{scope}.{collection}"
 
         def keyword_field(name: str) -> dict:
@@ -2560,14 +2797,16 @@ class CouchbaseStore:
         }
 
     async def ensure_knowledge_index(
-        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None
+        self, index_name: str | None = None, vector_field: str = "embedding", dims: int | None = None,
+        location: dict | None = None,
     ) -> bool:
         index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
+        loc = location or default_knowledge_location()
         try:
             resp = await asyncio.to_thread(
                 lambda: requests.put(
-                    self._search_admin_url(index_name),
-                    json=self._knowledge_index_definition(index_name, vector_field, dims),
+                    self._search_admin_url(index_name, loc["bucket"], loc["scope"]),
+                    json=self._knowledge_index_definition(index_name, vector_field, dims, loc),
                     auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
                     headers={"Content-Type": "application/json"},
                     timeout=30,
@@ -2586,13 +2825,14 @@ class CouchbaseStore:
             logger.warning("Could not ensure knowledge vector index '%s': %s", index_name, exc)
             return False
 
-    async def delete_knowledge_index(self, index_name: str) -> bool:
+    async def delete_knowledge_index(self, index_name: str, location: dict | None = None) -> bool:
         if index_name == COUCHBASE_CONFIG["knowledge_index"]:
             raise ValueError("The default knowledge index is never deleted")
+        loc = location or default_knowledge_location()
         try:
             resp = await asyncio.to_thread(
                 lambda: requests.delete(
-                    self._search_admin_url(index_name),
+                    self._search_admin_url(index_name, loc["bucket"], loc["scope"]),
                     auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
                     timeout=30,
                     verify=couchbase_requests_verify(),
@@ -2615,18 +2855,22 @@ class CouchbaseStore:
 
         return await asyncio.to_thread(_get)
 
-    async def upsert_knowledge_chunk(self, chunk: dict):
-        await asyncio.to_thread(self.knowledge.upsert, f"kchunk::{chunk['chunk_id']}", chunk)
+    async def upsert_knowledge_chunk(self, chunk: dict, location: dict | None = None):
+        """One chunk into its set's storage location (the appliance's own
+        knowledge collection when `location` is None)."""
+        coll = self._knowledge_collection(location)
+        await asyncio.to_thread(coll.upsert, f"kchunk::{chunk['chunk_id']}", chunk)
 
-    async def upsert_knowledge_chunks(self, chunks: list[dict]) -> None:
+    async def upsert_knowledge_chunks(self, chunks: list[dict], location: dict | None = None) -> None:
         """Bulk write for background ingestion - one SDK multi-op per batch
         instead of one round trip per chunk. Raises on any failed key so a
         job never records chunks it did not actually store."""
         if not chunks:
             return
+        coll = self._knowledge_collection(location)
 
         def _run():
-            result = self.knowledge.upsert_multi({f"kchunk::{c['chunk_id']}": c for c in chunks})
+            result = coll.upsert_multi({f"kchunk::{c['chunk_id']}": c for c in chunks})
             if not result.all_ok:
                 failed = [k for k, r in result.exceptions.items()] if getattr(result, "exceptions", None) else []
                 raise RuntimeError(f"{len(failed) or 'some'} chunk write(s) failed: {failed[:3]}")
@@ -2697,50 +2941,69 @@ class CouchbaseStore:
             logger.warning("list_knowledge_documents query failed: %s", exc)
             return []
 
-    async def delete_knowledge_document(self, document_id: str) -> int:
-        """Remove a document and every chunk belonging to it. Returns the
-        number of documents deleted (metadata row plus chunks)."""
-        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
-        coll = COUCHBASE_CONFIG["knowledge_collection"]
+    def _document_locations(self, location: dict | None) -> list[dict]:
+        """Where a document's records can be: its metadata row is always in
+        the appliance's own knowledge collection, its chunks in the set's
+        location. With no location given (a caller that only has the
+        document ID), every registered location is tried - cheap, since
+        each is one indexed query on `document_id`, and it is what makes
+        orphaned chunks from a failed ingest reclaimable regardless."""
+        if location:
+            locs = [default_knowledge_location()]
+            if location_key(location) != location_key(None):
+                locs.append(location)
+            return locs
+        return self.knowledge_locations()
+
+    async def delete_knowledge_document(self, document_id: str, location: dict | None = None) -> int:
+        """Remove a document and every chunk belonging to it, wherever its
+        set stores them. Returns the number of records deleted (metadata
+        row plus chunks)."""
 
         def _run():
-            q = (
-                f"DELETE FROM `{bucket}`.`{scope}`.`{coll}` k "
-                f"WHERE k.document_id = $document_id RETURNING META(k).id"
-            )
-            rows = list(self.cluster.query(
-                q, QueryOptions(named_parameters={"document_id": document_id}, metrics=False)
-            ).rows())
-            return len(rows)
+            total = 0
+            for loc in self._document_locations(location):
+                q = (
+                    f"DELETE FROM {_keyspace(loc)} k "
+                    f"WHERE k.document_id = $document_id RETURNING META(k).id"
+                )
+                try:
+                    rows = list(self.cluster.query(
+                        q, QueryOptions(named_parameters={"document_id": document_id}, metrics=False)
+                    ).rows())
+                    total += len(rows)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("delete_knowledge_document(%s) in %s failed: %s",
+                                   document_id, location_key(loc), exc)
+            return total
 
-        try:
-            return await asyncio.to_thread(_run)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("delete_knowledge_document(%s) failed: %s", document_id, exc)
-            return 0
+        return await asyncio.to_thread(_run)
 
-    async def update_knowledge_expiry(self, document_id: str, expires_at: str | None) -> int:
+    async def update_knowledge_expiry(self, document_id: str, expires_at: str | None,
+                                      location: dict | None = None) -> int:
         """Set (or clear, with None) `expires_at` on a document and all of its
-        chunks. Returns the number of records changed."""
-        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
-        coll = COUCHBASE_CONFIG["knowledge_collection"]
-        if expires_at:
-            q = (f"UPDATE `{bucket}`.`{scope}`.`{coll}` k SET k.expires_at = $expires_at "
-                 f"WHERE k.document_id = $document_id RETURNING META(k).id")
-            params = {"document_id": document_id, "expires_at": expires_at}
-        else:
-            q = (f"UPDATE `{bucket}`.`{scope}`.`{coll}` k UNSET k.expires_at "
-                 f"WHERE k.document_id = $document_id RETURNING META(k).id")
-            params = {"document_id": document_id}
+        chunks, wherever its set stores them. Returns the number of records
+        changed."""
 
         def _run():
-            return len(list(self.cluster.query(q, QueryOptions(named_parameters=params, metrics=False)).rows()))
+            total = 0
+            for loc in self._document_locations(location):
+                if expires_at:
+                    q = (f"UPDATE {_keyspace(loc)} k SET k.expires_at = $expires_at "
+                         f"WHERE k.document_id = $document_id RETURNING META(k).id")
+                    params = {"document_id": document_id, "expires_at": expires_at}
+                else:
+                    q = (f"UPDATE {_keyspace(loc)} k UNSET k.expires_at "
+                         f"WHERE k.document_id = $document_id RETURNING META(k).id")
+                    params = {"document_id": document_id}
+                try:
+                    total += len(list(self.cluster.query(q, QueryOptions(named_parameters=params, metrics=False)).rows()))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("update_knowledge_expiry(%s) in %s failed: %s",
+                                   document_id, location_key(loc), exc)
+            return total
 
-        try:
-            return await asyncio.to_thread(_run)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("update_knowledge_expiry(%s) failed: %s", document_id, exc)
-            return 0
+        return await asyncio.to_thread(_run)
 
     async def list_expired_knowledge_documents(self, now_iso: str, limit: int = 500) -> list[str]:
         bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
@@ -2763,11 +3026,42 @@ class CouchbaseStore:
             return []
 
     async def count_knowledge_chunks(self) -> int:
-        return await self._count_where(COUCHBASE_CONFIG["knowledge_collection"], "knowledge_chunk")
+        """Chunks across every storage location knowledge sets use."""
+        if not self.connected:
+            return 0
+
+        def _run():
+            total = 0
+            for loc in self.knowledge_locations():
+                q = f'SELECT RAW COUNT(*) FROM {_keyspace(loc)} d WHERE d.doc_type = "knowledge_chunk"'
+                try:
+                    rows = list(self.cluster.query(q, QueryOptions(metrics=False)).rows())
+                    total += int(rows[0]) if rows else 0
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("count_knowledge_chunks in %s failed: %s", location_key(loc), exc)
+            return total
+
+        return await asyncio.to_thread(_run)
+
+    async def count_knowledge_chunks_at(self, location: dict | None) -> int:
+        """Chunks in one location, whichever set wrote them - what the
+        storage picker shows next to an existing collection."""
+        if not self.connected:
+            return 0
+
+        def _run():
+            q = f'SELECT RAW COUNT(*) FROM {_keyspace(location)} d WHERE d.doc_type = "knowledge_chunk"'
+            rows = list(self.cluster.query(q, QueryOptions(metrics=False)).rows())
+            return int(rows[0]) if rows else 0
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _run_knowledge_search_sync(
         self, role: str, vector: list, top_k: int, document_id: str | None,
-        index_name: str | None = None, vector_field: str = "embedding",
+        index_name: str | None = None, vector_field: str = "embedding", location: dict | None = None,
     ) -> list[dict]:
         index_name = index_name or COUCHBASE_CONFIG["knowledge_index"]
         vector_query = CBVectorQuery.create(vector_field, vector, num_candidates=max(top_k * 4, 25))
@@ -2783,7 +3077,10 @@ class CouchbaseStore:
         prefilter = cb_search.ConjunctionQuery(*must)
 
         request = cb_search.SearchRequest.create(prefilter).with_vector_search(vector_search)
-        result = self.scope.search(
+        # A scoped index lives in the bucket and scope of the collection it
+        # maps, so the search is issued through that scope - the appliance's
+        # own for the default set, the set's storage location otherwise.
+        result = self._knowledge_scope(location).search(
             index_name,
             request,
             SearchOptions(limit=top_k, fields=["document_id", "allowed_roles"]),
@@ -2792,14 +3089,14 @@ class CouchbaseStore:
 
     async def search_knowledge(
         self, role: str, query_vector: list, top_k: int = 5, document_id: str | None = None,
-        index_name: str | None = None, vector_field: str = "embedding",
+        index_name: str | None = None, vector_field: str = "embedding", location: dict | None = None,
     ) -> list[dict]:
         if not self.connected:
             return []
         try:
             rows = await asyncio.to_thread(
                 self._run_knowledge_search_sync, role, query_vector, top_k, document_id,
-                index_name, vector_field,
+                index_name, vector_field, location,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Knowledge vector search failed: %s", exc)
@@ -2808,7 +3105,7 @@ class CouchbaseStore:
         results = []
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         for row in rows:
-            chunk = await asyncio.to_thread(self._get_knowledge_chunk_sync, row["id"])
+            chunk = await asyncio.to_thread(self._get_knowledge_chunk_sync, row["id"], location)
             if not chunk:
                 continue
             # Expired but not yet swept: never returned, however well it
@@ -2833,9 +3130,9 @@ class CouchbaseStore:
             })
         return results
 
-    def _get_knowledge_chunk_sync(self, doc_id: str) -> dict | None:
+    def _get_knowledge_chunk_sync(self, doc_id: str, location: dict | None = None) -> dict | None:
         try:
-            return self.knowledge.get(doc_id).content_as[dict]
+            return self._knowledge_collection(location).get(doc_id).content_as[dict]
         except DocumentNotFoundException:
             return None
 
