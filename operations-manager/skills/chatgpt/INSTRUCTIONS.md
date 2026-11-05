@@ -74,7 +74,7 @@ client = AOMClient(
     # both unset to let the appliance's policy decide - the operator's
     # global default, or a per-role / per-agent override assigned to this
     # key. `model` without `provider` is rejected.
-    provider=os.environ.get("AOM_LLM_PROVIDER"),   # "anthropic" | "openai" | "google"
+    provider=os.environ.get("AOM_LLM_PROVIDER"),   # "anthropic" | "openai" | "google" | "bedrock"
     model=os.environ.get("AOM_LLM_MODEL"),
 )
 ```

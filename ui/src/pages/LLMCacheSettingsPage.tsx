@@ -159,7 +159,7 @@ export function LLMCacheSettingsPage() {
                   <div className="flex-between">
                     <div className="stat-label">{p.vendor}</div>
                     <span className={`badge ${p.api_key_configured ? "badge-trusted" : "badge-neutral"}`}>
-                      {p.api_key_configured ? "key set" : "stub mode"}
+                      {p.api_key_configured ? "key set" : "not configured"}
                     </span>
                   </div>
                   <div className="stat-value" style={{ fontSize: 22 }}>

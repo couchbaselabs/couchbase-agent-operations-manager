@@ -237,7 +237,7 @@ cache.
 
 ```bash
 cp .env.example .env
-# optional: add ANTHROPIC_API_KEY, OPENAI_API_KEY and/or GEMINI_API_KEY to .env
+# optional: add ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY and/or AWS_BEARER_TOKEN_BEDROCK to .env
 # (without them, LLM caching answers misses from a labelled stub - see below)
 ./scripts/setup-corporate-ca.sh
 docker compose up --build
@@ -698,13 +698,18 @@ spent at all.
 
 ### Choosing the LLM
 
-Claude, ChatGPT and Gemini are all selectable from **LLM Caching ->
-Providers & Policy**, each with its own model list and list-price
-estimates (`operations-manager/app/llm_cache.py`). The bundled default is
+Claude, ChatGPT, Gemini and Amazon Bedrock are all selectable from **LLM
+Caching -> Providers & Policy**, each with its own model list and
+list-price estimates (`operations-manager/app/llm_cache.py`). The bundled default is
 ChatGPT's low-cost `gpt-5.6-luna` (`LLM_CACHE_PROVIDER` /
 `LLM_CACHE_MODEL` in `.env`), so a fresh install spends as little as
-possible once a key is set. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or
-`GEMINI_API_KEY` in `.env` to proxy calls for real. On Kubernetes, see
+possible once a key is set. Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY` or `AWS_BEARER_TOKEN_BEDROCK` in `.env` to proxy calls
+for real (Bedrock also accepts static `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` or, with `AWS_BEDROCK_USE_DEFAULT_CREDENTIALS=true`,
+the instance / pod role; `AWS_BEDROCK_REGION` picks the region and
+`AWS_BEDROCK_MODEL_IDS` adds provisioned or extra model IDs). On
+Kubernetes, see
 [LLM provider API keys](./helm/couchbase-agent-operations-manager/README.md#llm-provider-api-keys)
 in the chart README. Keys are read at startup, so restart
 operations-manager after adding or changing one

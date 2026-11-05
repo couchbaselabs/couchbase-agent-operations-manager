@@ -243,13 +243,16 @@ operationsManager:
     similarityThreshold: 0.94
     logRetentionHours: 720
 
-  # All three optional - a provider with no key still answers on a cache
-  # miss with a clearly-labelled offline stub, so the feature is demoable
-  # with no outbound network access. Stored in the same Secret as above.
+  # All optional - a provider with no key still answers on a cache miss
+  # with a clearly-labelled offline stub, so the feature is demoable with
+  # no outbound network access. Stored in the same Secret as above.
   providerApiKeys:
     anthropic: ""
     openai: ""
     gemini: ""
+    # Amazon Bedrock API key (Bedrock console -> API keys). Alternatives
+    # are under bedrock: below.
+    bedrock: ""
     # Hosted embedding models for Knowledge Base knowledge sets (optional;
     # OpenAI and Gemini embeddings reuse the keys above).
     voyage: ""
@@ -261,6 +264,21 @@ operationsManager:
   # recently used is unloaded). The largest local models need ~2GB of RAM
   # each - raise resources.limits.memory before raising this.
   embeddingMaxLoadedModels: 2
+
+  bedrock:
+    # Region the Bedrock runtime calls go to (model access is per-region).
+    region: us-east-1
+    # Instead of providerApiKeys.bedrock: static IAM access keys (stored in
+    # the same Secret) ...
+    accessKeyId: ""
+    secretAccessKey: ""
+    # ... or trust the Pod's own role (IRSA / EKS Pod Identity on the
+    # operations-manager ServiceAccount). Needs bedrock:InvokeModel on the
+    # models you select.
+    useDefaultCredentials: false
+    # Extra model or inference-profile IDs / provisioned-throughput ARNs to
+    # offer alongside the built-in catalog, comma-separated.
+    modelIds: ""
 
   audit:
     logRetentionHours: 720

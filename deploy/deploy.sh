@@ -59,7 +59,7 @@ fi
 
 # Pick up live LLM provider API keys from a local .env, if you've made
 # one (`cp .env.example .env` then fill in a key - see .env.example).
-# .env is gitignored and is ONLY read here for these three specific keys
+# .env is gitignored and is ONLY read here for these specific keys
 # - it's the supported way to give this deployment a live key without
 # putting it in values-k3s.yaml or a shell history
 # entry. Re-run this script any time you change .env to push the new key.
@@ -80,6 +80,20 @@ GEMINI_KEY="$(get_env_var GEMINI_API_KEY)"
 [ -n "$ANTHROPIC_KEY" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.providerApiKeys.anthropic=${ANTHROPIC_KEY}")
 [ -n "$OPENAI_KEY" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.providerApiKeys.openai=${OPENAI_KEY}")
 [ -n "$GEMINI_KEY" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.providerApiKeys.gemini=${GEMINI_KEY}")
+# Amazon Bedrock: a Bedrock API key, or static access keys, or opt in to
+# the node's / pod's own IAM role; plus region and extra model IDs.
+BEDROCK_KEY="$(get_env_var AWS_BEARER_TOKEN_BEDROCK)"
+AWS_KEY_ID="$(get_env_var AWS_ACCESS_KEY_ID)"
+AWS_KEY_SECRET="$(get_env_var AWS_SECRET_ACCESS_KEY)"
+BEDROCK_DEFAULT_CREDS="$(get_env_var AWS_BEDROCK_USE_DEFAULT_CREDENTIALS)"
+BEDROCK_REGION="$(get_env_var AWS_BEDROCK_REGION)"
+BEDROCK_MODEL_IDS="$(get_env_var AWS_BEDROCK_MODEL_IDS)"
+[ -n "$BEDROCK_KEY" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.providerApiKeys.bedrock=${BEDROCK_KEY}")
+[ -n "$AWS_KEY_ID" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.bedrock.accessKeyId=${AWS_KEY_ID}")
+[ -n "$AWS_KEY_SECRET" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.bedrock.secretAccessKey=${AWS_KEY_SECRET}")
+[ "$BEDROCK_DEFAULT_CREDS" = "true" ] && PROVIDER_KEY_ARGS+=(--set "operationsManager.bedrock.useDefaultCredentials=true")
+[ -n "$BEDROCK_REGION" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.bedrock.region=${BEDROCK_REGION}")
+[ -n "$BEDROCK_MODEL_IDS" ] && PROVIDER_KEY_ARGS+=(--set-string "operationsManager.bedrock.modelIds=${BEDROCK_MODEL_IDS}")
 
 echo "==> helm upgrade --install ${RELEASE} -n ${NAMESPACE} ..."
 helm upgrade --install "${RELEASE}" ./helm/couchbase-agent-operations-manager \

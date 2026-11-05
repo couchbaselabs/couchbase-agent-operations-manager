@@ -371,7 +371,7 @@ export function PolicyOverridesPanel({
                   {providers.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.label}
-                      {p.api_key_configured ? "" : " (stub mode - no key set)"}
+                      {p.api_key_configured ? "" : " (not configured - no key set)"}
                     </option>
                   ))}
                 </select>

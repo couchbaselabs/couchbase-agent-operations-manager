@@ -266,6 +266,16 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Amazon Bedrock: a Bedrock API key is the simplest; static access
+      # keys work too. AWS_BEDROCK_USE_DEFAULT_CREDENTIALS=true trusts the
+      # instance role instead (no key needed on EC2 / ECS).
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_BEDROCK_USE_DEFAULT_CREDENTIALS: ${AWS_BEDROCK_USE_DEFAULT_CREDENTIALS:-false}
+      AWS_BEDROCK_REGION: ${AWS_BEDROCK_REGION:-us-east-1}
+      AWS_BEDROCK_MODEL_IDS: ${AWS_BEDROCK_MODEL_IDS:-}
       # Hosted embedding models for Knowledge Base knowledge sets (all
       # optional; OpenAI and Gemini reuse the keys above). Local models need
       # none - they download into the hf-cache volume on first use.

@@ -303,6 +303,15 @@ LLM_API_KEYS = {
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
     "openai": os.getenv("OPENAI_API_KEY", ""),
     "google": os.getenv("GEMINI_API_KEY", ""),
+    # Amazon Bedrock authenticates through the AWS credential chain, not a
+    # single key. The value here is only a "configured" marker (never sent
+    # anywhere): a Bedrock API key, an access key ID, or an explicit opt-in
+    # to the pod / instance role. The region is read in app/llm_cache.py.
+    "bedrock": (
+        os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")
+        or os.getenv("AWS_ACCESS_KEY_ID", "")
+        or ("default-credentials" if os.getenv("AWS_BEDROCK_USE_DEFAULT_CREDENTIALS", "").lower() == "true" else "")
+    ),
 }
 
 # Runtime cache policy lives in Couchbase (settings::llm_cache) because it is

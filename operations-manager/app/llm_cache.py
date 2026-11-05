@@ -8,7 +8,7 @@ difference is what the choke point buys you here - a cache.
 
 Three things live in this module:
 
-  1. The provider catalog (Claude / ChatGPT / Gemini), including per-model
+  1. The provider catalog (Claude / ChatGPT / Gemini / AWS Bedrock), including per-model
      token pricing so "tokens saved" can be reported as money saved. Prices
      are list-price *estimates* and are meant to be edited - see PRICING.
   2. The cache key + invalidation policy engine. Everything a user can
@@ -75,7 +75,43 @@ PROVIDERS: dict[str, dict] = {
         "models": ["gemini-3.1-pro-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
         "default_model": "gemini-2.5-flash",
     },
+    # Amazon Bedrock. A "model" here is a Bedrock model ID or inference
+    # profile ID, called through the Converse API (one request shape for
+    # every model family). The list below is the pay-per-token catalog that
+    # needs no provisioning; add custom / provisioned-throughput ARNs or
+    # other model IDs through AWS_BEDROCK_MODEL_IDS (comma-separated).
+    #
+    # Credentials come from the standard AWS chain, so any of these works:
+    #   - AWS_BEARER_TOKEN_BEDROCK (a Bedrock API key - the simplest)
+    #   - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (/ AWS_SESSION_TOKEN)
+    #   - AWS_BEDROCK_USE_DEFAULT_CREDENTIALS=true to trust the pod / instance
+    #     role (IRSA, EKS Pod Identity, an EC2 instance profile)
+    # The region comes from AWS_BEDROCK_REGION (then AWS_REGION /
+    # AWS_DEFAULT_REGION, then us-east-1). See config.LLM_API_KEYS.
+    "bedrock": {
+        "id": "bedrock",
+        "label": "Bedrock",
+        "vendor": "Amazon Web Services",
+        "env_key": "AWS_BEARER_TOKEN_BEDROCK",
+        "endpoint": "https://bedrock-runtime.{region}.amazonaws.com/model/{model}/converse",
+        "docs_url": "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html",
+        "models": [
+            "amazon.nova-pro-v1:0",
+            "amazon.nova-lite-v1:0",
+            "amazon.nova-micro-v1:0",
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "us.meta.llama3-3-70b-instruct-v1:0",
+        ],
+        "default_model": "amazon.nova-lite-v1:0",
+    },
 }
+
+for _model_id in (os.getenv("AWS_BEDROCK_MODEL_IDS") or "").split(","):
+    _model_id = _model_id.strip()
+    if _model_id and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,256}", _model_id) \
+            and _model_id not in PROVIDERS["bedrock"]["models"]:
+        PROVIDERS["bedrock"]["models"].append(_model_id)
 
 # USD per 1,000,000 tokens, (input, output). These are *estimates* used to
 # turn "tokens saved" into "dollars saved" on the dashboard - they are not
@@ -91,6 +127,14 @@ PRICING: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro-preview": (2.00, 12.00),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.075, 0.30),
+    # Bedrock on-demand list prices, us-east-1. Cross-region inference
+    # profiles (global./us. prefixes) bill at the underlying model's rate.
+    "amazon.nova-pro-v1:0": (0.80, 3.20),
+    "amazon.nova-lite-v1:0": (0.06, 0.24),
+    "amazon.nova-micro-v1:0": (0.035, 0.14),
+    "global.anthropic.claude-sonnet-4-5-20250929-v1:0": (3.00, 15.00),
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0": (1.00, 5.00),
+    "us.meta.llama3-3-70b-instruct-v1:0": (0.72, 0.72),
 }
 
 CACHE_SCOPES = ("global", "per_role", "per_subject")
@@ -578,7 +622,50 @@ def call_provider(provider: str, model: str, prompt: str, cfg: dict, api_keys: d
             model=model,
         )
 
+    if provider == "bedrock":
+        return _bedrock_converse(model, prompt, max_tokens, temperature, timeout)
+
     raise ValueError(f"No adapter implemented for provider '{provider}'")
+
+
+def bedrock_region() -> str:
+    return (
+        os.getenv("AWS_BEDROCK_REGION")
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    ).strip()
+
+
+def _bedrock_converse(model: str, prompt: str, max_tokens: int, temperature: float, timeout: int) -> ProviderResult:
+    """Bedrock goes through boto3 rather than `requests` because every call
+    has to be SigV4-signed (or carry a Bedrock API key, which botocore also
+    handles). The Converse API gives one request/response shape for every
+    model family on Bedrock, so this adapter needs no per-model branches."""
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=bedrock_region(),
+        config=BotoConfig(read_timeout=timeout, connect_timeout=min(timeout, 10), retries={"max_attempts": 2}),
+    )
+    body = client.converse(
+        modelId=model,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
+    )
+    content = ((body.get("output") or {}).get("message") or {}).get("content") or []
+    text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    usage = body.get("usage") or {}
+    return ProviderResult(
+        text=text,
+        prompt_tokens=int(usage.get("inputTokens") or estimate_tokens(prompt)),
+        completion_tokens=int(usage.get("outputTokens") or estimate_tokens(text)),
+        stub=False,
+        provider="bedrock",
+        model=model,
+    )
 
 
 def provider_catalog(api_keys: dict) -> list[dict]:

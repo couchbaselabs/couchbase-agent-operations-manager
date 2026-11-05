@@ -177,18 +177,27 @@ the registries, and Capella buckets/credentials/allowlist - see
 ## LLM provider API keys
 
 operations-manager's LLM caching gateway can forward cache misses to
-Claude (Anthropic), ChatGPT (OpenAI) and Gemini (Google). Set the keys
-under `operationsManager.providerApiKeys` in a values file (see the
-example above). They're stored in the chart's `<release>-...-app-secrets`
-Secret (`templates/secret-app.yaml`) and wired into the
-operations-manager Pod as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and
-`GEMINI_API_KEY`, the same variables Docker Compose reads from `.env`.
+Claude (Anthropic), ChatGPT (OpenAI), Gemini (Google) and Amazon Bedrock.
+Set the keys under `operationsManager.providerApiKeys` in a values file
+(see the example above). They're stored in the chart's
+`<release>-...-app-secrets` Secret (`templates/secret-app.yaml`) and wired
+into the operations-manager Pod as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY` and `AWS_BEARER_TOKEN_BEDROCK`, the same variables Docker
+Compose reads from `.env`.
 
-- **All three are optional.** Set only the providers you'll use. A
+- **All four are optional.** Set only the providers you'll use. A
   provider without a key answers cache misses from a labelled
   deterministic stub, so caching, the savings dashboard and invalidation
   all work with no outbound access - you can install first and add keys
   later.
+- **Bedrock has three ways in.** `providerApiKeys.bedrock` takes a
+  Bedrock API key. `operationsManager.bedrock.accessKeyId` /
+  `secretAccessKey` take static IAM keys instead. On EKS, leave both empty
+  and set `operationsManager.bedrock.useDefaultCredentials: true` with an
+  IRSA / Pod Identity role (needing `bedrock:InvokeModel`) bound to the
+  operations-manager ServiceAccount. `bedrock.region` picks the Bedrock
+  region (model access is granted per region) and `bedrock.modelIds` adds
+  provisioned-throughput ARNs or extra model IDs to the catalog.
 - **Pass them on every upgrade.** Unlike the generated Couchbase password
   and agent API keys, provider keys aren't read back from the existing
   Secret: a `helm upgrade` without `-f secrets.values.yaml` (or

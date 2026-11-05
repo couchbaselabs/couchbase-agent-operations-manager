@@ -51,7 +51,7 @@ variable "provider_api_keys" {
     anthropic  = optional(string, "")
     openai     = optional(string, "")
     gemini     = optional(string, "")
-    databricks = optional(string, "")
+    bedrock    = optional(string, "")
     voyage     = optional(string, "")
     cohere     = optional(string, "")
     mistral    = optional(string, "")

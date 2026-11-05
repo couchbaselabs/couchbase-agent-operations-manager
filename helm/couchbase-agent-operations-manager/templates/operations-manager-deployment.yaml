@@ -198,6 +198,31 @@ spec:
                 secretKeyRef:
                   name: {{ include "aom.authSecretName" . }}
                   key: GEMINI_API_KEY
+            - name: AWS_BEARER_TOKEN_BEDROCK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: AWS_BEARER_TOKEN_BEDROCK
+                  optional: true
+            {{- $bedrock := .Values.operationsManager.bedrock | default dict }}
+            {{- if $bedrock.accessKeyId }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aom.authSecretName" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
+            - name: AWS_BEDROCK_USE_DEFAULT_CREDENTIALS
+              value: {{ $bedrock.useDefaultCredentials | default false | quote }}
+            - name: AWS_BEDROCK_REGION
+              value: {{ $bedrock.region | default "us-east-1" | quote }}
+            - name: AWS_BEDROCK_MODEL_IDS
+              value: {{ $bedrock.modelIds | default "" | quote }}
             - name: VOYAGE_API_KEY
               valueFrom:
                 secretKeyRef:
