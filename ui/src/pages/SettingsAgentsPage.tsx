@@ -168,6 +168,26 @@ export function SettingsAgentsPage() {
     }
   }
 
+  async function handleDelete(agent: AgentIdentity) {
+    if (
+      !confirm(
+        `Delete "${agent.name}" permanently? This drops the revocation tombstone too: a caller still presenting one of its ` +
+          "old keys will be told the key is unrecognized rather than revoked. The audit log keeps the record."
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      await api.deleteAgent(agent.agent_id);
+      setNotice(`"${agent.name}" deleted.`);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Delete failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSaveOidc() {
     if (!oidc) return;
     setBusy(true);
@@ -550,6 +570,11 @@ export function SettingsAgentsPage() {
                           Revoke agent
                         </button>
                       </>
+                    )}
+                    {a.status === "revoked" && (
+                      <button className="btn btn-danger-outline btn-sm" disabled={busy} onClick={() => handleDelete(a)}>
+                        Delete agent
+                      </button>
                     )}
                   </div>
                 </div>
