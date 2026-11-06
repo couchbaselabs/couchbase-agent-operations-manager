@@ -564,7 +564,7 @@ function GrafanaWizard({ view, onChanged, onClose }: { view: MonitoringView; onC
       </div>
       <p className="cell-muted" style={{ fontSize: 12.5, marginTop: -4 }}>
         Creates or updates the <span className="cell-mono">AOM Prometheus</span> data source (uid aom-prometheus), checks its
-        health, and installs the <em>Couchbase Agent Operations Manager</em> folder and overview dashboard through
+        health, and installs the <em>Couchbase Labs Agent Operations Manager</em> folder and overview dashboard through
         Grafana&apos;s HTTP API. Repeatable. The credential is used for this one call and never stored.
       </p>
       {err && <div className="error-note">{err}</div>}

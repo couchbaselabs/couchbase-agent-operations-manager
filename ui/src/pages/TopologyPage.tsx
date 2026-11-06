@@ -50,7 +50,7 @@ export function TopologyPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Live Topology</h1>
-          <p className="page-subtitle">Agent requests to Couchbase Agent Operations Manager for MCP tools and LLM Providers</p>
+          <p className="page-subtitle">Agent requests to Couchbase Labs Agent Operations Manager for MCP tools and LLM Providers</p>
         </div>
         <div className="flex-row" style={{ gap: 8 }}>
           <button className={`btn btn-sm ${view === "sankey" ? "btn-primary" : "btn-secondary"}`} onClick={() => setView("sankey")}>

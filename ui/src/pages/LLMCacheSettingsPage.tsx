@@ -38,7 +38,7 @@ export function LLMCacheSettingsPage() {
 
   // Test console
   const [apiKey, setApiKey] = useState("demo-admin-4c56");
-  const [prompt, setPrompt] = useState("Summarise what the Couchbase Agent Operations Manager does in three sentences.");
+  const [prompt, setPrompt] = useState("Summarise what the Couchbase Labs Agent Operations Manager does in three sentences.");
   const [bypass, setBypass] = useState(false);
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<LLMCompleteResponse | null>(null);

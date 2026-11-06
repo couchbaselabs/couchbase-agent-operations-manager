@@ -77,7 +77,7 @@ export function LoginPage() {
             <CouchbaseGlyph />
           </div>
           <div className="login-brand-name">
-            Couchbase
+            Couchbase Labs
             <br />
             Agent Operations Manager
           </div>

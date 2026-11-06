@@ -137,7 +137,7 @@ export function Sidebar() {
           <CouchbaseGlyph />
         </div>
         <div className="brand-name">
-          Couchbase
+          Couchbase Labs
           <br />
           Agent Operations Manager
         </div>
