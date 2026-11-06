@@ -278,6 +278,26 @@ def action_breakdown(log_entries: list[dict]) -> dict:
     return {"discover": counts.get("discover", 0), "invoke": counts.get("invoke", 0), "authenticate": counts.get("authenticate", 0)}
 
 
+def hourly_volume_from_aggregate(rows: list[dict], buckets: int = 12) -> list[dict]:
+    """Same shape as hourly_volume, but from a GROUP BY hour aggregate over
+    the whole window ({"hour": "YYYY-MM-DDTHH", "count": N} rows from
+    couchbase_client.access_log_hourly_aggregate_since) rather than from a
+    capped sample of recent entries."""
+    import datetime as _dt
+
+    now = _dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    hour_keys = [(now - _dt.timedelta(hours=i)) for i in range(buckets - 1, -1, -1)]
+    counts = {h.strftime("%Y-%m-%dT%H"): 0 for h in hour_keys}
+    for r in rows:
+        key = (r.get("hour") or "")[:13]
+        if key in counts:
+            counts[key] += int(r.get("count") or 0)
+    return [
+        {"hour": h.strftime("%H:00"), "timestamp": h.strftime("%Y-%m-%dT%H:00:00Z"), "count": counts[h.strftime("%Y-%m-%dT%H")]}
+        for h in hour_keys
+    ]
+
+
 def hourly_volume(log_entries: list[dict], buckets: int = 12) -> list[dict]:
     """Bucket log entries by their ISO-8601 UTC hour (`...THH:MM:SSZ`),
     returning the most recent `buckets` hours oldest-first, zero-filled."""

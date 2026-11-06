@@ -3274,17 +3274,28 @@ async def insights_route():
 @cached_dashboard_response
 async def dashboard():
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hourly_cutoff = (datetime.now(timezone.utc) - timedelta(hours=12)).replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     # Independent reads - run concurrently instead of stacking their latencies.
-    servers, tools, log_entries, decision_rows = await asyncio.gather(
+    servers, tools, log_entries, decision_rows, hourly_rows = await asyncio.gather(
         store.list_servers(),
         store.list_tools(),
         store.recent_access_log(limit=INSIGHTS_LOOKBACK_ENTRIES, analytics=True),
         store.access_log_decision_aggregate_since(cutoff),
+        store.access_log_hourly_aggregate_since(hourly_cutoff),
     )
 
     findings = insights.compute_insights(servers, tools, log_entries)
     actions = insights.action_breakdown(log_entries)
-    hourly = insights.hourly_volume(log_entries, buckets=12)
+    # The chart needs every row in the window grouped by hour, for the same
+    # reason the 24h tile below does: the INSIGHTS_LOOKBACK_ENTRIES sample
+    # covers only the last few minutes of a busy deployment, which drew a
+    # single bar in the current hour and nothing before it. Fall back to
+    # the sample only if the aggregate query itself failed.
+    hourly = (
+        insights.hourly_volume_from_aggregate(hourly_rows, buckets=12)
+        if hourly_rows
+        else insights.hourly_volume(log_entries, buckets=12)
+    )
 
     # "Access Events (24h)" and its Allow/Deny/Error breakdown need a real
     # COUNT(1) over the full 24h window, not a count over the most-recent

@@ -1150,6 +1150,33 @@ class CouchbaseStore:
             logger.warning("access_log_decision_aggregate_since query failed: %s", exc)
             return []
 
+    async def access_log_hourly_aggregate_since(self, since: str) -> list[dict]:
+        """GROUP BY UTC hour over the *entire* audit log within a time
+        window - powers the Dashboard's "Access Volume" chart. Same reason
+        as access_log_decision_aggregate_since: bucketing the capped
+        recent_access_log(limit=N) sample only shows the last few minutes
+        once traffic is busy (at ~1k events/hour, 250 rows is ~10 minutes,
+        so every bar but the current hour reads zero). Timestamps are
+        ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`, so the first 13 characters are
+        the hour key; rows come back as {"hour": "YYYY-MM-DDTHH", "count"}."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["access_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT SUBSTR(e.timestamp, 0, 13) AS hour, COUNT(1) AS count "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since "
+                f"GROUP BY SUBSTR(e.timestamp, 0, 13)"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"since": since}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("access_log_hourly_aggregate_since query failed: %s", exc)
+            return []
+
     # -- LLM response cache ----------------------------------------------------
     #
     # The cache is a KV collection with a second Search (FTS) vector index over
