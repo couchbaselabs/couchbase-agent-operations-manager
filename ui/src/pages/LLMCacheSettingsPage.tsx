@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { PolicyOverridesPanel } from "../components/llm/PolicyOverridesPanel";
 import type { LLMCacheConfig, LLMCompleteResponse, LLMProvider, Role } from "../api/types";
@@ -130,9 +131,14 @@ export function LLMCacheSettingsPage() {
             {lastSweep ? ` - last invalidation sweep ${lastSweep.replace("T", " ").replace("Z", "")}` : ""}.
           </p>
         </div>
-        <button className="btn btn-primary" onClick={handleSave} disabled={saving || !config}>
-          {saving ? "Saving..." : "Save policy"}
-        </button>
+        <div className="flex-row">
+          <Link to="/settings/limits" className="btn btn-secondary">
+            Limits &amp; Budgets
+          </Link>
+          <button className="btn btn-primary" onClick={handleSave} disabled={saving || !config}>
+            {saving ? "Saving..." : "Save policy"}
+          </button>
+        </div>
       </div>
 
       {error && <div className="error-note">{error}</div>}
