@@ -182,6 +182,9 @@ export function KnowledgePage() {
   const [file, setFile] = useState<File | null>(null);
   const [pastedText, setPastedText] = useState("");
   const [addMode, setAddMode] = useState<"document" | "dump" | "import">("document");
+  // Which of the collapsible tool panels is open; null keeps them all off the page.
+  const [panel, setPanel] = useState<"add" | "syncs" | "jobs" | "retrieval" | null>(null);
+  const togglePanel = (p: "add" | "syncs" | "jobs" | "retrieval") => setPanel((cur) => (cur === p ? null : p));
   const [uploadProgress, setUploadProgress] = useState<{ sent: number; total: number } | null>(null);
   const uploadAbort = useRef<AbortController | null>(null);
   const [importUri, setImportUri] = useState("");
@@ -384,11 +387,12 @@ export function KnowledgePage() {
         });
         setNotice(
           `Import queued as job ${res.job.job_id}: the object is being downloaded into the spool and indexed in the ` +
-            "background - progress is in the Ingestion jobs table below."
+            "background - progress is in the Ingestion jobs panel."
         );
         setImportUri("");
         setImportSecret("");
         setJobs((j) => [res.job, ...j]);
+        setPanel("jobs");
         return;
       }
 
@@ -414,8 +418,9 @@ export function KnowledgePage() {
         setNotice(
           `Uploaded ${fmtBytes(file.size)} as job ${res.job.job_id}. ` +
             (addMode === "dump" ? "Rows are being parsed and embedded" : "The document is being chunked and embedded") +
-            " in the background - progress is in the Ingestion jobs table below."
+            " in the background - progress is in the Ingestion jobs panel."
         );
+        setPanel("jobs");
         setTitle("");
         setTableName("");
         setColumnNames("");
@@ -709,9 +714,29 @@ export function KnowledgePage() {
             is never a candidate, however well it matches the query.
           </p>
         </div>
-        <button className="btn btn-secondary" onClick={load}>
-          Refresh
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {(
+            [
+              ["add", "Add a Knowledge Set"],
+              ["syncs", "Warehouse syncs"],
+              ["jobs", "Ingestion jobs"],
+              ["retrieval", "Try retrieval as an agent"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              className={`btn ${panel === key ? "btn-primary" : "btn-secondary"}`}
+              aria-pressed={panel === key}
+              onClick={() => togglePanel(key)}
+            >
+              {label}
+            </button>
+          ))}
+          <button className="btn btn-secondary" onClick={load}>
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && <div className="error-note">{error}</div>}
@@ -751,7 +776,9 @@ export function KnowledgePage() {
             </div>
           </div>
 
-          <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Add a document</h2>
+          {panel === "add" && (
+            <>
+          <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Add a Knowledge Set</h2>
           <form className="panel section-gap" onSubmit={handleUpload} style={{ marginBottom: 24 }}>
             <div className="two-col">
               <div className="field">
@@ -1491,9 +1518,13 @@ export function KnowledgePage() {
               )}
             </div>
           </form>
+            </>
+          )}
 
-          <WarehouseSyncsPanel sets={data.sets} roles={data.roles} onChanged={load} />
+          {panel === "syncs" && <WarehouseSyncsPanel sets={data.sets} roles={data.roles} onChanged={load} />}
 
+          {panel === "jobs" && (
+            <>
           <h2 style={{ fontSize: 16, margin: "22px 0 4px 0" }}>Ingestion jobs</h2>
           <p className="cell-muted" style={{ fontSize: 12.5, margin: "0 0 14px 0" }}>
             Every file upload and cloud import runs as a background job: spooled to disk, then parsed, embedded in
@@ -1619,7 +1650,11 @@ export function KnowledgePage() {
               </div>
             )}
           </div>
+            </>
+          )}
 
+          {panel === "retrieval" && (
+            <>
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Try retrieval as an agent</h2>
           <form className="panel section-gap" onSubmit={handleSearch} style={{ marginBottom: 24 }}>
             <div className="two-col">
@@ -1683,6 +1718,8 @@ export function KnowledgePage() {
               </div>
             )}
           </form>
+            </>
+          )}
 
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Knowledge sets</h2>
           <div className="card" style={{ marginBottom: 24 }}>
@@ -1827,7 +1864,7 @@ export function KnowledgePage() {
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Documents</h2>
           {data.documents.length === 0 ? (
             <div className="card empty-state">
-              Nothing ingested yet. Add a document above, or POST to /v1/knowledge.
+              Nothing ingested yet. Use Add a Knowledge Set above, or POST to /v1/knowledge.
             </div>
           ) : (
             <div className="card">
