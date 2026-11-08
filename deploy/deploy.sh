@@ -70,7 +70,7 @@ fi
 # just the one line per key instead.
 get_env_var() {
   [ -f .env ] || return 0
-  grep -E "^$1=" .env | tail -n1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+  { grep -E "^$1=" .env || true; } | tail -n1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
 }
 
 PROVIDER_KEY_ARGS=()
