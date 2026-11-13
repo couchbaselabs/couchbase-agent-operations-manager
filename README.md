@@ -963,8 +963,14 @@ it parses and embeds inside the request. Everything else goes through the
   `gs://` (service-account JSON, or Application Default Credentials),
   `az://` / `abfss://` (connection string, or account + key/SAS), or
   `https://` (a presigned/signed URL, or the Databricks Files API with a
-  bearer token). The credential is used for the download only and is never
-  stored on the job or the document.
+  bearer token), or `snowflake://` with a Snowflake service account
+  (`auth: {account, user, auth_method: "keypair"|"token", private_key |
+  token, warehouse, role}`): `snowflake://@DB.SCHEMA.STAGE/path/file` pulls
+  one staged file through `GET_PRESIGNED_URL` (an internal stage needs
+  `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`), `snowflake://DB.SCHEMA.TABLE`
+  streams the whole table through the SQL REST API. The credential is used
+  for the download only and is never stored on the finished, failed or
+  cancelled job or on the document.
 - **The job** then parses the file in a stream - CSV/TSV and JSON lines
   line by line, Parquet by row group, Avro record by record, gzip through
   a streaming decompressor, zip members one at a time - chunks rows as it
@@ -1015,7 +1021,8 @@ file to the same ingestion job as an upload - so a 50 M-row result costs the
 process the same memory as a small one, and shows up in the Ingestion jobs
 table with progress and cancel.
 
-- **Connection**: Snowflake key-pair JWT (recommended) or a PAT/OAuth token;
+- **Connection**: a Snowflake service account (`TYPE = SERVICE` user) with
+  key-pair JWT (recommended) or a programmatic access token / OAuth token;
   Databricks service-principal OAuth M2M or a PAT, plus the SQL warehouse ID;
   BigQuery a service-account JSON key. Secrets are encrypted at rest and never
   returned. *Test connection* and *Preview query* (10 rows) work before saving.

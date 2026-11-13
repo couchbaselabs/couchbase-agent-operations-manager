@@ -5755,7 +5755,7 @@ async def list_knowledge(request: Request):
             "batch_chunks": KNOWLEDGE_INGEST_BATCH_CHUNKS,
             "max_chunks_per_document": KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
             "active_jobs": ingest_runner.active_count() if ingest_runner else 0,
-            "import_schemes": ["https", "s3", "gs", "az", "abfss"],
+            "import_schemes": ["https", "s3", "gs", "az", "abfss", "snowflake"],
         },
         "jobs": [ingest_jobs.public_job(j) for j in await store.list_knowledge_jobs(limit=ingest_jobs.MAX_RECENT_JOBS)],
         "supported_extensions": list(knowledge.SUPPORTED_EXTENSIONS),
@@ -6083,7 +6083,11 @@ class KnowledgeImportRequest(BaseModel):
       https: {"mode": "none"|"bearer"|"header"|"basic", "secret", "header_name", "username"}
       s3:    {"access_key_id", "secret", "session_token", "region", "endpoint_url"} (all optional - env/IRSA otherwise)
       gs:    {"service_account_json"} (optional - Application Default Credentials otherwise)
-      az:    {"connection_string"} or {"account", "secret"} (account key or SAS token)"""
+      az:    {"connection_string"} or {"account", "secret"} (account key or SAS token)
+      snowflake: {"account", "user", "auth_method": "keypair"|"token", "private_key",
+              "private_key_passphrase", "token", "warehouse", "role"} - a Snowflake
+              service account. The uri is snowflake://@DB.SCHEMA.STAGE/path/file (a
+              staged file) or snowflake://DB.SCHEMA.TABLE (the whole table)."""
     uri: str
     auth: dict = Field(default_factory=dict)
     filename: str | None = None
@@ -6098,19 +6102,38 @@ class KnowledgeImportRequest(BaseModel):
 
 @app.post("/v1/knowledge/imports", status_code=202)
 async def import_knowledge(req: KnowledgeImportRequest, request: Request):
-    """Queue an import from s3://, gs://, az://, abfss:// or https://. The
-    object is streamed into the spool by the job itself, so the request
-    returns immediately with the job to poll."""
+    """Queue an import from s3://, gs://, az://, abfss://, https:// or
+    snowflake:// (a staged file or a table, read as a Snowflake service
+    account). The object is streamed into the spool by the job itself, so
+    the request returns immediately with the job to poll."""
     user = require_admin(request)
     if not store.connected or embeddings is None:
         raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
     runner = _ingest_runner()
     uri = req.uri.strip()
     scheme = (uri.split("://", 1)[0] if "://" in uri else "").lower()
-    if scheme not in ("http", "https", "s3", "gs", "az", "abfss", "wasbs"):
-        raise HTTPException(status_code=400, detail="uri must start with https://, s3://, gs://, az:// or abfss://")
+    if scheme not in ("http", "https", "s3", "gs", "az", "abfss", "wasbs", "snowflake"):
+        raise HTTPException(status_code=400, detail="uri must start with https://, s3://, gs://, az://, abfss:// or snowflake://")
     filename = (req.filename or "").strip() or os.path.basename(uri.split("?", 1)[0].rstrip("/")) or "import"
     dump = req.dump or {}
+    if scheme == "snowflake":
+        try:
+            target = ingest_jobs.parse_snowflake_uri(uri)
+        except ingest_jobs.ImportError_ as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        missing = ingest_jobs.missing_snowflake_auth(req.auth)
+        if missing:
+            raise HTTPException(status_code=400, detail="snowflake:// needs a Snowflake service-account credential; missing: " + ", ".join(missing))
+        if target["kind"] == "table":
+            # Rows arrive as newline-delimited JSON whatever the caller
+            # named the file, and a table is always parsed as a table.
+            filename = target["filename"]
+            if not req.auth.get("warehouse"):
+                raise HTTPException(status_code=400, detail="reading a Snowflake table needs a warehouse on the credential")
+            dump = {"source": dump.get("source") or "snowflake", "table_name": dump.get("table_name") or target["table"],
+                    "header": None, "column_names": []}
+        else:
+            filename = (req.filename or "").strip() or target["filename"]
     params = _ingest_params_from_query(
         title=req.title or filename, allowed_roles=",".join(req.allowed_roles), set_id=req.set_id,
         dump_source=dump.get("source"), table_name=dump.get("table_name"),

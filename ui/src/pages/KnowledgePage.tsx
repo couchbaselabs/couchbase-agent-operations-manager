@@ -32,6 +32,14 @@ const IMPORT_HELP: Record<string, string> = {
   other: "Any https://, s3://, gs://, az:// or abfss:// object; the credential is used for the download only and never stored.",
 };
 
+// Shown instead of the per-warehouse hint when the credential is a
+// Snowflake service account: AOM reads from Snowflake itself.
+const SNOWFLAKE_ACCOUNT_HELP =
+  "With a Snowflake service account AOM reads from Snowflake directly: snowflake://@DB.SCHEMA.STAGE/path/data_0_0_0.csv.gz imports one staged file (the role needs USAGE on an external stage, READ on an internal one; an internal stage must use ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE') or the download is unreadable), and snowflake://DB.SCHEMA.TABLE imports the whole table through the warehouse. For a filtered or scheduled load use Warehouse syncs.";
+
+// Role IDs as the operations manager accepts them (app/rbac_policy.py).
+const ROLE_ID_PATTERN = /^[a-z][a-z0-9_]{1,47}$/;
+
 const NEW_SET = "__new__";
 // Sentinel for "type a new name" in the bucket / scope / collection pickers.
 const NEW_NAME = "__new__";
@@ -96,6 +104,7 @@ function ChooseOrCreate({
 // Expiry choices for a new document, and for changing one later.
 const EXPIRY_OPTIONS: Array<{ value: string; label: string; seconds?: number }> = [
   { value: "never", label: "Never" },
+  { value: "hours", label: "A number of hours..." },
   { value: "1d", label: "1 day", seconds: 86400 },
   { value: "7d", label: "7 days", seconds: 7 * 86400 },
   { value: "30d", label: "30 days", seconds: 30 * 86400 },
@@ -152,6 +161,13 @@ function expiryLabel(expiresAt?: string | null) {
   if (days < 1) return `in ${Math.max(1, Math.round(ms / 3600000))}h · ${when}`;
   return `in ${Math.round(days)}d · ${when}`;
 }
+
+// Whole hours only, from 1 hour up to the 10-year ceiling the API enforces.
+const MAX_EXPIRY_HOURS = 10 * 365 * 24;
+function parseExpiryHours(raw: string): number | null {
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n >= 1 && n <= MAX_EXPIRY_HOURS ? n : null;
+}
 const IMPORT_MODEL = "__import__";
 
 function modelOptionLabel(m: EmbeddingModelOption) {
@@ -188,12 +204,20 @@ export function KnowledgePage() {
   const [uploadProgress, setUploadProgress] = useState<{ sent: number; total: number } | null>(null);
   const uploadAbort = useRef<AbortController | null>(null);
   const [importUri, setImportUri] = useState("");
-  const [importAuthMode, setImportAuthMode] = useState<"none" | "bearer" | "header" | "aws" | "gcp" | "azure">("none");
+  const [importAuthMode, setImportAuthMode] = useState<"none" | "bearer" | "header" | "aws" | "gcp" | "azure" | "snowflake">("none");
   const [importSecret, setImportSecret] = useState("");
   const [importKeyId, setImportKeyId] = useState("");
   const [importRegion, setImportRegion] = useState("");
   const [importHeaderName, setImportHeaderName] = useState("X-Api-Key");
   const [importAccount, setImportAccount] = useState("");
+  // Snowflake service account (credential mode "snowflake"); the private
+  // key or token itself rides in importSecret like every other secret.
+  const [sfAccount, setSfAccount] = useState("");
+  const [sfUser, setSfUser] = useState("");
+  const [sfAuthMethod, setSfAuthMethod] = useState<"keypair" | "token">("keypair");
+  const [sfPassphrase, setSfPassphrase] = useState("");
+  const [sfWarehouse, setSfWarehouse] = useState("");
+  const [sfRole, setSfRole] = useState("");
   const [importIsDump, setImportIsDump] = useState(true);
   const [jobs, setJobs] = useState<KnowledgeJob[]>([]);
   const [jobBusy, setJobBusy] = useState<string | null>(null);
@@ -203,6 +227,13 @@ export function KnowledgePage() {
   const [columnNames, setColumnNames] = useState("");
   const [expiryChoice, setExpiryChoice] = useState("never");
   const [expiryDate, setExpiryDate] = useState("");
+  const [expiryHours, setExpiryHours] = useState("24");
+  // Inline "add a role" under the role checkboxes.
+  const [addingRole, setAddingRole] = useState(false);
+  const [newRoleId, setNewRoleId] = useState("");
+  const [newRoleDescription, setNewRoleDescription] = useState("");
+  const [creatingRole, setCreatingRole] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
@@ -297,6 +328,28 @@ export function KnowledgePage() {
     setAllowedRoles((roles) => (roles.includes(role) ? roles.filter((r) => r !== role) : [...roles, role]));
   }
 
+  // Create a role without leaving the form, and tick it for this upload.
+  // Same route and rules as the Roles & RBAC page; the new role has no
+  // tools or agents yet - those are granted there.
+  async function handleCreateRole() {
+    const id = newRoleId.trim().toLowerCase();
+    setCreatingRole(true);
+    setRoleError(null);
+    try {
+      const res = await api.createRole(id, newRoleDescription.trim());
+      const created = res.role.id;
+      setData((d) => (d ? { ...d, roles: d.roles.includes(created) ? d.roles : [...d.roles, created] } : d));
+      setAllowedRoles((roles) => (roles.includes(created) ? roles : [...roles, created]));
+      setNewRoleId("");
+      setNewRoleDescription("");
+      setAddingRole(false);
+    } catch (e: any) {
+      setRoleError(e.message || "Could not create the role");
+    } finally {
+      setCreatingRole(false);
+    }
+  }
+
   // Ingestion jobs refresh on their own while any is active; a job that
   // just finished also refreshes the document list once.
   const anyJobActive = jobs.some((j) => JOB_ACTIVE.has(j.status));
@@ -348,6 +401,18 @@ export function KnowledgePage() {
           : importAccount && importSecret
             ? { account: importAccount, secret: importSecret }
             : undefined;
+      case "snowflake":
+        return {
+          mode: "snowflake",
+          account: sfAccount.trim(),
+          user: sfUser.trim(),
+          auth_method: sfAuthMethod,
+          ...(sfAuthMethod === "keypair"
+            ? { private_key: importSecret, ...(sfPassphrase ? { private_key_passphrase: sfPassphrase } : {}) }
+            : { token: importSecret.trim() }),
+          ...(sfWarehouse.trim() ? { warehouse: sfWarehouse.trim() } : {}),
+          ...(sfRole.trim() ? { role: sfRole.trim() } : {}),
+        };
       default:
         return undefined;
     }
@@ -360,8 +425,18 @@ export function KnowledgePage() {
     setNotice(null);
     try {
       const expiryOpt = EXPIRY_OPTIONS.find((o) => o.value === expiryChoice);
+      const hours = expiryChoice === "hours" ? parseExpiryHours(expiryHours) : null;
+      if (expiryChoice === "hours" && hours == null) {
+        throw new Error(`Enter a whole number of hours between 1 and ${MAX_EXPIRY_HOURS.toLocaleString()}`);
+      }
       const expiry: { ttl_seconds?: number; expires_at?: string } =
-        expiryChoice === "date" ? { expires_at: expiryDate } : expiryOpt?.seconds ? { ttl_seconds: expiryOpt.seconds } : {};
+        expiryChoice === "date"
+          ? { expires_at: expiryDate }
+          : hours != null
+            ? { ttl_seconds: hours * 3600 }
+            : expiryOpt?.seconds
+              ? { ttl_seconds: expiryOpt.seconds }
+              : {};
       if (expiryChoice === "date" && !expiryDate) throw new Error("Pick the date this document expires");
 
       const dumpOptions = {
@@ -376,6 +451,24 @@ export function KnowledgePage() {
 
       if (addMode === "import") {
         if (!importUri.trim()) throw new Error("Enter the object URI to import");
+        const sfUri = importUri.trim().toLowerCase().startsWith("snowflake://");
+        if (sfUri && importAuthMode !== "snowflake") {
+          throw new Error("A snowflake:// URI needs the Snowflake service account credential");
+        }
+        if (importAuthMode === "snowflake") {
+          if (!sfUri) {
+            throw new Error(
+              "With a Snowflake service account the URI is snowflake://@DB.SCHEMA.STAGE/path/file or snowflake://DB.SCHEMA.TABLE"
+            );
+          }
+          if (!sfAccount.trim() || !sfUser.trim()) throw new Error("Enter the Snowflake account identifier and service user");
+          if (!importSecret.trim()) {
+            throw new Error(sfAuthMethod === "keypair" ? "Paste the service user's private key (PEM)" : "Enter the access token");
+          }
+          if (!importUri.trim().slice("snowflake://".length).startsWith("@") && !sfWarehouse.trim()) {
+            throw new Error("Importing a table needs a warehouse to run the query on");
+          }
+        }
         const res = await api.importKnowledge({
           uri: importUri.trim(),
           auth: importAuth(),
@@ -391,6 +484,7 @@ export function KnowledgePage() {
         );
         setImportUri("");
         setImportSecret("");
+        setSfPassphrase("");
         setJobs((j) => [res.job, ...j]);
         setPanel("jobs");
         return;
@@ -473,6 +567,15 @@ export function KnowledgePage() {
       const date = prompt("Expire on which date? (YYYY-MM-DD, UTC)");
       if (!date) return;
       expiry = { expires_at: date };
+    } else if (choice === "hours") {
+      const raw = prompt("Expire in how many hours from now?", "24");
+      if (!raw) return;
+      const hours = parseExpiryHours(raw);
+      if (hours == null) {
+        setError(`Enter a whole number of hours between 1 and ${MAX_EXPIRY_HOURS.toLocaleString()}`);
+        return;
+      }
+      expiry = { ttl_seconds: hours * 3600 };
     } else if (opt?.seconds) {
       expiry = { ttl_seconds: opt.seconds };
     }
@@ -1188,13 +1291,22 @@ export function KnowledgePage() {
                     <input
                       type="text"
                       value={importUri}
-                      placeholder="s3://bucket/exports/orders_0_0_0.csv.gz  ·  gs://...  ·  az://container/path  ·  https://..."
+                      placeholder={
+                        importAuthMode === "snowflake"
+                          ? "snowflake://@DB.SCHEMA.STAGE/exports/orders_0_0_0.csv.gz  ·  snowflake://DB.SCHEMA.TABLE"
+                          : "s3://bucket/exports/orders_0_0_0.csv.gz  ·  gs://...  ·  az://container/path  ·  https://...  ·  snowflake://..."
+                      }
                       onChange={(e) => {
                         setImportUri(e.target.value);
                         const v = e.target.value.trim().toLowerCase();
                         if (v.startsWith("s3://") && importAuthMode === "none") setImportAuthMode("aws");
                         else if (v.startsWith("gs://") && importAuthMode === "none") setImportAuthMode("gcp");
                         else if ((v.startsWith("az://") || v.startsWith("abfss://")) && importAuthMode === "none") setImportAuthMode("azure");
+                        else if (v.startsWith("snowflake://") && importAuthMode !== "snowflake") {
+                          setImportAuthMode("snowflake");
+                          setImportSecret("");
+                          setDumpSource("snowflake");
+                        }
                         if (!tableName && v) {
                           const base = e.target.value.split("?")[0].split("/").pop() || "";
                           setTableName(base.replace(/(\.(gz|zip|csv|tsv|json|jsonl|ndjson|parquet|avro|snappy))+$/i, ""));
@@ -1208,18 +1320,100 @@ export function KnowledgePage() {
                   </div>
                   <div className="field">
                     <label>Credential</label>
-                    <select value={importAuthMode} onChange={(e) => setImportAuthMode(e.target.value as any)}>
+                    <select
+                      value={importAuthMode}
+                      onChange={(e) => {
+                        // One secret field serves every mode; never carry a
+                        // token typed for one credential into another.
+                        setImportSecret("");
+                        setImportAuthMode(e.target.value as any);
+                        if (e.target.value === "snowflake") setDumpSource("snowflake");
+                      }}
+                    >
                       <option value="none">none (public object or presigned/signed URL)</option>
                       <option value="bearer">https: bearer token (Databricks PAT / OAuth token)</option>
                       <option value="header">https: API key in a named header</option>
                       <option value="aws">S3: access key ID + secret (omit to use the pod's IAM role)</option>
                       <option value="gcp">GCS: service-account JSON (omit to use Application Default Credentials)</option>
                       <option value="azure">Azure: connection string, or account name + key/SAS</option>
+                      <option value="snowflake">Snowflake: service account (key pair or access token)</option>
                     </select>
                     <div className="field-hint">Used for the download only - never stored on the job or the document.</div>
                   </div>
                 </div>
-                {importAuthMode !== "none" && (
+                {importAuthMode === "snowflake" && (
+                  <>
+                    <div className="three-col-fields" style={{ marginBottom: 4 }}>
+                      <div className="field">
+                        <label>Account identifier</label>
+                        <input type="text" value={sfAccount} placeholder="myorg-myaccount" onChange={(e) => setSfAccount(e.target.value)} />
+                        <div className="field-hint">The part before .snowflakecomputing.com.</div>
+                      </div>
+                      <div className="field">
+                        <label>Service user</label>
+                        <input type="text" value={sfUser} placeholder="AOM_SVC" autoComplete="off" onChange={(e) => setSfUser(e.target.value)} />
+                        <div className="field-hint">A TYPE = SERVICE user; it cannot sign in with a password.</div>
+                      </div>
+                      <div className="field">
+                        <label>Authentication</label>
+                        <select
+                          value={sfAuthMethod}
+                          onChange={(e) => {
+                            setImportSecret("");
+                            setSfAuthMethod(e.target.value as "keypair" | "token");
+                          }}
+                        >
+                          <option value="keypair">Key pair (RSA private key)</option>
+                          <option value="token">Programmatic access token (PAT)</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="two-col">
+                      <div className="field">
+                        <label>{sfAuthMethod === "keypair" ? "Private key (PEM)" : "Access token"}</label>
+                        {sfAuthMethod === "keypair" ? (
+                          <textarea
+                            rows={4}
+                            className="cell-mono"
+                            autoComplete="off"
+                            spellCheck={false}
+                            style={{ WebkitTextSecurity: "disc", fontSize: 12 } as React.CSSProperties}
+                            value={importSecret}
+                            placeholder={"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"}
+                            onChange={(e) => setImportSecret(e.target.value)}
+                          />
+                        ) : (
+                          <input type="password" autoComplete="new-password" value={importSecret} onChange={(e) => setImportSecret(e.target.value)} />
+                        )}
+                        <div className="field-hint">
+                          {sfAuthMethod === "keypair"
+                            ? "The PKCS#8 private key whose public half is set on the user (ALTER USER ... SET RSA_PUBLIC_KEY = '...')."
+                            : "A programmatic access token generated for the service user; its network policy must allow the operations manager."}
+                        </div>
+                      </div>
+                      <div>
+                        {sfAuthMethod === "keypair" && (
+                          <div className="field">
+                            <label>Private key passphrase (optional)</label>
+                            <input type="password" autoComplete="new-password" value={sfPassphrase} onChange={(e) => setSfPassphrase(e.target.value)} />
+                          </div>
+                        )}
+                        <div className="two-col">
+                          <div className="field">
+                            <label>Warehouse</label>
+                            <input type="text" value={sfWarehouse} placeholder="COMPUTE_WH" onChange={(e) => setSfWarehouse(e.target.value)} />
+                            <div className="field-hint">Required to import a table.</div>
+                          </div>
+                          <div className="field">
+                            <label>Role (optional)</label>
+                            <input type="text" value={sfRole} placeholder="the user's default role" onChange={(e) => setSfRole(e.target.value)} />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
+                {importAuthMode !== "none" && importAuthMode !== "snowflake" && (
                   <div className="two-col">
                     {importAuthMode === "aws" && (
                       <>
@@ -1283,7 +1477,9 @@ export function KnowledgePage() {
                             </option>
                           ))}
                         </select>
-                        <div className="field-hint">{IMPORT_HELP[dumpSource] || IMPORT_HELP.other}</div>
+                        <div className="field-hint">
+                          {importAuthMode === "snowflake" ? SNOWFLAKE_ACCOUNT_HELP : IMPORT_HELP[dumpSource] || IMPORT_HELP.other}
+                        </div>
                       </div>
                       <div className="field">
                         <label>Table name</label>
@@ -1446,6 +1642,24 @@ export function KnowledgePage() {
                     onChange={(e) => setExpiryDate(e.target.value)}
                   />
                 )}
+                {expiryChoice === "hours" && (
+                  <div className="flex-row" style={{ gap: 8, alignItems: "center", marginTop: 8 }}>
+                    <input
+                      type="number"
+                      min={1}
+                      max={MAX_EXPIRY_HOURS}
+                      step={1}
+                      style={{ maxWidth: 140 }}
+                      value={expiryHours}
+                      aria-label="Hours until this document expires"
+                      onChange={(e) => setExpiryHours(e.target.value)}
+                    />
+                    <span className="cell-muted">
+                      hour(s) after it is added
+                      {parseExpiryHours(expiryHours) == null ? " - enter a whole number, 1 or more" : ""}
+                    </span>
+                  </div>
+                )}
                 <div className="field-hint">
                   An expired document stops being retrieved the moment it expires (RAG answers included) and is
                   deleted within {Math.round(data.expiry_sweep_seconds / 60)} minutes. Change it any time below.
@@ -1468,9 +1682,68 @@ export function KnowledgePage() {
                   </label>
                 </div>
               ))}
+              {addingRole ? (
+                <div className="new-set-panel" style={{ marginTop: 8 }}>
+                  <div className="two-col">
+                    <div className="field">
+                      <label>New role ID</label>
+                      <input
+                        type="text"
+                        value={newRoleId}
+                        placeholder="e.g. contracts_reader"
+                        autoFocus
+                        onChange={(e) => setNewRoleId(e.target.value.toLowerCase())}
+                      />
+                      <div className="field-hint">
+                        Lowercase letters, digits and underscores, starting with a letter. It cannot be renamed later.
+                      </div>
+                    </div>
+                    <div className="field">
+                      <label>Description</label>
+                      <input
+                        type="text"
+                        value={newRoleDescription}
+                        placeholder="Who holds this role and what it is for"
+                        onChange={(e) => setNewRoleDescription(e.target.value)}
+                        onKeyDown={(e) => {
+                          // Enter here must not submit the upload form around it.
+                          if (e.key === "Enter") e.preventDefault();
+                        }}
+                      />
+                    </div>
+                  </div>
+                  {roleError && <div className="error-note" style={{ marginBottom: 10 }}>{roleError}</div>}
+                  <div className="flex-row" style={{ gap: 8 }}>
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      disabled={creatingRole || !ROLE_ID_PATTERN.test(newRoleId.trim()) || !newRoleDescription.trim()}
+                      onClick={handleCreateRole}
+                    >
+                      {creatingRole ? "Creating role..." : "Create role and select it"}
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      disabled={creatingRole}
+                      onClick={() => {
+                        setAddingRole(false);
+                        setRoleError(null);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button className="btn btn-secondary btn-sm" type="button" style={{ marginTop: 6 }} onClick={() => setAddingRole(true)}>
+                  + Add a role
+                </button>
+              )}
               <div className="field-hint">
                 Required. A document no role can read is indexed, embedded and permanently invisible, so the form
-                refuses rather than letting you create one.
+                refuses rather than letting you create one. A role added here starts with no tools or agents;
+                grant those on the Roles &amp; RBAC page.
               </div>
             </div>
 
@@ -1920,7 +2193,13 @@ export function KnowledgePage() {
                             <option value="">Change...</option>
                             {EXPIRY_OPTIONS.map((o) => (
                               <option key={o.value} value={o.value}>
-                                {o.value === "never" ? "Never expire" : o.value === "date" ? "On a date..." : `In ${o.label}`}
+                                {o.value === "never"
+                                  ? "Never expire"
+                                  : o.value === "date"
+                                    ? "On a date..."
+                                    : o.value === "hours"
+                                      ? "In a number of hours..."
+                                      : `In ${o.label}`}
                               </option>
                             ))}
                           </select>

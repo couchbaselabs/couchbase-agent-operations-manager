@@ -32,9 +32,10 @@ once per missed tick; a sync whose previous run is still going is skipped
 and the skip recorded. Only one run per sync at a time.
 
 Authentication, per vendor (what the vendors recommend for services):
-  Snowflake   key-pair JWT (RSA private key, the account's recommended
-              path for programmatic access), or a programmatic access
-              token / OAuth access token as a bearer.
+  Snowflake   a service account (TYPE = SERVICE user): key-pair JWT (RSA
+              private key, the account's recommended path for programmatic
+              access), or a programmatic access token / OAuth access token
+              as a bearer.
   Databricks  service-principal OAuth M2M (client ID + secret, token
               exchange at /oidc/v1/token - the same client-credentials
               code app/server_auth.py uses for MCP servers), or a PAT.
@@ -83,20 +84,27 @@ VENDORS: list[dict] = [
     {
         "id": "snowflake", "label": "Snowflake", "product": "Snowflake SQL REST API", "openSource": False,
         "transport": "POST /api/v2/statements, result partitions streamed",
-        "description": "Runs the query on a Snowflake warehouse and streams the result partitions.",
+        "description": "Runs the query on a Snowflake warehouse as a service account (a TYPE = SERVICE user with a "
+                       "key pair or a programmatic access token) and streams the result partitions.",
         "fields": [
             _f("account", "Account identifier", "text", "", True, "abc12345.us-east-1",
                "The part before .snowflakecomputing.com (org-account or account locator with region)."),
-            _f("user", "User", "text", "", True, "AOM_SVC", "The user the key pair or token belongs to."),
-            _f("auth_method", "Authentication", "select", "keypair", True, "", None, ["keypair", "token"]),
+            _f("user", "Service account user", "text", "", True, "AOM_SVC",
+               "The Snowflake service account: CREATE USER AOM_SVC TYPE = SERVICE DEFAULT_ROLE = ... . Service users "
+               "have no password, so they authenticate with one of the two methods below. A person's user works too."),
+            _f("auth_method", "Authentication", "select", "keypair", True, "",
+               "How the service account signs in: keypair (RSA key pair - Snowflake's recommendation for services) "
+               "or token (programmatic access token).", ["keypair", "token"]),
             _f("private_key", "Private key (PEM)", "secret_text", "", False, "",
-               "Key-pair auth: the RSA private key registered on the user (ALTER USER ... SET RSA_PUBLIC_KEY). PKCS#8 PEM; "
-               "encrypted keys need the passphrase below."),
+               "Key-pair auth (keypair): the RSA private key whose public half is set on the service account "
+               "(ALTER USER AOM_SVC SET RSA_PUBLIC_KEY = '...'). PKCS#8 PEM; encrypted keys need the passphrase below."),
             _f("private_key_passphrase", "Private key passphrase", "secret", "", False, "", "Only for an encrypted private key."),
             _f("token", "Access token", "secret", "", False, "",
-               "Token auth: a programmatic access token (PAT) or an OAuth access token, sent as a bearer."),
+               "Token auth (token): a programmatic access token generated for the service account (ALTER USER AOM_SVC "
+               "ADD PROGRAMMATIC ACCESS TOKEN ...; its network policy must allow the operations manager), or an OAuth "
+               "access token. Sent as a bearer."),
             _f("warehouse", "Warehouse", "text", "", True, "COMPUTE_WH", None),
-            _f("role", "Role", "text", "", False, "ANALYST", "Optional."),
+            _f("role", "Role", "text", "", False, "ANALYST", "Optional; the service account's default role otherwise."),
             _f("database", "Database", "text", "", False, "SALES", "Optional default for unqualified names in the query."),
             _f("schema", "Schema", "text", "", False, "PUBLIC", "Optional."),
         ],
@@ -426,21 +434,36 @@ def _snowflake_jwt(account: str, user: str, private_key_pem: str, passphrase: st
     return jwt.encode(payload, key, algorithm="RS256")
 
 
-def _snowflake_headers(conn: dict) -> dict:
-    method = conn.get("auth_method") or "keypair"
-    if method == "keypair":
-        token = _snowflake_jwt(conn["account"], conn["user"], _get("snowflake", conn, "private_key"), _get("snowflake", conn, "private_key_passphrase") or None)
-        return {"Authorization": f"Bearer {token}", "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT",
-                "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "couchbase-aom/1.0"}
-    token = _get("snowflake", conn, "token")
+def snowflake_auth_headers(account: str, user: str, *, auth_method: str = "keypair", private_key: str = "",
+                           passphrase: str | None = None, token: str = "") -> dict:
+    """SQL API headers for a Snowflake user from plaintext credentials:
+    key-pair JWT (what a TYPE = SERVICE user normally has) or a
+    programmatic access token / OAuth token. Shared by warehouse syncs
+    (stored, encrypted connection) and Knowledge Base imports (a
+    credential used once for the download)."""
+    common = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "couchbase-aom/1.0"}
+    if (auth_method or "keypair") == "keypair":
+        jwt_token = _snowflake_jwt(account, user, private_key, passphrase or None)
+        return {"Authorization": f"Bearer {jwt_token}", "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT", **common}
     kind = "PROGRAMMATIC_ACCESS_TOKEN" if token and not token.count(".") >= 2 else "OAUTH"
-    return {"Authorization": f"Bearer {token}", "X-Snowflake-Authorization-Token-Type": kind,
-            "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "couchbase-aom/1.0"}
+    return {"Authorization": f"Bearer {token}", "X-Snowflake-Authorization-Token-Type": kind, **common}
 
 
-def run_snowflake(conn: dict, query: str, *, cancelled: Callable[[], bool], on_total=None) -> Iterator[dict]:
+def _snowflake_headers(conn: dict) -> dict:
+    return snowflake_auth_headers(
+        conn["account"], conn["user"], auth_method=conn.get("auth_method") or "keypair",
+        private_key=_get("snowflake", conn, "private_key"),
+        passphrase=_get("snowflake", conn, "private_key_passphrase") or None,
+        token=_get("snowflake", conn, "token"),
+    )
+
+
+def run_snowflake(conn: dict, query: str, *, cancelled: Callable[[], bool], on_total=None,
+                  headers: dict | None = None) -> Iterator[dict]:
+    """`headers` lets a caller that already holds plaintext credentials
+    (Knowledge Base imports) skip the stored-connection lookup."""
     base = f"https://{conn['account']}.snowflakecomputing.com/api/v2/statements"
-    headers = _snowflake_headers(conn)
+    headers = headers or _snowflake_headers(conn)
     body = {"statement": query, "timeout": QUERY_TIMEOUT_SECONDS, "warehouse": conn.get("warehouse") or None,
             "role": conn.get("role") or None, "database": conn.get("database") or None, "schema": conn.get("schema") or None,
             "parameters": {"MULTI_STATEMENT_COUNT": 1}}

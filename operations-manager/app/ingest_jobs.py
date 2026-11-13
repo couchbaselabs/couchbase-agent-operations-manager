@@ -16,7 +16,9 @@ outlive every timeout between them. This module is the other path:
      unloads to an external stage, BigQuery EXPORT DATA, Databricks
      df.write to a Volume or cloud path), or an https URL (a presigned
      URL, or the Databricks Files API with a bearer token). The object is
-     streamed into the spool the same way.
+     streamed into the spool the same way. A snowflake:// URI with a
+     Snowflake service-account credential reads a staged file or a whole
+     table straight from Snowflake instead (see fetch_snowflake).
   3. **A job.** Either route returns a job id at once. One worker per
      KNOWLEDGE_INGEST_CONCURRENCY slot takes the job: streams rows out of
      the spooled file (app/data_dumps.DumpReader) or text out of a
@@ -41,8 +43,10 @@ and the knowledge set's own quota.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -178,6 +182,117 @@ def _stream_to(path: str, iterator, on_progress: Callable[[int], None], limit_by
     return received
 
 
+# -- Snowflake (service-account credential) -----------------------------------
+# An unquoted identifier, or a double-quoted one with no embedded quote.
+_SF_IDENT = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"\x00-\x1f]+")'
+_SF_NAME = re.compile(rf"^{_SF_IDENT}(?:\.{_SF_IDENT}){{0,2}}$")
+SNOWFLAKE_PRESIGN_SECONDS = 3600
+
+
+def parse_snowflake_uri(uri: str) -> dict:
+    """snowflake://@[DB.SCHEMA.]STAGE/path/file.csv.gz  -> a staged file
+       snowflake://[DB.SCHEMA.]TABLE                    -> a whole table
+
+    Names go into SQL text, so they are held to Snowflake's identifier
+    grammar here rather than escaped later. Raises ImportError_."""
+    rest = uri.split("://", 1)[1].split("?", 1)[0].strip() if "://" in uri else ""
+    if not rest:
+        raise ImportError_("a snowflake:// URI names a staged file (snowflake://@DB.SCHEMA.STAGE/path/file.csv.gz) "
+                           "or a table (snowflake://DB.SCHEMA.TABLE)")
+    if rest.startswith("@"):
+        stage, _, path = rest[1:].partition("/")
+        path = path.strip("/")
+        if not _SF_NAME.match(stage):
+            raise ImportError_(f"'{stage}' is not a named stage - use snowflake://@DB.SCHEMA.STAGE/path/file "
+                               "(user and table stages cannot produce download URLs)")
+        if not path or any(ord(c) < 32 for c in path):
+            raise ImportError_("give the path of one file inside the stage, e.g. snowflake://@DB.SCHEMA.STAGE/exports/orders_0_0_0.csv.gz")
+        return {"kind": "stage", "stage": stage, "path": path, "filename": os.path.basename(path)}
+    table = rest.rstrip("/")
+    if not _SF_NAME.match(table):
+        raise ImportError_(f"'{table}' is not a table name - use snowflake://DB.SCHEMA.TABLE, or "
+                           "snowflake://@DB.SCHEMA.STAGE/path/file for a staged file")
+    leaf = re.sub(r"[^A-Za-z0-9_.-]+", "_", table.split(".")[-1].strip('"')) or "table"
+    return {"kind": "table", "table": table, "filename": f"{leaf}.ndjson"}
+
+
+def snowflake_account(raw: str) -> str:
+    """Accept the bare identifier or a pasted URL."""
+    acct = re.sub(r"^https?://", "", (raw or "").strip(), flags=re.I).split("/", 1)[0]
+    return re.sub(r"\.snowflakecomputing\.com$", "", acct, flags=re.I)
+
+
+def missing_snowflake_auth(auth: dict | None) -> list[str]:
+    auth = auth or {}
+    missing = [label for key, label in (("account", "account identifier"), ("user", "service user")) if not str(auth.get(key) or "").strip()]
+    if (auth.get("auth_method") or "keypair") == "token":
+        if not auth.get("token"):
+            missing.append("access token")
+    elif not auth.get("private_key"):
+        missing.append("private key (PEM)")
+    return missing
+
+
+def fetch_snowflake(uri: str, auth: dict, dest: str, *, on_progress: Callable[[int], None],
+                    on_total: Callable[[int | None], None], limit_bytes: int, cancelled: Callable[[], bool]) -> int:
+    """Read from Snowflake as a service account (a TYPE = SERVICE user:
+    key-pair JWT, or a programmatic access token), over the SQL REST API -
+    the same code warehouse syncs use, no driver in the image.
+
+      staged file  SELECT GET_PRESIGNED_URL(@stage, 'path') and stream that
+                   URL into the spool; the file is parsed like any other
+                   export.
+      table        SELECT * FROM the table, result partitions streamed into
+                   the spool as newline-delimited JSON."""
+    from app import warehouse_sync  # lazy: keeps this module importable on its own
+
+    target = parse_snowflake_uri(uri)
+    missing = missing_snowflake_auth(auth)
+    if missing:
+        raise ImportError_("the Snowflake service-account credential is missing its " + ", ".join(missing) +
+                           " - credentials are never kept, so queue the import again with it")
+    account = snowflake_account(auth["account"])
+    conn = {"account": account, "warehouse": (auth.get("warehouse") or "").strip(), "role": (auth.get("role") or "").strip()}
+    try:
+        headers = warehouse_sync.snowflake_auth_headers(
+            account, auth["user"].strip(), auth_method=auth.get("auth_method") or "keypair",
+            private_key=auth.get("private_key") or "", passphrase=auth.get("private_key_passphrase") or None,
+            token=(auth.get("token") or "").strip(),
+        )
+        if target["kind"] == "stage":
+            literal = target["path"].replace("\\", "\\\\").replace("'", "''")
+            sql = f"SELECT GET_PRESIGNED_URL(@{target['stage']}, '{literal}', {SNOWFLAKE_PRESIGN_SECONDS}) AS URL"
+            row = next(iter(warehouse_sync.run_snowflake(conn, sql, cancelled=cancelled, headers=headers)), None)
+            url = str(next(iter((row or {}).values()), "") or "")
+            if not url.lower().startswith("https://"):
+                raise ImportError_(f"Snowflake returned no download URL for {target['path']} in @{target['stage']}")
+            return fetch_uri(url, None, dest, on_progress=on_progress, on_total=on_total,
+                             limit_bytes=limit_bytes, cancelled=cancelled)
+
+        if not conn["warehouse"]:
+            raise ImportError_("reading a table needs a warehouse - add one to the Snowflake credential")
+        on_total(None)
+        written = 0
+        last = time.time()
+        with open(dest, "w", encoding="utf-8") as out:
+            for row in warehouse_sync.run_snowflake(conn, f"SELECT * FROM {target['table']}", cancelled=cancelled, headers=headers):
+                line = json.dumps(row, default=str, separators=(",", ":")) + "\n"
+                written += len(line.encode("utf-8"))
+                if written > limit_bytes:
+                    raise ImportError_(f"the table is larger than the {limit_bytes // (1024 * 1024)} MB upload limit - "
+                                       "unload it to a stage in parts, or use a warehouse sync with a narrower query")
+                out.write(line)
+                if time.time() - last > 1:
+                    last = time.time()
+                    on_progress(written)
+        on_progress(written)
+        return written
+    except warehouse_sync.SyncError as exc:
+        if str(exc) == "cancelled":
+            raise JobCancelled() from exc
+        raise ImportError_(str(exc)) from exc
+
+
 def fetch_uri(uri: str, auth: dict | None, dest: str, *, on_progress: Callable[[int], None],
               on_total: Callable[[int | None], None], limit_bytes: int, cancelled: Callable[[], bool]) -> int:
     """Stream one object into `dest`. Returns the byte count.
@@ -193,6 +308,10 @@ def fetch_uri(uri: str, auth: dict | None, dest: str, *, on_progress: Callable[[
     auth = auth or {}
     parsed = urlparse(uri)
     scheme = (parsed.scheme or "").lower()
+
+    if scheme == "snowflake":
+        return fetch_snowflake(uri, auth, dest, on_progress=on_progress, on_total=on_total,
+                               limit_bytes=limit_bytes, cancelled=cancelled)
 
     def _iter_with_cancel(it):
         for block in it:
@@ -320,7 +439,7 @@ def fetch_uri(uri: str, auth: dict | None, dest: str, *, on_progress: Callable[[
         except Exception as exc:  # noqa: BLE001
             raise ImportError_(f"Azure Blob error for {uri}: {str(exc)[:300]}") from exc
 
-    raise ImportError_(f"unsupported URI scheme '{scheme}' - use https://, s3://, gs://, az:// or abfss://")
+    raise ImportError_(f"unsupported URI scheme '{scheme}' - use https://, s3://, gs://, az://, abfss:// or snowflake://")
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +574,10 @@ class IngestRunner:
         # one, so partial chunks are found even when it never returned.
         document_id = job.get("document_id")
         job.update(status=status, phase=status, error=error, finished_at=now_iso(), document_id=None)
+        # An import that failed or was cancelled before its download
+        # finished still carries the credential; it is for the download
+        # only and must not outlive the attempt.
+        (job.get("params") or {}).pop("auth", None)
         if document_id:
             # Nothing half-indexed stays retrievable.
             removed = await self.store.delete_knowledge_document(document_id)
