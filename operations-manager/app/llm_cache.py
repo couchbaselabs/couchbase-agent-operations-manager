@@ -645,6 +645,13 @@ def _bedrock_converse(model: str, prompt: str, max_tokens: int, temperature: flo
     import boto3
     from botocore.config import Config as BotoConfig
 
+    # Deployments pass every provider variable through, so an unused Bedrock
+    # API key arrives as an empty string. botocore treats a variable that is
+    # set at all as a token and sends it instead of signing with the pod /
+    # instance role or access keys, and Bedrock answers 403.
+    if not (os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or "x").strip():
+        os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+
     client = boto3.client(
         "bedrock-runtime",
         region_name=bedrock_region(),
