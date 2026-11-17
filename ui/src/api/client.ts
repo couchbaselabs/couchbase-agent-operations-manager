@@ -99,9 +99,15 @@ class ApiError extends Error {
 let onUnauthorized: (() => void) | null = null;
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  // `headers` goes after the spread on purpose: the other way round, a
+  // caller that passes its own headers (every call that sends an agent
+  // `Authorization: Bearer` key) replaces this object wholesale and loses
+  // Content-Type. The browser then labels the JSON body text/plain, and
+  // FastAPI refuses to parse it ("Input should be a valid dictionary or
+  // object to extract fields from").
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   if (!res.ok) {
     let detail = res.statusText;
