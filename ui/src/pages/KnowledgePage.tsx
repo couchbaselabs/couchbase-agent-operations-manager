@@ -883,6 +883,10 @@ export function KnowledgePage() {
             <>
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Add a Knowledge Set</h2>
           <form className="panel section-gap" onSubmit={handleUpload} style={{ marginBottom: 24 }}>
+            <div className="helper-banner helper-banner-neutral">
+              <strong>Note:</strong> When determining what embedding model to use, it&rsquo;s always a good idea to
+              research / search what embedding models best support the LLM and your use-case.
+            </div>
             <div className="two-col">
               <div className="field">
                 <label>Knowledge set</label>
