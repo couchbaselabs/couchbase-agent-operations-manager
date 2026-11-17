@@ -28,6 +28,21 @@ Four independent controls, because they fail in different ways:
     provider call may take. Without one, a hung downstream holds a
     connection here open indefinitely.
 
+Three scopes, all checked on every call, because "who is over the line"
+has three different answers:
+
+  - **Per caller** - the ceilings one API key / agent identity may reach.
+    The defaults apply to everyone; an override for a role or for one agent
+    replaces only the fields it sets (an agent override wins over a role
+    override, which wins over the defaults).
+  - **Per role, shared** - one budget that every caller in a role draws
+    from together: "the support agents may spend $50 a day between them".
+  - **Global** - one ceiling for the whole gateway, all callers combined.
+    The backstop that holds even when every individual caller is inside
+    its own limit.
+
+A call is refused when any scope that applies to it is exhausted.
+
 Counting is done with Couchbase KV atomic counters (see
 `CouchbaseStore.incr_counter`) rather than an in-process dictionary: the
 counter document carries the window as its expiry, so the window rolls
@@ -41,6 +56,7 @@ feature gets switched back off permanently, so the honest default is to
 measure first: with `enforce` false every limit is evaluated and recorded
 exactly as it would be, and nothing is blocked.
 """
+import hashlib
 import time
 
 # Window lengths, in seconds, for each counter family.
@@ -77,6 +93,31 @@ LIMIT_LABELS = {
     "spend": "spend budget",
 }
 
+# Which config field holds the ceiling for each counter family.
+FAMILY_FIELDS = {
+    "requests": "requests_per_minute",
+    "tool_calls": "tool_calls_per_minute",
+    "tool_calls_per_run": "tool_calls_per_run",
+    "tokens": "tokens_per_hour",
+    "spend": "spend_per_day_usd",
+}
+# Everything a per-caller override may set, and everything a shared scope
+# (a role's total, the global total) may set. A run belongs to one caller,
+# so the per-run ceiling has no shared form.
+CALLER_LIMIT_FIELDS = tuple(FAMILY_FIELDS.values())
+SHARED_LIMIT_FIELDS = tuple(f for f in CALLER_LIMIT_FIELDS if f != "tool_calls_per_run")
+OVERRIDE_MATCH_TYPES = ("role", "agent")
+MAX_OVERRIDES = 200
+
+# Counter subjects for the shared scopes. A caller subject is a key prefix
+# or an "anon:" address, so the "@" keeps these from ever colliding with one.
+GLOBAL_SUBJECT = "@global"
+
+
+def role_subject(role: str) -> str:
+    return f"@role:{role}"
+
+
 DEFAULT_GOVERNANCE_CONFIG = {
     "enabled": True,
     # False = evaluate and record, never block. See the module docstring.
@@ -87,6 +128,12 @@ DEFAULT_GOVERNANCE_CONFIG = {
     "tool_calls_per_run": 25,
     "tokens_per_hour": 500_000,
     "spend_per_day_usd": 25.0,
+    # Global ceilings: all callers combined. 0 disables each one, and all
+    # are off by default - a gateway-wide ceiling set without knowing the
+    # fleet's total traffic refuses everyone at once.
+    "global_limits": {field: 0 for field in SHARED_LIMIT_FIELDS},
+    # Per-role and per-agent limits - see normalize_override.
+    "overrides": [],
     # Roles that bypass every limit. Kept deliberately empty by default -
     # an exemption should be a decision someone made, not a default they
     # inherited.
@@ -115,6 +162,114 @@ _INT_FIELDS = (
 # fails", so they get a floor rather than an off switch.
 _MIN_VALUES = {"downstream_timeout_seconds": 1, "llm_timeout_seconds": 1, "request_timeout_seconds": 5}
 _MAX_VALUES = {"downstream_timeout_seconds": 600, "llm_timeout_seconds": 900, "request_timeout_seconds": 1800}
+
+
+def _limit_value(field: str, value):
+    """One ceiling coerced to its type, or None when it is not a number."""
+    try:
+        if field == "spend_per_day_usd":
+            return max(0.0, round(float(value), 4))
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_limits(raw, fields: tuple, *, sparse: bool, keep_zero: bool = True) -> dict:
+    """A set of ceilings limited to `fields`. `sparse` keeps only the ones
+    supplied (an override); otherwise every field is present and a missing
+    one is 0. `keep_zero` False drops zeros, for scopes where 0 just means
+    "no ceiling here"."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for field in fields:
+        value = _limit_value(field, raw.get(field)) if raw.get(field) not in (None, "") else None
+        if value is None:
+            if not sparse:
+                out[field] = 0
+            continue
+        if value or keep_zero:
+            out[field] = value
+    return out
+
+
+def _override_id(match_type: str, match_value: str) -> str:
+    material = f"{match_type}:{match_value}:{time.time_ns()}"
+    return "limit-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def normalize_override(raw: dict | None) -> dict | None:
+    """One per-role or per-agent entry in its stored shape, or None when it
+    names nobody or sets nothing.
+
+    `limits` are per-caller ceilings and carry only the fields the entry
+    sets - everything else keeps following the defaults, so a later change
+    to the default token budget still reaches an agent whose override only
+    raised its request rate. A 0 here is deliberate: "no ceiling on this
+    for this caller". `shared_limits` exist for a role only: one total that
+    every caller in the role counts against together."""
+    raw = raw or {}
+    match = raw.get("match") or {}
+    match_type = str(match.get("type") or "").strip()
+    match_value = str(match.get("value") or "").strip()[:200]
+    if match_type not in OVERRIDE_MATCH_TYPES or not match_value:
+        return None
+    limits = normalize_limits(raw.get("limits"), CALLER_LIMIT_FIELDS, sparse=True)
+    shared = {}
+    if match_type == "role":
+        shared = normalize_limits(raw.get("shared_limits"), SHARED_LIMIT_FIELDS, sparse=True, keep_zero=False)
+    if not limits and not shared:
+        return None
+    return {
+        "override_id": str(raw.get("override_id") or "").strip()[:64] or _override_id(match_type, match_value),
+        "name": str(raw.get("name") or "").strip()[:120] or f"{match_type} {match_value}",
+        "match": {"type": match_type, "value": match_value},
+        "enabled": bool(raw.get("enabled", True)),
+        "limits": limits,
+        "shared_limits": shared,
+    }
+
+
+def normalize_overrides(raw) -> list[dict]:
+    out, seen = [], set()
+    for item in raw if isinstance(raw, list) else []:
+        entry = normalize_override(item if isinstance(item, dict) else None)
+        if entry and entry["override_id"] not in seen:
+            seen.add(entry["override_id"])
+            out.append(entry)
+    return out[:MAX_OVERRIDES]
+
+
+def resolve(cfg: dict, role: str | None, agent_id: str | None) -> dict:
+    """The ceilings that apply to one caller.
+
+    Returns `caller` (every per-caller ceiling, resolved field by field:
+    the agent's override, else the role's, else the default), `source`
+    (which of those supplied each field), and `role_total` (the role's
+    shared ceilings, empty when it has none). Within one match the first
+    enabled entry in stored order applies."""
+    def first(match_type, value):
+        if not value:
+            return None
+        for entry in cfg.get("overrides") or []:
+            if entry.get("enabled", True) and entry["match"]["type"] == match_type \
+                    and entry["match"]["value"] == value:
+                return entry
+        return None
+
+    role_entry, agent_entry = first("role", role), first("agent", agent_id)
+    caller, source = {}, {}
+    for field in CALLER_LIMIT_FIELDS:
+        if agent_entry and field in agent_entry["limits"]:
+            caller[field], source[field] = agent_entry["limits"][field], "agent"
+        elif role_entry and field in role_entry["limits"]:
+            caller[field], source[field] = role_entry["limits"][field], "role"
+        else:
+            caller[field], source[field] = cfg.get(field, 0), "default"
+    return {
+        "caller": caller,
+        "source": source,
+        "role_total": dict(role_entry["shared_limits"]) if role_entry else {},
+    }
 
 
 def normalize_config(cfg: dict | None) -> dict:
@@ -148,6 +303,9 @@ def normalize_config(cfg: dict | None) -> dict:
     if not isinstance(roles, (list, tuple)):
         roles = []
     merged["exempt_roles"] = [str(r)[:64] for r in roles][:20]
+
+    merged["global_limits"] = normalize_limits(merged.get("global_limits"), SHARED_LIMIT_FIELDS, sparse=False)
+    merged["overrides"] = normalize_overrides(merged.get("overrides"))
 
     return merged
 
@@ -212,16 +370,15 @@ def is_exempt(cfg: dict, role: str | None) -> bool:
 
 
 def limit_for(cfg: dict, family: str) -> float:
-    return {
-        "requests": cfg.get("requests_per_minute", 0),
-        "tool_calls": cfg.get("tool_calls_per_minute", 0),
-        "tool_calls_per_run": cfg.get("tool_calls_per_run", 0),
-        "tokens": cfg.get("tokens_per_hour", 0),
-        "spend": cfg.get("spend_per_day_usd", 0.0),
-    }.get(family, 0)
+    """The default per-caller ceiling for a family."""
+    return cfg.get(FAMILY_FIELDS.get(family, ""), 0) or 0
 
 
-def evaluate(cfg: dict, family: str, used: float, role: str | None) -> dict:
+def evaluate(
+    cfg: dict, family: str, used: float, role: str | None, *,
+    limit: float | None = None, scope: str = "caller", scope_name: str | None = None,
+    source: str = "default",
+) -> dict:
     """Decide what to do about a counter that has just been advanced to
     `used`. Always returns a full verdict, even when nothing is wrong, so
     callers can attach it to a trace span unconditionally.
@@ -230,8 +387,21 @@ def evaluate(cfg: dict, family: str, used: float, role: str | None) -> dict:
     they differ exactly when limits are being measured rather than
     enforced, which is the whole point of `enforce`.
     """
-    limit = limit_for(cfg, family)
+    # `limit` is the resolved ceiling for the scope being judged (see
+    # resolve); left out, the default per-caller ceiling applies. `scope` is
+    # whose counter `used` came from - "caller", "role" (the role's shared
+    # total) or "global" - and `source` says where a caller's ceiling came
+    # from: the defaults, a role override or an agent override.
+    if limit is None:
+        limit = limit_for(cfg, family)
+    who = {
+        "role": f"shared by every caller in role '{scope_name}'",
+        "global": "across all callers (global)",
+    }.get(scope, "for this caller")
     verdict = {
+        "scope": scope,
+        "scope_name": scope_name,
+        "source": source,
         "family": family,
         "label": LIMIT_LABELS.get(family, family),
         "limit": limit,
@@ -257,11 +427,11 @@ def evaluate(cfg: dict, family: str, used: float, role: str | None) -> dict:
     )
     if family == "spend":
         verdict["reason"] = (
-            f"daily spend budget exhausted for this caller: ${used:.4f} used of ${limit:.2f} allowed"
+            f"daily spend budget exhausted {who}: ${used:.4f} used of ${limit:.2f} allowed"
         )
     elif family == "tokens":
         verdict["reason"] = (
-            f"hourly token budget exhausted for this caller: {int(used)} used of {int(limit)} allowed"
+            f"hourly token budget exhausted {who}: {int(used)} used of {int(limit)} allowed"
         )
     elif family == "tool_calls_per_run":
         verdict["reason"] = (
@@ -270,7 +440,7 @@ def evaluate(cfg: dict, family: str, used: float, role: str | None) -> dict:
         )
     else:
         verdict["reason"] = (
-            f"{verdict['label']} limit exceeded for this caller: {int(used)} in the last "
+            f"{verdict['label']} limit exceeded {who}: {int(used)} in the last "
             f"{window}s, over the limit of {int(limit)}"
         )
     return verdict

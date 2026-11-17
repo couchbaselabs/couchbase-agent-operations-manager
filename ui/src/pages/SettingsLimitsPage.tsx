@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import type { GovernanceConfig, GovernanceConfigResponse, LimitVerdict } from "../api/types";
+import { LimitOverridesPanel } from "../components/limits/LimitOverridesPanel";
+import type {
+  GovernanceConfig,
+  GovernanceConfigResponse,
+  LimitOverride,
+  LimitVerdict,
+  SharedLimitFields,
+} from "../api/types";
+
+const FAMILIES = ["requests", "tool_calls", "tokens", "spend"];
 
 function usageLabel(v: LimitVerdict) {
   if (v.family === "spend") return `$${Number(v.used).toFixed(4)} / $${Number(v.limit).toFixed(2)}`;
@@ -43,6 +52,11 @@ export function SettingsLimitsPage() {
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(false);
 
+  // Current usage filters
+  const [search, setSearch] = useState("");
+  const [roleFilter, setRoleFilter] = useState("");
+  const [limitFilter, setLimitFilter] = useState<"" | "over" | "custom" | "active">("");
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -82,6 +96,45 @@ export function SettingsLimitsPage() {
     }
   }
 
+  function patchGlobal(update: Partial<SharedLimitFields>) {
+    setConfig((c) => (c ? { ...c, global_limits: { ...c.global_limits, ...update } } : c));
+  }
+
+  // Adding, editing or removing a role/agent entry saves straight away -
+  // along with anything else changed on the page, since it is one policy.
+  async function handleSaveOverrides(overrides: LimitOverride[], note: string): Promise<boolean> {
+    if (!config) return false;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.saveGovernanceConfig({ ...config, overrides });
+      setConfig(res.config);
+      setNotice(`${note} It applies to the next call.`);
+      await load();
+      return true;
+    } catch (e: any) {
+      setError(e.message || "Could not save the limits");
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const filteredUsage = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return (data?.usage || []).filter((row) => {
+      if (needle && ![row.agent, row.subject, row.agent_id, row.role].some((v) => (v || "").toLowerCase().includes(needle)))
+        return false;
+      if (roleFilter && row.role !== roleFilter) return false;
+      if (limitFilter === "over" && !row.limits.some((l) => l.exceeded)) return false;
+      if (limitFilter === "custom" && !row.limits.some((l) => l.source === "role" || l.source === "agent")) return false;
+      if (limitFilter === "active" && !row.limits.some((l) => Number(l.used) > 0)) return false;
+      return true;
+    });
+  }, [data, search, roleFilter, limitFilter]);
+  const filtering = !!(search.trim() || roleFilter || limitFilter);
+
   function toggleExemptRole(role: string) {
     if (!config) return;
     const current = config.exempt_roles || [];
@@ -96,10 +149,10 @@ export function SettingsLimitsPage() {
         <div>
           <h1 className="page-title">Limits &amp; Budgets</h1>
           <p className="page-subtitle">
-            Ceilings on what a caller may consume through this gateway: request and tool-call rates, a per-run tool
-            ceiling, a rolling token budget, a daily spend budget, and the timeouts on downstream and provider
-            calls. Counted with Couchbase KV atomic counters, so a window rolls itself and the count survives a
-            restart.
+            Ceilings on what may be consumed through this gateway - request and tool-call rates, a per-run tool
+            ceiling, a rolling token budget and a daily spend budget - set globally for all callers combined, as
+            defaults for each caller, and per role or per agent. Plus the timeouts on downstream and provider calls.
+            Counted with Couchbase KV atomic counters, so a window rolls itself and the count survives a restart.
           </p>
         </div>
         <button className="btn btn-primary" onClick={handleSave} disabled={saving || !config}>
@@ -160,7 +213,58 @@ export function SettingsLimitsPage() {
             the caller's address instead.
           </div>
 
-          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>2. Ceilings</h2>
+          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>2. Global limits and budgets</h2>
+          <div className="panel section-gap" style={{ marginBottom: 24 }}>
+            <div className="field-hint" style={{ marginTop: 0, marginBottom: 14 }}>
+              One ceiling for the whole gateway - every caller, role and agent combined. It holds even when each
+              caller is inside its own limits, and when it is reached every caller is refused until the window rolls.
+              0 disables each one; roles exempt from every limit are not counted.
+            </div>
+            <div className="two-col">
+              <div className="field">
+                <label>Requests per minute, all callers</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={config.global_limits.requests_per_minute}
+                  onChange={(e) => patchGlobal({ requests_per_minute: Number(e.target.value) })}
+                />
+              </div>
+              <div className="field">
+                <label>Tool calls per minute, all callers</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={config.global_limits.tool_calls_per_minute}
+                  onChange={(e) => patchGlobal({ tool_calls_per_minute: Number(e.target.value) })}
+                />
+              </div>
+            </div>
+            <div className="two-col">
+              <div className="field">
+                <label>Tokens per hour, all callers</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={config.global_limits.tokens_per_hour}
+                  onChange={(e) => patchGlobal({ tokens_per_hour: Number(e.target.value) })}
+                />
+              </div>
+              <div className="field">
+                <label>Spend per day, all callers (USD)</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={config.global_limits.spend_per_day_usd}
+                  onChange={(e) => patchGlobal({ spend_per_day_usd: Number(e.target.value) })}
+                />
+                <div className="field-hint">The total LLM budget for the appliance, at the dashboard&rsquo;s price estimates.</div>
+              </div>
+            </div>
+          </div>
+
+          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>3. Default limits for each caller</h2>
           <div className="panel section-gap" style={{ marginBottom: 24 }}>
             <div className="two-col">
               <div className="field">
@@ -252,7 +356,16 @@ export function SettingsLimitsPage() {
             </div>
           </div>
 
-          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>3. Timeouts</h2>
+          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>4. Per-role and per-agent limits and budgets</h2>
+          <LimitOverridesPanel
+            config={config}
+            roles={data.roles}
+            agents={data.agents}
+            busy={saving}
+            onSave={handleSaveOverrides}
+          />
+
+          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>5. Timeouts</h2>
           <div className="panel section-gap" style={{ marginBottom: 24 }}>
             <div className="two-col">
               <div className="field">
@@ -302,40 +415,28 @@ export function SettingsLimitsPage() {
             </div>
           </div>
 
-          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>4. Current usage</h2>
-          {data.usage.length === 0 || data.usage.every((u) => u.limits.length === 0) ? (
-            <div className="card empty-state">
-              No limits are set, so nothing is being counted. Set a ceiling above to start recording usage against
-              it.
-            </div>
-          ) : (
-            <div className="card">
+          <h2 style={{ fontSize: 16, margin: "0 0 14px 0" }}>6. Current usage</h2>
+
+          {(data.global_usage.length > 0 || data.role_usage.length > 0) && (
+            <div className="card" style={{ marginBottom: 16 }}>
               <div className="table-wrap">
                 <table className="data-table">
                   <thead>
                     <tr>
-                      <th>Caller</th>
-                      <th>Role</th>
-                      {["requests", "tool_calls", "tokens", "spend"].map((f) => (
+                      <th>Shared budget</th>
+                      {FAMILIES.map((f) => (
                         <th key={f}>{f.replace("_", " ")}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {data.usage.map((row) => (
-                      <tr key={row.subject}>
-                        <td>
-                          {row.agent ? (
-                            <>
-                              <div style={{ fontWeight: 600 }}>{row.agent}</div>
-                              <div className="cell-mono cell-muted" style={{ fontSize: 11 }}>{row.subject}</div>
-                            </>
-                          ) : (
-                            <span className="cell-mono">{row.subject}</span>
-                          )}
-                        </td>
-                        <td className="cell-muted">{row.role}</td>
-                        {["requests", "tool_calls", "tokens", "spend"].map((family) => {
+                    {[
+                      ...(data.global_usage.length ? [{ key: "global", label: "Global - all callers", limits: data.global_usage }] : []),
+                      ...data.role_usage.map((r) => ({ key: `role-${r.role}`, label: `Role total - ${r.role}`, limits: r.limits })),
+                    ].map((row) => (
+                      <tr key={row.key}>
+                        <td style={{ fontWeight: 600 }}>{row.label}</td>
+                        {FAMILIES.map((family) => {
                           const verdict = row.limits.find((l) => l.family === family);
                           return (
                             <td key={family} style={{ minWidth: 130 }}>
@@ -348,11 +449,120 @@ export function SettingsLimitsPage() {
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+
+          {data.usage.length === 0 ? (
+            <div className="card empty-state">No callers yet - usage appears here once an agent has an API key.</div>
+          ) : (
+            <div className="card">
+              <div className="flex-row" style={{ flexWrap: "wrap", gap: 10, marginBottom: 12, alignItems: "center" }}>
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search callers by agent name, key or role..."
+                  aria-label="Search callers"
+                  style={{ flex: "1 1 260px", minWidth: 220 }}
+                />
+                <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} aria-label="Filter by role">
+                  <option value="">All roles</option>
+                  {data.roles.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={limitFilter}
+                  onChange={(e) => setLimitFilter(e.target.value as typeof limitFilter)}
+                  aria-label="Filter by usage"
+                >
+                  <option value="">All callers</option>
+                  <option value="active">Active in the current window</option>
+                  <option value="over">Over a limit</option>
+                  <option value="custom">With role or agent limits</option>
+                </select>
+                {filtering && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => {
+                      setSearch("");
+                      setRoleFilter("");
+                      setLimitFilter("");
+                    }}
+                  >
+                    Clear
+                  </button>
+                )}
+                <span className="cell-muted" style={{ fontSize: 12 }}>
+                  {filtering ? `${filteredUsage.length} of ${data.usage.length} callers` : `${data.usage.length} callers`}
+                </span>
+              </div>
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Caller</th>
+                      <th>Role</th>
+                      {FAMILIES.map((f) => (
+                        <th key={f}>{f.replace("_", " ")}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredUsage.map((row) => (
+                      <tr key={row.subject}>
+                        <td>
+                          {row.agent ? (
+                            <>
+                              <div style={{ fontWeight: 600 }}>{row.agent}</div>
+                              <div className="cell-mono cell-muted" style={{ fontSize: 11 }}>{row.subject}</div>
+                            </>
+                          ) : (
+                            <span className="cell-mono">{row.subject}</span>
+                          )}
+                        </td>
+                        <td className="cell-muted">
+                          {row.role}
+                          {row.exempt && (
+                            <div>
+                              <span className="badge badge-neutral">exempt</span>
+                            </div>
+                          )}
+                        </td>
+                        {FAMILIES.map((family) => {
+                          const verdict = row.limits.find((l) => l.family === family);
+                          return (
+                            <td key={family} style={{ minWidth: 130 }}>
+                              {verdict ? (
+                                <>
+                                  <UsageBar verdict={verdict} />
+                                  {(verdict.source === "role" || verdict.source === "agent") && (
+                                    <span className="badge badge-info" style={{ marginLeft: 6 }}>
+                                      {verdict.source} limit
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="cell-muted">no limit</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {filteredUsage.length === 0 && <div className="empty-state">No callers match these filters.</div>}
+              </div>
               <div className="field-hint" style={{ marginTop: 10 }}>
                 Usage is per rolling window: {data.window_seconds.requests}s for requests and tool calls,{" "}
                 {data.window_seconds.tokens / 3600}h for tokens, {data.window_seconds.spend / 86400}d for spend.
                 A window that has just rolled reads as zero because its counter has expired, not because usage was
-                reset.
+                reset. Each caller is shown against its own ceiling - the default, or its role&rsquo;s or agent&rsquo;s
+                where one is set.
               </div>
             </div>
           )}

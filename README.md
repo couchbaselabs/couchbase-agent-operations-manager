@@ -601,6 +601,18 @@ over.
   memory, and MCP tool integration - plus download buttons for the SDK
   itself and for AI-assistant integration skills (Claude/ChatGPT/Gemini).
   See [Developer SDK](#developer-sdk) below.
+- **Settings -> Limits & Budgets** - request and tool-call rates, a
+  per-run tool ceiling, an hourly token budget and a daily spend budget,
+  at three scopes that are all checked on every call: **global** (all
+  callers combined), **per caller** (defaults for everyone), and **per
+  role or per agent** (a role or a single agent identity gets its own
+  ceilings; an agent's entry wins over its role's, which wins over the
+  defaults, field by field). A role can also carry a shared total that
+  all of its callers draw from together. Limits start in measure-only
+  mode; with Enforce on, a refused call returns 429 with `Retry-After`
+  and `X-AOM-Limit-Scope` (`caller`, `role` or `global`). Current usage
+  shows the global and role totals and every caller against its own
+  ceiling, searchable by agent name, key or role.
 - **Settings -> Export ROI Metrics** - download what the LLM Cache and
   Context Cache saved as a Couchbase-branded Excel workbook (for sharing),
   or as CSV or JSON (for analysis): window totals (up to the 7-day cache

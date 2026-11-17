@@ -356,6 +356,7 @@ async def agent_request_limits(request: Request, call_next):
     # route reuses this lookup instead of repeating it.
     role: str | None = None
     subject: str | None = None
+    limit_agent_id: str | None = None
     authorization = request.headers.get("authorization")
     if authorization and authorization.lower().startswith("bearer "):
         credential = authorization.split(" ", 1)[1].strip()
@@ -366,6 +367,7 @@ async def agent_request_limits(request: Request, call_next):
                 identity = None
             if identity:
                 role, subject = identity["role"], identity["key_prefix"]
+                limit_agent_id = identity.get("agent_id")
                 # Stashed as a triple so the route's authenticate() reuses
                 # the whole identity, not just the two fields it used to
                 # need - scoping lives on the third element.
@@ -378,7 +380,9 @@ async def agent_request_limits(request: Request, call_next):
     )
 
     try:
-        verdicts = await check_limits(role, limit_subject, ["requests"], trace_id=ctx["trace_id"])
+        verdicts = await check_limits(
+            role, limit_subject, ["requests"], trace_id=ctx["trace_id"], agent_id=limit_agent_id,
+        )
     except Exception as exc:  # noqa: BLE001
         # A limiter that cannot count must not take the gateway down with
         # it - log and let the call through, the same posture record_span
@@ -1636,51 +1640,77 @@ async def check_limits(
     subject: str | None,
     families: list[str],
     trace_id: str | None = None,
+    agent_id: str | None = None,
 ) -> list[dict]:
+    """Count this call and judge it against every scope that applies: the
+    caller's own ceilings (defaults, or its role's / agent's override), its
+    role's shared total, and the global total. See governance.resolve."""
     cfg = governance_config
     verdicts: list[dict] = []
     if not cfg.get("enabled") or governance.is_exempt(cfg, role):
         return verdicts
 
+    resolved = governance.resolve(cfg, role, agent_id)
+    scopes = [("caller", subject or "unknown", resolved["caller"], None)]
+    if role and resolved["role_total"]:
+        scopes.append(("role", governance.role_subject(role), resolved["role_total"], role))
+    scopes.append(("global", governance.GLOBAL_SUBJECT, cfg.get("global_limits") or {}, None))
+
     for family in families:
-        if not governance.limit_for(cfg, family):
-            continue
-        if family == "tool_calls_per_run":
-            if not trace_id:
+        field = governance.FAMILY_FIELDS[family]
+        for scope, scope_subject, limits, scope_name in scopes:
+            limit = limits.get(field) or 0
+            if not limit:
                 continue
-            used = await store.incr_counter(
-                governance.run_counter_key(family, trace_id), 1, expiry_seconds=6 * 3600
-            )
-        elif family in ("tokens", "spend"):
-            raw = await store.read_counter(governance.counter_key(family, subject or "unknown"))
-            used = governance.from_spend_units(raw) if family == "spend" else raw
-        else:
-            used = await store.incr_counter(
-                governance.counter_key(family, subject or "unknown"), 1,
-                expiry_seconds=governance.window_expiry_seconds(family),
-            )
-        verdicts.append(governance.evaluate(cfg, family, used, role))
+            if family == "tool_calls_per_run":
+                if not trace_id:
+                    continue
+                used = await store.incr_counter(
+                    governance.run_counter_key(family, trace_id), 1, expiry_seconds=6 * 3600
+                )
+            elif family in ("tokens", "spend"):
+                raw = await store.read_counter(governance.counter_key(family, scope_subject))
+                used = governance.from_spend_units(raw) if family == "spend" else raw
+            else:
+                used = await store.incr_counter(
+                    governance.counter_key(family, scope_subject), 1,
+                    expiry_seconds=governance.window_expiry_seconds(family),
+                )
+            verdicts.append(governance.evaluate(
+                cfg, family, used, role, limit=limit, scope=scope, scope_name=scope_name,
+                source=resolved["source"][field] if scope == "caller" else scope,
+            ))
 
     return verdicts
 
 
-async def record_usage(role: str | None, subject: str | None, *, tokens: int = 0, cost_usd: float = 0.0):
+async def record_usage(
+    role: str | None, subject: str | None, *, tokens: int = 0, cost_usd: float = 0.0,
+    agent_id: str | None = None,
+):
     """Add what a completed call actually consumed to the rolling budget
-    counters."""
+    counters of every scope that has a budget for it."""
     cfg = governance_config
     if not cfg.get("enabled") or governance.is_exempt(cfg, role):
         return
-    if tokens > 0 and cfg.get("tokens_per_hour"):
-        await store.incr_counter(
-            governance.counter_key("tokens", subject or "unknown"), int(tokens),
-            expiry_seconds=governance.window_expiry_seconds("tokens"),
-        )
+    resolved = governance.resolve(cfg, role, agent_id)
+    scopes = [(subject or "unknown", resolved["caller"])]
+    if role and resolved["role_total"]:
+        scopes.append((governance.role_subject(role), resolved["role_total"]))
+    scopes.append((governance.GLOBAL_SUBJECT, cfg.get("global_limits") or {}))
+
     units = governance.to_spend_units(cost_usd)
-    if units > 0 and cfg.get("spend_per_day_usd"):
-        await store.incr_counter(
-            governance.counter_key("spend", subject or "unknown"), units,
-            expiry_seconds=governance.window_expiry_seconds("spend"),
-        )
+    for scope_subject, limits in scopes:
+        if tokens > 0 and limits.get("tokens_per_hour"):
+            await store.incr_counter(
+                governance.counter_key("tokens", scope_subject), int(tokens),
+                expiry_seconds=governance.window_expiry_seconds("tokens"),
+            )
+        if units > 0 and limits.get("spend_per_day_usd"):
+            await store.incr_counter(
+                governance.counter_key("spend", scope_subject), units,
+                expiry_seconds=governance.window_expiry_seconds("spend"),
+            )
 
 
 def limit_headers(verdict: dict) -> dict:
@@ -1688,6 +1718,9 @@ def limit_headers(verdict: dict) -> dict:
         "X-AOM-Refusal": "limit",
         "X-AOM-Limit": verdict.get("family") or "",
         "X-AOM-Limit-Value": str(verdict.get("limit") or ""),
+        # caller | role | global - whose ceiling this was, so a client can tell
+        # "slow down" from "your team's budget is gone".
+        "X-AOM-Limit-Scope": verdict.get("scope") or "caller",
     }
     if verdict.get("retry_after_seconds"):
         headers["Retry-After"] = str(verdict["retry_after_seconds"])
@@ -2944,7 +2977,8 @@ async def invoke(
     # stays comfortably inside a per-minute rate while making its fortieth
     # tool call of the same task.
     verdicts = await check_limits(
-        role, subject, ["tool_calls", "tool_calls_per_run"], trace_id=ctx["trace_id"]
+        role, subject, ["tool_calls", "tool_calls_per_run"], trace_id=ctx["trace_id"],
+        agent_id=caller_identity(request).get("agent_id"),
     )
     await enforce_or_log(
         verdicts, ctx, action="invoke", role=role, subject=subject, tool_id=req.tool_id, started=start
@@ -3752,7 +3786,8 @@ async def llm_complete(
     # a caller past its ceiling should find that out at a moment that is
     # cheap for everyone.
     limit_verdicts = await check_limits(
-        role, subject, ["tokens", "spend"], trace_id=ctx["trace_id"]
+        role, subject, ["tokens", "spend"], trace_id=ctx["trace_id"],
+        agent_id=caller_identity(request).get("agent_id"),
     )
     await enforce_or_log(
         limit_verdicts, ctx, action="complete", role=role, subject=subject,
@@ -3983,7 +4018,10 @@ async def llm_complete(
     # A cache hit deliberately adds nothing: the whole argument for the cache
     # is that the tokens were never spent, so charging a caller for them
     # would make the budget disagree with the invoice.
-    await record_usage(role, subject, tokens=total_tokens, cost_usd=cost_usd)
+    await record_usage(
+        role, subject, tokens=total_tokens, cost_usd=cost_usd,
+        agent_id=caller_identity(request).get("agent_id"),
+    )
 
     await record_span(
         ctx, kind="llm", name=f"{provider}:{model}", started=start, role=role, subject=subject,
@@ -5731,21 +5769,37 @@ async def get_eval_run(run_id: str):
 # ---------------------------------------------------------------------------
 @app.get("/v1/governance/config")
 async def get_governance_config(request: Request):
-    """The policy, plus what every known caller has actually consumed in the
-    current window. Usage next to the ceiling is the whole point: nobody can
-    set a sensible limit without knowing what normal traffic looks like,
-    which is also why `enforce` defaults off."""
+    """The policy - default per-caller ceilings, global ceilings, and the
+    per-role / per-agent overrides - plus what every scope has actually
+    consumed in the current window. Usage next to the ceiling is the whole
+    point: nobody can set a sensible limit without knowing what normal
+    traffic looks like, which is also why `enforce` defaults off."""
     require_admin(request)
+    windowed = ("requests", "tool_calls", "tokens", "spend")
 
-    async def _usage_entry(subject: str, role: str | None, **extra) -> dict:
-        entry = {"subject": subject, "role": role, "limits": [], **extra}
-        for family in ("requests", "tool_calls", "tokens", "spend"):
-            if not governance.limit_for(governance_config, family):
+    async def _scope_usage(scope: str, subject: str, limits: dict, role: str | None,
+                           scope_name: str | None = None, source: dict | None = None) -> list[dict]:
+        out = []
+        for family in windowed:
+            field = governance.FAMILY_FIELDS[family]
+            limit = limits.get(field) or 0
+            if not limit:
                 continue
             raw = await store.read_counter(governance.counter_key(family, subject))
             used = governance.from_spend_units(raw) if family == "spend" else raw
-            entry["limits"].append(governance.evaluate(governance_config, family, used, role))
-        return entry
+            out.append(governance.evaluate(
+                governance_config, family, used, role, limit=limit, scope=scope, scope_name=scope_name,
+                source=(source or {}).get(field, scope),
+            ))
+        return out
+
+    async def _usage_entry(subject: str, role: str | None, **extra) -> dict:
+        resolved = governance.resolve(governance_config, role, extra.get("agent_id"))
+        return {
+            "subject": subject, "role": role, **extra,
+            "exempt": governance.is_exempt(governance_config, role),
+            "limits": await _scope_usage("caller", subject, resolved["caller"], role, source=resolved["source"]),
+        }
 
     usage = []
     seen: set[str] = set()
@@ -5773,11 +5827,31 @@ async def get_governance_config(request: Request):
         return max([float(l.get("used") or 0) / float(l.get("limit") or 1) for l in entry["limits"]] or [0.0])
     usage.sort(key=_load, reverse=True)
 
+    role_usage = []
+    for role_id in ROLES:
+        shared = governance.resolve(governance_config, role_id, None)["role_total"]
+        if shared:
+            role_usage.append({
+                "role": role_id,
+                "limits": await _scope_usage("role", governance.role_subject(role_id), shared, role_id, role_id),
+            })
+    agents = {}
+    for entry in usage:
+        if entry.get("agent_id"):
+            agents[entry["agent_id"]] = {"agent_id": entry["agent_id"], "name": entry.get("agent"), "role": entry["role"]}
+
     return {
         "config": governance.public_config(governance_config),
         "defaults": governance.DEFAULT_GOVERNANCE_CONFIG,
         "window_seconds": governance.WINDOW_SECONDS,
         "roles": list(ROLES),
+        "agents": sorted(agents.values(), key=lambda a: (a["name"] or "").lower()),
+        "caller_limit_fields": list(governance.CALLER_LIMIT_FIELDS),
+        "shared_limit_fields": list(governance.SHARED_LIMIT_FIELDS),
+        "global_usage": await _scope_usage(
+            "global", governance.GLOBAL_SUBJECT, governance_config.get("global_limits") or {}, None,
+        ),
+        "role_usage": role_usage,
         "usage": usage,
     }
 

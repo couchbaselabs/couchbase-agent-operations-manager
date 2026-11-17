@@ -1087,14 +1087,42 @@ export interface ExperimentResponse {
 
 // --- Limits and budgets -----------------------------------------------------
 
-export interface GovernanceConfig {
-  enabled: boolean;
-  enforce: boolean;
+export interface LimitFields {
   requests_per_minute: number;
   tool_calls_per_minute: number;
   tool_calls_per_run: number;
   tokens_per_hour: number;
   spend_per_day_usd: number;
+}
+
+// The ceilings a shared scope can carry - a role's total, the global total.
+// A run belongs to one caller, so there is no shared per-run ceiling.
+export type SharedLimitFields = Omit<LimitFields, "tool_calls_per_run">;
+
+// Limits for one role or one agent. `limits` are per-caller and hold only
+// the fields the entry sets (0 = no ceiling for that caller);
+// `shared_limits` is a role's shared total.
+export interface LimitOverride {
+  override_id: string;
+  name: string;
+  match: { type: "role" | "agent"; value: string };
+  enabled: boolean;
+  limits: Partial<LimitFields>;
+  shared_limits: Partial<SharedLimitFields>;
+}
+
+export interface GovernanceAgentRef {
+  agent_id: string;
+  name: string | null;
+  role: string;
+}
+
+export interface GovernanceConfig extends LimitFields {
+  enabled: boolean;
+  enforce: boolean;
+  // All callers combined; 0 disables each one.
+  global_limits: SharedLimitFields;
+  overrides: LimitOverride[];
   exempt_roles: string[];
   downstream_timeout_seconds: number;
   llm_timeout_seconds: number;
@@ -1102,6 +1130,11 @@ export interface GovernanceConfig {
 }
 
 export interface LimitVerdict {
+  // Whose counter this is: one caller, a role's shared total, or everyone.
+  scope: "caller" | "role" | "global";
+  scope_name: string | null;
+  // Where a caller's ceiling came from.
+  source: "default" | "role" | "agent" | "global";
   family: string;
   label: string;
   limit: number;
@@ -1118,6 +1151,7 @@ export interface GovernanceUsageRow {
   agent?: string;
   agent_id?: string;
   role: string;
+  exempt: boolean;
   limits: LimitVerdict[];
 }
 
@@ -1126,6 +1160,9 @@ export interface GovernanceConfigResponse {
   defaults: GovernanceConfig;
   window_seconds: Record<string, number>;
   roles: string[];
+  agents: GovernanceAgentRef[];
+  global_usage: LimitVerdict[];
+  role_usage: Array<{ role: string; limits: LimitVerdict[] }>;
   usage: GovernanceUsageRow[];
 }
 
