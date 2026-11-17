@@ -90,6 +90,7 @@ const SETTINGS_SECTION: NavSection = {
     { to: "/settings/log-forwarding", icon: "⇶", text: "Log Forwarding" },
     { to: "/settings/guardrails", icon: "⊘", text: "Guardrails & PII" },
     { to: "/settings/https-cert", icon: "⚿", text: "HTTPS Certificate" },
+    { to: "/settings/roi-export", icon: "⇩", text: "Export ROI Metrics" },
   ],
 };
 

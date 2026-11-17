@@ -23,6 +23,9 @@ pypdf==6.19.0
 # Databricks/Spark, BigQuery and Snowflake, and BigQuery Avro exports.
 pyarrow==26.0.0
 fastavro==1.13.1
+# Branded Excel workbook for Settings -> Export ROI Metrics
+# (app/roi_export.py to_xlsx).
+openpyxl==3.1.5
 # Prometheus exporter for GET /metrics (app/metrics.py) - scraped by
 # Prometheus / Grafana, see MONITORING.md.
 prometheus_client==0.26.0

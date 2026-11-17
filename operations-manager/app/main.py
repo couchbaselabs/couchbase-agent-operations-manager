@@ -57,6 +57,7 @@ from app import (
     memory_consolidation,
     metrics,
     rag_apps,
+    roi_export,
     mcp_client,
     sdk_packaging,
     server_auth,
@@ -89,6 +90,7 @@ from config import (
     AGENT_OIDC_SETTINGS_DOC,
     APPROVALS_SETTINGS_DOC,
     CONTEXT_CACHE_DEFAULTS,
+    CONTEXT_CACHE_LOG_RETENTION_HOURS,
     EVAL_SEED_STARTER_DATASET,
     GOVERNANCE_SETTINGS_DOC,
     GUARDRAILS_SETTINGS_DOC,
@@ -110,6 +112,7 @@ from config import (
     ROLES_SETTINGS_DOC,
     LLM_API_KEYS,
     LLM_CACHE_DEFAULTS,
+    LLM_CACHE_LOG_RETENTION_HOURS,
     SAMPLE_MCP_SERVERS_BASE_URL,
     SEED_API_KEYS,
     SIEM_SETTINGS_DOC,
@@ -160,6 +163,7 @@ OPENAPI_TAGS = [
      "token accounting."},
     {"name": "LLM caching", "description": "Response-cache configuration, providers, dashboard and cache administration."},
     {"name": "Context caching", "description": "The agent-side data-source cache: configuration, entries and purge/sweep."},
+    {"name": "ROI metrics", "description": "Export of LLM Cache and Context Cache savings (JSON, CSV or branded Excel)."},
     {"name": "Agent memory", "description": "Durable per-user memory: entries, search, consolidation and forgetting."},
     {"name": "Agent identities", "description": "Agent keys (issue, rotate, revoke) and OIDC federation settings."},
     {"name": "Approvals", "description": "Human-in-the-loop holds on high-risk tools and the policy behind them."},
@@ -627,6 +631,9 @@ llm_config_version: str = llm_cache.config_fingerprint(llm_config)
 # llm_cache.resolve_policy. Kept in their own settings doc so saving the
 # global form never clobbers them and vice versa.
 LLM_POLICIES_DOC = "settings::llm_cache_policies"
+# Providers an admin added at runtime - see "Custom providers" in
+# app/llm_cache.py. One settings doc, API keys encrypted inside it.
+CUSTOM_LLM_PROVIDERS_DOC = "settings::custom_llm_providers"
 llm_policies: list[dict] = []
 llm_catalog_version: str = ""
 last_llm_sweep_at: str | None = None
@@ -866,6 +873,9 @@ async def couchbase_startup():
     spawn(_startup_catalog_ingest())
     spawn(hijack_monitor_loop())
 
+    # Before the cache policy: normalize_config resets a provider it does
+    # not know, so a policy that selects a custom provider needs it registered.
+    await _startup_step("load custom LLM providers", load_custom_llm_providers())
     await _startup_step("load LLM cache config", load_llm_config())
     await _startup_step("load LLM cache policies", load_llm_policies())
     await _startup_step("refresh catalog version", refresh_catalog_version())
@@ -1367,7 +1377,7 @@ async def governed_completion(prompt: str, *, purpose: str) -> tuple[str, bool]:
     latency_ms = int((time.time() - started) * 1000)
     prompt_tokens = int(result["prompt_tokens"])
     completion_tokens = int(result["completion_tokens"])
-    cost_usd = llm_cache.estimate_cost_usd(cfg["model"], prompt_tokens, completion_tokens)
+    cost_usd = llm_cache.estimate_cost_usd(cfg["model"], prompt_tokens, completion_tokens, cfg["provider"])
 
     await _store_cache_entry(
         eid, cfg, cfg["provider"], cfg["model"], scope, prompt, result,
@@ -1769,6 +1779,54 @@ async def save_llm_config(cfg: dict):
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
+
+
+async def load_custom_llm_providers():
+    """Register the providers added from Providers & Policy. Their API keys
+    are stored encrypted (same Fernet-at-rest scheme as the LDAP bind
+    password) and decrypted only into llm_cache.CUSTOM_SECRETS."""
+    stored = await store.get_setting(CUSTOM_LLM_PROVIDERS_DOC)
+    docs, secrets = {}, {}
+    for provider_id, doc in ((stored or {}).get("providers") or {}).items():
+        doc = dict(doc)
+        enc = doc.pop("api_key_enc", None)
+        if enc:
+            try:
+                secrets[provider_id] = user_auth.decrypt_secret(enc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not decrypt the API key for LLM provider '%s': %s", provider_id, exc)
+        docs[provider_id] = doc
+    llm_cache.set_custom(docs, secrets)
+    if docs:
+        logger.info("Custom LLM providers loaded (%d)", len(docs))
+
+
+async def save_custom_llm_providers():
+    out = {}
+    for provider_id, doc in llm_cache.CUSTOM.items():
+        doc = dict(doc)
+        if provider_id in llm_cache.CUSTOM_SECRETS:
+            doc["api_key_enc"] = user_auth.encrypt_secret(llm_cache.CUSTOM_SECRETS[provider_id])
+        out[provider_id] = doc
+    await store.upsert_setting(
+        CUSTOM_LLM_PROVIDERS_DOC,
+        {"doc_type": "settings", "setting_id": "custom_llm_providers", "providers": out,
+         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+    )
+
+
+def custom_llm_provider_users(provider_id: str) -> list[str]:
+    """Everything that routes to this provider - what blocks deleting it."""
+    users = []
+    if llm_config.get("provider") == provider_id:
+        users.append("the default cache policy")
+    if llm_config.get("fallback_provider") == provider_id:
+        users.append("the default policy's fallback")
+    users += [f"policy override '{p['name']}'" for p in llm_policies
+              if (p.get("config") or {}).get("provider") == provider_id]
+    users += [f"RAG application '{a.get('name') or a['app_id']}'" for a in rag_apps_registry.values()
+              if a.get("provider") == provider_id]
+    return users
 
 
 async def load_llm_policies():
@@ -3410,7 +3468,7 @@ async def topology(window_hours: int = 24):
             "provider": key,
             "label": spec.get("label", key),
             "vendor": spec.get("vendor", key),
-            "configured": bool((LLM_API_KEYS.get(key) or "").strip()),
+            "configured": llm_cache.is_configured(key, LLM_API_KEYS),
             "caching_enabled": bool(llm_config.get("enabled")),
             "is_default": key == llm_config.get("provider"),
             "calls": provider_calls.get(key, 0),
@@ -3466,9 +3524,9 @@ class LLMPoliciesRequest(BaseModel):
 
 @app.get("/v1/llm/providers")
 async def llm_providers():
-    """The selectable LLMs - Claude, ChatGPT and Gemini - with their models
-    and list-price estimates, plus whether each one has an API key
-    configured. Keys themselves are never returned."""
+    """The selectable LLMs - the built-in providers plus any custom ones an
+    admin has added - with their models and price estimates, plus whether
+    each one is configured. Keys themselves are never returned."""
     return {"providers": llm_cache.provider_catalog(LLM_API_KEYS)}
 
 
@@ -3543,6 +3601,132 @@ async def put_llm_policies(req: LLMPoliciesRequest, request: Request):
             if old_pm != new_pm and any(old_pm):
                 invalidated += await store.purge_cache_by_policy(pid)
     return {"policies": policies, "entries_invalidated": invalidated}
+
+
+# -- Custom LLM providers ------------------------------------------------------
+class CustomLLMProviderRequest(BaseModel):
+    # Which entry of the "Add provider" dropdown the form started from
+    # (azure_openai, snowflake_cortex, databricks, google_deepmind, cohere,
+    # mistral, self_hosted) or None for a blank custom provider.
+    preset: str | None = None
+    label: str
+    vendor: str = ""
+    base_url: str
+    models: list[dict] = Field(default_factory=list)
+    default_model: str = ""
+    max_tokens_param: str = ""
+    auth_header: str = ""
+    # None = keep the stored key (edits); "" = remove it.
+    api_key: str | None = None
+
+
+class TestCustomLLMProviderRequest(BaseModel):
+    provider_id: str | None = None
+    provider: CustomLLMProviderRequest | None = None
+
+
+def _custom_llm_provider_doc(req: CustomLLMProviderRequest, *, existing: dict | None, user: dict) -> dict:
+    try:
+        return llm_cache.custom_provider(req.model_dump(), existing=existing, created_by=user.get("username"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/llm/custom-providers")
+async def list_custom_llm_providers(request: Request):
+    """The providers added from Providers & Policy (never their API keys),
+    plus the presets the "Add provider" form offers."""
+    require_admin(request)
+    return {
+        "providers": [
+            dict(llm_cache.public_custom(doc), in_use_by=custom_llm_provider_users(pid))
+            for pid, doc in llm_cache.CUSTOM.items()
+        ],
+        "presets": llm_cache.public_presets(),
+        "max_providers": llm_cache.MAX_CUSTOM_PROVIDERS,
+    }
+
+
+@app.post("/v1/llm/custom-providers")
+async def create_custom_llm_provider(req: CustomLLMProviderRequest, request: Request):
+    """Add an OpenAI-compatible LLM endpoint as a selectable provider. It
+    becomes available to the default policy, per-role / per-agent overrides
+    and RAG applications as soon as this returns."""
+    user = require_admin(request)
+    if len(llm_cache.CUSTOM) >= llm_cache.MAX_CUSTOM_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"At most {llm_cache.MAX_CUSTOM_PROVIDERS} custom providers")
+    doc = _custom_llm_provider_doc(req, existing=None, user=user)
+    if doc["id"] in llm_cache.PROVIDERS:
+        raise HTTPException(status_code=409, detail=f"A provider named '{doc['label']}' already exists - give this one a different name")
+    preset = llm_cache.CUSTOM_PRESET_BY_ID.get(doc.get("preset") or "")
+    if preset and preset.get("api_key_required") and not (req.api_key or "").strip():
+        raise HTTPException(status_code=400, detail=f"{preset['label']} needs an API key ({preset['api_key_label']})")
+    llm_cache.register_custom(doc, req.api_key or "")
+    await save_custom_llm_providers()
+    logger.info("Custom LLM provider '%s' added by %s (%s)", doc["id"], user.get("username"), doc["base_url"])
+    return {"provider": llm_cache.public_custom(doc)}
+
+
+@app.put("/v1/llm/custom-providers/{provider_id}")
+async def update_custom_llm_provider(provider_id: str, req: CustomLLMProviderRequest, request: Request):
+    """Edit a custom provider in place. Its ID never changes, so cache
+    entries, policies and savings history stay attached. A policy that
+    pointed at a model this edit removes falls back to the provider's
+    default model."""
+    user = require_admin(request)
+    existing = llm_cache.CUSTOM.get(provider_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Custom provider not found")
+    doc = _custom_llm_provider_doc(req, existing=existing, user=user)
+    llm_cache.register_custom(doc, req.api_key)
+    await save_custom_llm_providers()
+    # Re-validate anything that named a model the provider no longer lists.
+    if llm_config.get("provider") == provider_id and llm_config["model"] not in llm_cache.PROVIDERS[provider_id]["models"]:
+        await save_llm_config(llm_config)
+    if any((p.get("config") or {}).get("provider") == provider_id for p in llm_policies):
+        await save_llm_policies(llm_policies)
+    return {"provider": llm_cache.public_custom(doc)}
+
+
+@app.delete("/v1/llm/custom-providers/{provider_id}")
+async def delete_custom_llm_provider(provider_id: str, request: Request):
+    """Remove a custom provider and its stored key. Refused while a policy
+    or RAG application still routes to it. Its cached answers are purged;
+    its rows in the savings history stay."""
+    user = require_admin(request)
+    if provider_id not in llm_cache.CUSTOM:
+        raise HTTPException(status_code=404, detail="Custom provider not found")
+    users = custom_llm_provider_users(provider_id)
+    if users:
+        raise HTTPException(status_code=409, detail=f"Still in use by {', '.join(users)} - point those elsewhere first")
+    purged = await store.purge_cache(provider=provider_id)
+    llm_cache.unregister_custom(provider_id)
+    await save_custom_llm_providers()
+    logger.info("Custom LLM provider '%s' removed by %s", provider_id, user.get("username"))
+    return {"deleted": True, "provider_id": provider_id, "entries_purged": purged}
+
+
+@app.post("/v1/llm/custom-providers/test")
+async def test_custom_llm_provider(req: TestCustomLLMProviderRequest, request: Request):
+    """Send one small prompt to a custom provider's default model and report
+    what came back. Works on the unsaved form (`provider`), a saved provider
+    (`provider_id`), or both - an edit form that leaves the key blank is
+    tested with the stored key. Stores nothing and caches nothing."""
+    user = require_admin(request)
+    existing = llm_cache.CUSTOM.get(req.provider_id or "")
+    if req.provider_id and not existing:
+        raise HTTPException(status_code=404, detail="Custom provider not found")
+    if req.provider:
+        doc = _custom_llm_provider_doc(req.provider, existing=existing, user=user)
+        api_key = req.provider.api_key
+        if api_key is None:
+            api_key = llm_cache.CUSTOM_SECRETS.get(req.provider_id or "", "")
+    elif existing:
+        doc, api_key = existing, llm_cache.CUSTOM_SECRETS.get(existing["id"], "")
+    else:
+        raise HTTPException(status_code=400, detail="Give a provider_id or a provider to test")
+    timeout = min(int(governance_config.get("llm_timeout_seconds") or 60), 30)
+    return await asyncio.to_thread(llm_cache.test_custom, doc, api_key or "", timeout)
 
 
 @app.post("/v1/llm/complete")
@@ -3755,7 +3939,7 @@ async def llm_complete(
     prompt_tokens = int(result["prompt_tokens"])
     completion_tokens = int(result["completion_tokens"])
     total_tokens = prompt_tokens + completion_tokens
-    cost_usd = llm_cache.estimate_cost_usd(model, prompt_tokens, completion_tokens)
+    cost_usd = llm_cache.estimate_cost_usd(model, prompt_tokens, completion_tokens, provider)
 
     # The prompt can be clean and the answer not - a lookup by customer ID
     # returns the customer. Checked after the call for the same reason
@@ -4048,7 +4232,7 @@ async def llm_dashboard():
         "provider": llm_config["provider"],
         "provider_label": provider_spec["label"],
         "model": llm_config["model"],
-        "api_key_configured": bool((LLM_API_KEYS.get(llm_config["provider"]) or "").strip()),
+        "api_key_configured": llm_cache.is_configured(llm_config["provider"], LLM_API_KEYS),
         # Overrides routing some roles/agents to other providers or models -
         # the reason the breakdown below can carry more than one row.
         "policies_active": sum(1 for p in llm_policies if p.get("enabled", True)),
@@ -4392,6 +4576,73 @@ async def context_dashboard():
         "agent_breakdown": dashboard_data["agent_breakdown"],
         "recent_events": recent_events,
     }
+
+
+# ---------------------------------------------------------------------------
+# ROI metrics export (see app/roi_export.py)
+# ---------------------------------------------------------------------------
+@app.get("/v1/roi/export")
+async def export_roi_metrics(
+    request: Request,
+    window_days: int = 7,
+    format: str = "json",
+    context_cost_per_fetch_usd: float | None = None,
+    platform_cost_usd: float | None = None,
+):
+    """LLM Cache and Context Cache savings as one report: window totals,
+    all-time totals, a per-model and per-agent breakdown, a daily series,
+    and a twelve-month estimate that extends the window's daily run rate
+    month by month (savings, platform cost, net and ROI).
+
+    `window_days` is capped at how long the cache event logs are kept (7 days
+    unless LLM_CACHE_LOG_RETENTION_HOURS / CONTEXT_CACHE_LOG_RETENTION_HOURS
+    say otherwise); the all-time totals are not windowed. `format=csv`
+    returns the same figures as one flat table for analysis; `format=xlsx`
+    returns them as a Couchbase-branded Excel workbook for sharing.
+
+    Context fetches carry no price, so they are reported in dollars only
+    when `context_cost_per_fetch_usd` is given. `platform_cost_usd` (what
+    running this appliance cost over the window) adds net savings and ROI."""
+    user = require_admin(request)
+    if format not in ("json", "csv", "xlsx"):
+        raise HTTPException(status_code=400, detail="format must be json, csv or xlsx")
+    for name, value in (("context_cost_per_fetch_usd", context_cost_per_fetch_usd),
+                        ("platform_cost_usd", platform_cost_usd)):
+        if value is not None and not (0 <= value <= 1_000_000_000):
+            raise HTTPException(status_code=400, detail=f"{name} must be zero or a positive amount")
+    retention_days = max(1, min(LLM_CACHE_LOG_RETENTION_HOURS, CONTEXT_CACHE_LOG_RETENTION_HOURS) // 24)
+    window_days = max(1, min(int(window_days), retention_days))
+
+    now = time.time()
+    until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - window_days * 86400))
+    llm_rows, context_rows, llm_lifetime, context_lifetime = await asyncio.gather(
+        store.llm_dashboard_aggregate_since(since),
+        store.context_dashboard_aggregate_since(since),
+        store.get_lifetime_stats(),
+        store.get_context_lifetime_stats(),
+    )
+    report = roi_export.build_report(
+        llm_rows=llm_rows, context_rows=context_rows,
+        llm_lifetime=llm_lifetime, context_lifetime=context_lifetime,
+        window_days=window_days, since=since, until=until, retention_days=retention_days,
+        provider_labels={pid: spec["label"] for pid, spec in llm_cache.PROVIDERS.items()},
+        context_cost_per_fetch_usd=context_cost_per_fetch_usd,
+        platform_cost_usd=platform_cost_usd,
+    )
+    if format == "json":
+        return report
+    logger.info("ROI metrics exported by %s (%d-day window, %s)", user.get("username"), window_days, format)
+    filename = f"aom-roi-metrics-{until[:10]}-{window_days}d.{format}"
+    if format == "xlsx":
+        content, media_type = await asyncio.to_thread(roi_export.to_xlsx, report), roi_export.XLSX_MEDIA_TYPE
+    else:
+        content, media_type = roi_export.to_csv(report), "text/csv; charset=utf-8"
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -7887,6 +8138,7 @@ _OPENAPI_PREFIX_TAGS = (
     ("/v1/rag", "RAG applications"),
     ("/v1/llm", "LLM caching"),
     ("/v1/context", "Context caching"),
+    ("/v1/roi", "ROI metrics"),
     ("/v1/agent-memory", "Agent memory"),
     ("/v1/agents", "Agent identities"),
     ("/v1/approvals", "Approvals"),

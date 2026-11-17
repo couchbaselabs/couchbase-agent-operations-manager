@@ -29,6 +29,7 @@ import { SettingsGuardrailsPage } from "./pages/SettingsGuardrailsPage";
 import { SettingsAgentsPage } from "./pages/SettingsAgentsPage";
 import { SettingsLogForwardingPage } from "./pages/SettingsLogForwardingPage";
 import { SettingsMonitoringPage } from "./pages/SettingsMonitoringPage";
+import { SettingsRoiExportPage } from "./pages/SettingsRoiExportPage";
 import { LoginPage } from "./pages/LoginPage";
 import { RequirePasswordChangePage } from "./pages/RequirePasswordChangePage";
 import { useAuth } from "./auth/AuthContext";
@@ -141,6 +142,14 @@ export default function App() {
             element={
               <AdminRoute>
                 <SettingsMonitoringPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/settings/roi-export"
+            element={
+              <AdminRoute>
+                <SettingsRoiExportPage />
               </AdminRoute>
             }
           />

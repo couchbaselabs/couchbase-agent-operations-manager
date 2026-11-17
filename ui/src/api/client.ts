@@ -54,6 +54,12 @@ import type {
   LLMConfigResponse,
   LLMDashboardResponse,
   LLMProvider,
+  CustomLLMPreset,
+  CustomLLMProvider,
+  CustomLLMProviderPayload,
+  CustomLLMTestResult,
+  RoiExportOptions,
+  RoiReport,
   ContextCacheConfig,
   ContextCacheEntry,
   ContextConfigResponse,
@@ -112,6 +118,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+function roiQuery(format: "json" | "csv" | "xlsx", o: RoiExportOptions): string {
+  const q = new URLSearchParams({ format, window_days: String(o.window_days) });
+  if (o.context_cost_per_fetch_usd) q.set("context_cost_per_fetch_usd", String(o.context_cost_per_fetch_usd));
+  if (o.platform_cost_usd) q.set("platform_cost_usd", String(o.platform_cost_usd));
+  return `/v1/roi/export?${q.toString()}`;
 }
 
 export const api = {
@@ -330,6 +343,26 @@ export const api = {
       body: JSON.stringify({ tool_id: toolId, arguments: args }),
     }),
 
+  // -- ROI metrics export -------------------------------------------------
+  roiReport: (options: RoiExportOptions) => request<RoiReport>(roiQuery("json", options)),
+  // The CSV and the branded Excel workbook are files, not JSON, so they
+  // bypass request<T>() - but keep its error and 401 handling.
+  roiFile: async (format: "csv" | "xlsx", options: RoiExportOptions): Promise<{ filename: string; blob: Blob }> => {
+    const res = await fetch(roiQuery(format, options));
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail || detail;
+      } catch {
+        // ignore
+      }
+      if (res.status === 401) onUnauthorized?.();
+      throw new ApiError(res.status, detail);
+    }
+    const match = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
+    return { filename: match ? match[1] : `aom-roi-metrics.${format}`, blob: await res.blob() };
+  },
+
   // -- LLM response caching --------------------------------------------
   llmProviders: () => request<{ providers: LLMProvider[] }>("/v1/llm/providers"),
   llmConfig: () => request<LLMConfigResponse>("/v1/llm/config"),
@@ -344,6 +377,27 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ policies }),
     }),
+  customLlmProviders: () =>
+    request<{ providers: CustomLLMProvider[]; presets: CustomLLMPreset[]; max_providers: number }>(
+      "/v1/llm/custom-providers",
+    ),
+  createCustomLlmProvider: (payload: CustomLLMProviderPayload) =>
+    request<{ provider: CustomLLMProvider }>("/v1/llm/custom-providers", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateCustomLlmProvider: (providerId: string, payload: CustomLLMProviderPayload) =>
+    request<{ provider: CustomLLMProvider }>(`/v1/llm/custom-providers/${encodeURIComponent(providerId)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  deleteCustomLlmProvider: (providerId: string) =>
+    request<{ deleted: boolean; entries_purged: number }>(
+      `/v1/llm/custom-providers/${encodeURIComponent(providerId)}`,
+      { method: "DELETE" },
+    ),
+  testCustomLlmProvider: (body: { provider_id?: string; provider?: CustomLLMProviderPayload }) =>
+    request<CustomLLMTestResult>("/v1/llm/custom-providers/test", { method: "POST", body: JSON.stringify(body) }),
   llmDashboard: () => request<LLMDashboardResponse>("/v1/llm/dashboard"),
   llmCacheEntries: (limit = 100) =>
     request<{ entries: LLMCacheEntry[]; count: number; total_entries: number }>(`/v1/llm/cache?limit=${limit}`),

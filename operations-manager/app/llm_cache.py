@@ -14,6 +14,10 @@ Three things live in this module:
   2. The cache key + invalidation policy engine. Everything a user can
      configure on the LLM Caching setup page is evaluated here, so the
      policy has exactly one implementation.
+     Admins can add further providers at runtime - any endpoint speaking
+     OpenAI's chat-completions API, with presets for Azure OpenAI,
+     Snowflake Cortex, Databricks, Google DeepMind, Cohere, Mistral AI and
+     self-hosted servers. See "Custom providers" below.
   3. Thin provider adapters over `requests`. If no API key is configured
      for the selected provider, the adapter returns a clearly-labelled
      deterministic stub instead of failing, so the whole feature (including
@@ -136,6 +140,321 @@ PRICING: dict[str, tuple[float, float]] = {
     "global.anthropic.claude-haiku-4-5-20251001-v1:0": (1.00, 5.00),
     "us.meta.llama3-3-70b-instruct-v1:0": (0.72, 0.72),
 }
+
+# ---------------------------------------------------------------------------
+# Custom providers
+# ---------------------------------------------------------------------------
+# Providers an admin adds from LLM Caching -> Providers & Policy. Every one
+# is an endpoint that speaks OpenAI's chat-completions API, which covers the
+# hosted platforms in CUSTOM_PRESETS as well as anything self-hosted (Ollama,
+# vLLM, TGI, LiteLLM, an internal gateway).
+#
+# A custom provider is registered into PROVIDERS under a "custom-<slug>" ID,
+# so the policy engine, per-role overrides, RAG applications, the dashboard
+# and the topology view treat it exactly like a built-in one. What differs:
+#   - its API key is entered in the dashboard and stored encrypted by
+#     app/main.py (settings::custom_llm_providers); the plaintext lives only
+#     in CUSTOM_SECRETS here, never in the environment and never in an API
+#     response;
+#   - its model list and per-model prices are whatever the admin entered
+#     (CUSTOM_PRICING), keyed by provider as well as model so a self-hosted
+#     "gpt-4o" alias does not inherit OpenAI's list price;
+#   - it never answers from the offline stub. An endpoint was configured, so
+#     a failure is a failure (same rule as a built-in provider with a key).
+CUSTOM_ID_PREFIX = "custom-"
+MAX_CUSTOM_PROVIDERS = 25
+MAX_CUSTOM_MODELS = 50
+MAX_TOKENS_PARAMS = ("max_tokens", "max_completion_tokens")
+# How the API key is sent: "Authorization: Bearer <key>" (almost everyone)
+# or Azure's "api-key: <key>" header.
+AUTH_HEADERS = ("bearer", "api-key")
+_CUSTOM_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,199}")
+
+# Starting points for the "Add provider" form. `base_url` is the root the
+# adapter appends /chat/completions to; a <placeholder> in it must be
+# replaced before the provider can be saved. Model IDs and prices are
+# suggestions - list-price estimates in USD per 1M tokens, editable like
+# PRICING - because every one of these platforms changes its line-up more
+# often than this file is released.
+CUSTOM_PRESETS: list[dict] = [
+    {
+        "id": "azure_openai",
+        "label": "Azure OpenAI",
+        "vendor": "Microsoft Azure",
+        "base_url": "https://<resource-name>.openai.azure.com/openai/v1",
+        "docs_url": "https://learn.microsoft.com/azure/ai-foundry/openai/api-version-lifecycle",
+        "api_key_label": "Azure OpenAI API key",
+        "api_key_required": True,
+        "auth_header": "api-key",
+        "max_tokens_param": "max_completion_tokens",
+        "notes": "Replace <resource-name> with your Azure OpenAI (or Foundry) resource. This is the v1 API, so "
+                 "no api-version is needed. A model here is your deployment name, not the underlying model "
+                 "name - replace the suggestions below with the deployments in your resource.",
+        "models": [
+            {"id": "gpt-5", "input_usd_per_1m": 1.25, "output_usd_per_1m": 10.00},
+            {"id": "gpt-5-mini", "input_usd_per_1m": 0.25, "output_usd_per_1m": 2.00},
+            {"id": "gpt-4o", "input_usd_per_1m": 2.50, "output_usd_per_1m": 10.00},
+        ],
+    },
+    {
+        "id": "snowflake_cortex",
+        "label": "Snowflake Cortex",
+        "vendor": "Snowflake",
+        "base_url": "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1",
+        "docs_url": "https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api",
+        "api_key_label": "Programmatic access token (PAT)",
+        "api_key_required": True,
+        "max_tokens_param": "max_completion_tokens",
+        "notes": "Replace <account-identifier> with your Snowflake account. The token's role needs the "
+                 "SNOWFLAKE.CORTEX_USER database role, and each model must be available in the account's region. "
+                 "Cortex bills in credits - set the prices to your contracted rate.",
+        "models": [
+            {"id": "claude-sonnet-4-5", "input_usd_per_1m": 3.00, "output_usd_per_1m": 15.00},
+            {"id": "openai-gpt-5", "input_usd_per_1m": 1.25, "output_usd_per_1m": 10.00},
+            {"id": "llama3.3-70b", "input_usd_per_1m": 0.72, "output_usd_per_1m": 0.72},
+            {"id": "mistral-large2", "input_usd_per_1m": 2.00, "output_usd_per_1m": 6.00},
+        ],
+    },
+    {
+        "id": "databricks",
+        "label": "Databricks-hosted LLMs",
+        "vendor": "Databricks",
+        "base_url": "https://<workspace-host>/serving-endpoints",
+        "docs_url": "https://docs.databricks.com/aws/en/machine-learning/model-serving/score-foundation-models",
+        "api_key_label": "Personal access token or service-principal token",
+        "api_key_required": True,
+        "max_tokens_param": "max_tokens",
+        "notes": "Replace <workspace-host> with your workspace URL. A model here is a serving endpoint name: "
+                 "a pay-per-token Foundation Model API endpoint, a provisioned-throughput endpoint or an "
+                 "external model. Databricks bills in DBUs - set the prices to your rate.",
+        "models": [
+            {"id": "databricks-claude-sonnet-4-5", "input_usd_per_1m": 3.00, "output_usd_per_1m": 15.00},
+            {"id": "databricks-meta-llama-3-3-70b-instruct", "input_usd_per_1m": 0.50, "output_usd_per_1m": 1.50},
+            {"id": "databricks-gpt-oss-120b", "input_usd_per_1m": 0.15, "output_usd_per_1m": 0.60},
+            {"id": "databricks-gemini-2-5-pro", "input_usd_per_1m": 1.25, "output_usd_per_1m": 10.00},
+        ],
+    },
+    {
+        "id": "google_deepmind",
+        "label": "Google DeepMind",
+        "vendor": "Google DeepMind",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "docs_url": "https://ai.google.dev/gemini-api/docs/openai",
+        "api_key_label": "Gemini API key (Google AI Studio)",
+        "api_key_required": True,
+        "max_tokens_param": "max_tokens",
+        "notes": "Google DeepMind's Gemini and Gemma models through the Gemini API's OpenAI-compatible "
+                 "endpoint. Separate from the built-in Gemini provider, which uses GEMINI_API_KEY from the "
+                 "environment and the native generateContent API.",
+        "models": [
+            {"id": "gemini-2.5-pro", "input_usd_per_1m": 1.25, "output_usd_per_1m": 10.00},
+            {"id": "gemini-2.5-flash", "input_usd_per_1m": 0.30, "output_usd_per_1m": 2.50},
+            {"id": "gemma-3-27b-it", "input_usd_per_1m": 0.00, "output_usd_per_1m": 0.00},
+        ],
+    },
+    {
+        "id": "cohere",
+        "label": "Cohere",
+        "vendor": "Cohere",
+        "base_url": "https://api.cohere.ai/compatibility/v1",
+        "docs_url": "https://docs.cohere.com/docs/compatibility-api",
+        "api_key_label": "Cohere API key",
+        "api_key_required": True,
+        "max_tokens_param": "max_tokens",
+        "notes": "Cohere's Command models through its Compatibility API.",
+        "models": [
+            {"id": "command-a-03-2025", "input_usd_per_1m": 2.50, "output_usd_per_1m": 10.00},
+            {"id": "command-r-plus-08-2024", "input_usd_per_1m": 2.50, "output_usd_per_1m": 10.00},
+            {"id": "command-r7b-12-2024", "input_usd_per_1m": 0.0375, "output_usd_per_1m": 0.15},
+        ],
+    },
+    {
+        "id": "mistral",
+        "label": "Mistral AI",
+        "vendor": "Mistral AI",
+        "base_url": "https://api.mistral.ai/v1",
+        "docs_url": "https://docs.mistral.ai/api/",
+        "api_key_label": "Mistral API key",
+        "api_key_required": True,
+        "max_tokens_param": "max_tokens",
+        "notes": "Mistral's hosted models (La Plateforme). The -latest aliases follow Mistral's current "
+                 "release of each tier, so check the prices against the model they point to today.",
+        "models": [
+            {"id": "mistral-large-latest", "input_usd_per_1m": 2.00, "output_usd_per_1m": 6.00},
+            {"id": "mistral-medium-latest", "input_usd_per_1m": 0.40, "output_usd_per_1m": 2.00},
+            {"id": "mistral-small-latest", "input_usd_per_1m": 0.10, "output_usd_per_1m": 0.30},
+        ],
+    },
+    {
+        "id": "self_hosted",
+        "label": "Self-hosted LLM",
+        "vendor": "Self-hosted",
+        "base_url": "http://<host>:<port>/v1",
+        "docs_url": "",
+        "api_key_label": "API key (leave blank if the server needs none)",
+        "api_key_required": False,
+        "max_tokens_param": "max_tokens",
+        "notes": "Any server that speaks OpenAI's /chat/completions API: Ollama (http://host:11434/v1), "
+                 "vLLM, Text Generation Inference, LM Studio, llama.cpp, LiteLLM. The URL must be reachable "
+                 "from the operations-manager container. Prices default to 0 - enter an amortized cost per "
+                 "1M tokens if you want cache hits to show as dollars saved.",
+        "models": [],
+    },
+]
+CUSTOM_PRESET_BY_ID = {p["id"]: p for p in CUSTOM_PRESETS}
+
+# id -> stored document (see custom_provider), id -> plaintext API key,
+# (id, model) -> (input, output) USD per 1M tokens.
+CUSTOM: dict[str, dict] = {}
+CUSTOM_SECRETS: dict[str, str] = {}
+CUSTOM_PRICING: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+def _price(value) -> float:
+    try:
+        return round(max(0.0, min(float(value or 0.0), 100_000.0)), 6)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def custom_provider(raw: dict | None, *, existing: dict | None = None, created_by: str | None = None) -> dict:
+    """Validate one submitted custom provider into its stored shape.
+    Raises ValueError with a message meant for the form. `existing` is the
+    stored document being edited - its ID and creation stamp are kept, so
+    renaming a provider does not orphan the cache entries, policies and
+    savings history keyed by that ID."""
+    raw = raw or {}
+    preset = CUSTOM_PRESET_BY_ID.get(str(raw.get("preset") or (existing or {}).get("preset") or ""))
+
+    label = str(raw.get("label") or "").strip()[:60]
+    if not label:
+        raise ValueError("Give the provider a name")
+    vendor = str(raw.get("vendor") or (preset or {}).get("vendor") or "Custom").strip()[:60] or "Custom"
+
+    base_url = str(raw.get("base_url") or "").strip().rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")]
+    if "<" in base_url or ">" in base_url:
+        raise ValueError("Replace the <placeholder> in the base URL with your own account or host")
+    if not re.fullmatch(r"https?://[^\s/?#]+[^\s?#]*", base_url) or len(base_url) > 500:
+        raise ValueError("Base URL must be an http(s) URL, e.g. https://llm.internal:8000/v1")
+
+    models, seen = [], set()
+    for m in raw.get("models") or []:
+        if isinstance(m, str):
+            m = {"id": m}
+        model_id = str((m or {}).get("id") or "").strip()
+        if not model_id:
+            continue
+        if not _CUSTOM_MODEL_ID.fullmatch(model_id):
+            raise ValueError(f"'{model_id[:60]}' is not a usable model ID (letters, digits and _ . : / @ + - only)")
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append({
+            "id": model_id,
+            "input_usd_per_1m": _price(m.get("input_usd_per_1m")),
+            "output_usd_per_1m": _price(m.get("output_usd_per_1m")),
+        })
+    if not models:
+        raise ValueError("Add at least one model - the name the endpoint expects in its 'model' field")
+    if len(models) > MAX_CUSTOM_MODELS:
+        raise ValueError(f"A provider can list at most {MAX_CUSTOM_MODELS} models")
+
+    default_model = str(raw.get("default_model") or "").strip()
+    if default_model not in seen:
+        default_model = models[0]["id"]
+
+    max_tokens_param = raw.get("max_tokens_param") or (preset or {}).get("max_tokens_param") or "max_tokens"
+    if max_tokens_param not in MAX_TOKENS_PARAMS:
+        max_tokens_param = "max_tokens"
+    auth_header = raw.get("auth_header") or (existing or {}).get("auth_header") \
+        or (preset or {}).get("auth_header") or "bearer"
+    if auth_header not in AUTH_HEADERS:
+        auth_header = "bearer"
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if existing:
+        provider_id = existing["id"]
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40] or "provider"
+        provider_id = CUSTOM_ID_PREFIX + slug
+    return {
+        "id": provider_id,
+        "label": label,
+        "vendor": vendor,
+        "preset": preset["id"] if preset else None,
+        "base_url": base_url,
+        "docs_url": (preset or {}).get("docs_url", ""),
+        "models": models,
+        "default_model": default_model,
+        "max_tokens_param": max_tokens_param,
+        "auth_header": auth_header,
+        "custom": True,
+        "created_by": (existing or {}).get("created_by") or created_by,
+        "created_at": (existing or {}).get("created_at") or now,
+        "updated_at": now,
+    }
+
+
+def register_custom(doc: dict, api_key: str | None = None):
+    """Make one validated custom provider selectable. `api_key` None keeps
+    whatever key is already held; "" clears it."""
+    pid = doc["id"]
+    CUSTOM[pid] = doc
+    for key in [k for k in CUSTOM_PRICING if k[0] == pid]:
+        del CUSTOM_PRICING[key]
+    for m in doc["models"]:
+        CUSTOM_PRICING[(pid, m["id"])] = (m["input_usd_per_1m"], m["output_usd_per_1m"])
+    if api_key is not None:
+        if api_key.strip():
+            CUSTOM_SECRETS[pid] = api_key.strip()
+        else:
+            CUSTOM_SECRETS.pop(pid, None)
+    PROVIDERS[pid] = {
+        "id": pid,
+        "label": doc["label"],
+        "vendor": doc["vendor"],
+        "env_key": "",
+        "endpoint": doc["base_url"] + "/chat/completions",
+        "docs_url": doc.get("docs_url") or "",
+        "models": [m["id"] for m in doc["models"]],
+        "default_model": doc["default_model"],
+        "max_tokens_param": doc.get("max_tokens_param") or "max_tokens",
+        "auth_header": doc.get("auth_header") or "bearer",
+        "custom": True,
+    }
+
+
+def unregister_custom(provider_id: str):
+    if provider_id in CUSTOM:
+        CUSTOM.pop(provider_id, None)
+        CUSTOM_SECRETS.pop(provider_id, None)
+        PROVIDERS.pop(provider_id, None)
+        for key in [k for k in CUSTOM_PRICING if k[0] == provider_id]:
+            del CUSTOM_PRICING[key]
+
+
+def set_custom(docs: dict, secrets: dict | None = None):
+    """Replace every custom provider at once (startup load)."""
+    for pid in list(CUSTOM):
+        unregister_custom(pid)
+    for pid, doc in (docs or {}).items():
+        register_custom(doc, (secrets or {}).get(pid, ""))
+
+
+def public_custom(doc: dict) -> dict:
+    """A custom provider as the dashboard sees it - everything except the key."""
+    return dict(doc, has_api_key=doc["id"] in CUSTOM_SECRETS)
+
+
+def is_configured(provider: str, api_keys: dict) -> bool:
+    """Whether a miss on this provider reaches a real model: a built-in one
+    needs its key, a custom one only exists once it has an endpoint."""
+    if (PROVIDERS.get(provider) or {}).get("custom"):
+        return True
+    return bool((api_keys.get(provider) or "").strip())
+
 
 CACHE_SCOPES = ("global", "per_role", "per_subject")
 EVICTION_POLICIES = ("lru", "lfu", "fifo")
@@ -389,12 +708,17 @@ def estimate_tokens(text: str) -> int:
     return max(1, round(len(text) / 4))
 
 
-def price_for(model: str) -> tuple[float, float]:
+def price_for(model: str, provider: str | None = None) -> tuple[float, float]:
+    """(input, output) USD per 1M tokens. A custom provider's own price for
+    the model wins - including an explicit 0 for a self-hosted one."""
+    custom = CUSTOM_PRICING.get((provider or "", model))
+    if custom is not None:
+        return custom
     return PRICING.get(model, (1.00, 5.00))
 
 
-def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    in_price, out_price = price_for(model)
+def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, provider: str | None = None) -> float:
+    in_price, out_price = price_for(model, provider)
     return round((prompt_tokens * in_price + completion_tokens * out_price) / 1_000_000, 6)
 
 
@@ -538,12 +862,17 @@ def call_provider(provider: str, model: str, prompt: str, cfg: dict, api_keys: d
     spec = PROVIDERS.get(provider)
     if not spec:
         raise ValueError(f"Unknown provider '{provider}'")
+    max_tokens = int(cfg.get("max_output_tokens", 1024))
+    temperature = float(cfg.get("temperature", 0.0))
+
+    if spec.get("custom"):
+        return _openai_compatible(
+            provider, spec, model, prompt, max_tokens, temperature, CUSTOM_SECRETS.get(provider, ""), timeout,
+        )
+
     key = (api_keys.get(provider) or "").strip()
     if not key:
         return _stub_completion(provider, model, prompt, cfg)
-
-    max_tokens = int(cfg.get("max_output_tokens", 1024))
-    temperature = float(cfg.get("temperature", 0.0))
 
     if provider == "anthropic":
         resp = requests.post(
@@ -628,6 +957,87 @@ def call_provider(provider: str, model: str, prompt: str, cfg: dict, api_keys: d
     raise ValueError(f"No adapter implemented for provider '{provider}'")
 
 
+def _openai_compatible(
+    provider: str, spec: dict, model: str, prompt: str, max_tokens: int, temperature: float,
+    api_key: str, timeout: int,
+) -> ProviderResult:
+    """Adapter for custom providers: one POST to <base_url>/chat/completions.
+    The key is optional (a self-hosted server often has none). Redirects are
+    not followed - a 30x from an LLM endpoint is a misconfigured URL, and
+    following it would replay the prompt somewhere the admin did not enter."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        if spec.get("auth_header") == "api-key":
+            headers["api-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        spec.get("max_tokens_param") or "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(spec["endpoint"], headers=headers, json=payload, timeout=timeout, allow_redirects=False)
+    if resp.status_code == 400 and "temperature" in (resp.text or "").lower():
+        # Reasoning models (GPT-5 family, o-series and their hosted
+        # equivalents) accept only their default temperature. Send the call
+        # once more without the field rather than fail every request.
+        payload.pop("temperature")
+        resp = requests.post(spec["endpoint"], headers=headers, json=payload, timeout=timeout, allow_redirects=False)
+    if resp.status_code >= 300:
+        detail = re.sub(r"\s+", " ", resp.text or "").strip()[:300]
+        raise RuntimeError(f"HTTP {resp.status_code} from {spec['endpoint']}" + (f": {detail}" if detail else ""))
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{spec['endpoint']} did not return JSON - is the base URL right?") from exc
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if not choices:
+        raise RuntimeError(f"{spec['endpoint']} returned no choices - is this an OpenAI-compatible chat endpoint?")
+    content = (choices[0].get("message") or {}).get("content")
+    if isinstance(content, list):  # content-part arrays, as some servers return
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    text = content or ""
+    usage = body.get("usage") or {}
+    return ProviderResult(
+        text=text,
+        prompt_tokens=int(usage.get("prompt_tokens") or estimate_tokens(prompt)),
+        completion_tokens=int(usage.get("completion_tokens") or estimate_tokens(text)),
+        stub=False,
+        provider=provider,
+        model=model,
+    )
+
+
+def test_custom(doc: dict, api_key: str = "", timeout: int = 20) -> dict:
+    """One small real call to a custom provider's default model, without
+    registering it - what the form's "Test connection" button runs. Returns
+    {ok, model, latency_ms, reply | error}; never raises."""
+    spec = {
+        "endpoint": doc["base_url"] + "/chat/completions",
+        "max_tokens_param": doc.get("max_tokens_param") or "max_tokens",
+        "auth_header": doc.get("auth_header") or "bearer",
+    }
+    model = doc["default_model"]
+    started = time.time()
+    try:
+        result = _openai_compatible(
+            doc["id"], spec, model, "Reply with the single word: OK", 64, 0.0, (api_key or "").strip(), timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "model": model, "latency_ms": int((time.time() - started) * 1000),
+                "error": str(exc)[:500]}
+    return {
+        "ok": True, "model": model, "latency_ms": int((time.time() - started) * 1000),
+        "reply": (result["text"] or "").strip()[:200],
+        "prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+    }
+
+
+def public_presets() -> list[dict]:
+    return [dict(p, auth_header=p.get("auth_header") or "bearer") for p in CUSTOM_PRESETS]
+
+
 def bedrock_region() -> str:
     return (
         os.getenv("AWS_BEDROCK_REGION")
@@ -687,12 +1097,14 @@ def provider_catalog(api_keys: dict) -> list[dict]:
             "env_key": spec["env_key"],
             "docs_url": spec["docs_url"],
             "default_model": spec["default_model"],
-            "api_key_configured": bool((api_keys.get(pid) or "").strip()),
+            "api_key_configured": is_configured(pid, api_keys),
+            "custom": bool(spec.get("custom")),
+            "base_url": CUSTOM[pid]["base_url"] if pid in CUSTOM else None,
             "models": [
                 {
                     "id": m,
-                    "input_usd_per_1m": price_for(m)[0],
-                    "output_usd_per_1m": price_for(m)[1],
+                    "input_usd_per_1m": price_for(m, pid)[0],
+                    "output_usd_per_1m": price_for(m, pid)[1],
                 }
                 for m in spec["models"]
             ],

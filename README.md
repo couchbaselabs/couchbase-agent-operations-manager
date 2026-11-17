@@ -560,9 +560,10 @@ over.
   bypassed / error); savings broken down by provider and model; the cache
   contents with each entry's live policy verdict; and the recent cache
   event stream.
-- **LLM Caching -> Providers & Policy** - pick Claude, ChatGPT or Gemini
-  and a model, tune exact/semantic matching, configure every invalidation
-  rule, and send a test completion to watch a miss turn into a hit. See
+- **LLM Caching -> Providers & Policy** - pick Claude, ChatGPT, Gemini,
+  Bedrock or a custom LLM provider you add yourself, choose a model, tune
+  exact/semantic matching, configure every invalidation rule, and send a
+  test completion to watch a miss turn into a hit. See
   [LLM caching for agents](#llm-caching-for-agents).
 - **Audit Log** - every discover/invoke/authenticate decision, live-
   refreshing, filterable by action and decision.
@@ -600,6 +601,19 @@ over.
   memory, and MCP tool integration - plus download buttons for the SDK
   itself and for AI-assistant integration skills (Claude/ChatGPT/Gemini).
   See [Developer SDK](#developer-sdk) below.
+- **Settings -> Export ROI Metrics** - download what the LLM Cache and
+  Context Cache saved as a Couchbase-branded Excel workbook (for sharing),
+  or as CSV or JSON (for analysis): window totals (up to the 7-day cache
+  event retention), all-time totals, a per-model and per-agent breakdown
+  and a daily series. LLM savings use the same per-model prices as the
+  dashboard. Context fetches have no token price, so they are reported as
+  fetches and time avoided unless you enter a cost per fetch; entering the
+  platform cost for the window adds net savings and ROI. The report also
+  carries a twelve-month estimate at current usage: the window's daily
+  run rate applied month by month, with cumulative savings and, when a
+  platform cost is given, net savings and ROI. It is a straight-line
+  estimate - no growth or seasonality. API:
+  `GET /v1/roi/export?format=xlsx|csv|json&window_days=7`.
 - **Settings -> Monitoring** - Prometheus scrape token (hash-only
   storage), the `/metrics` switch, a `scrape_configs` job to paste, *Check
   targets* against Prometheus's own API, a Grafana wizard that installs the
@@ -714,6 +728,37 @@ Kubernetes, see
 in the chart README. Keys are read at startup, so restart
 operations-manager after adding or changing one
 (`docker compose restart operations-manager`).
+
+#### Custom LLM providers
+
+Admins can add further providers from the same page with **Add LLM
+provider** - no restart and no `.env` change. Any endpoint that speaks
+OpenAI's chat-completions API works; the **Provider type** dropdown
+pre-fills the endpoint, authentication and suggested models for:
+
+| Provider type | Base URL | Key |
+|---|---|---|
+| Azure OpenAI | `https://<resource-name>.openai.azure.com/openai/v1` | API key, sent as `api-key`; models are your deployment names |
+| Snowflake Cortex | `https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1` | Programmatic access token |
+| Databricks-hosted LLMs | `https://<workspace-host>/serving-endpoints` | Personal access or service-principal token; models are serving endpoint names |
+| Google DeepMind | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini API key |
+| Cohere | `https://api.cohere.ai/compatibility/v1` | Cohere API key |
+| Mistral AI | `https://api.mistral.ai/v1` | Mistral API key |
+| Self-hosted LLM | `http://<host>:<port>/v1` (Ollama, vLLM, TGI, LM Studio, LiteLLM) | Optional |
+| Custom LLM provider | anything else | Optional |
+
+Each provider carries its own model list and per-model prices (USD per 1M
+tokens) - the suggested prices are list-price estimates, so enter your
+contracted rate, or 0 for a model you host. **Test connection** sends one
+small prompt before or after saving. A saved provider behaves like a
+built-in one everywhere: the default policy, per-role / per-agent
+overrides, RAG applications, the dashboard and Live Topology. Its API key
+is stored encrypted in Couchbase (`settings::custom_llm_providers`) and is
+never returned by the API. A custom provider never answers from the
+offline stub, and it cannot be removed while a policy or RAG application
+still routes to it. API: `GET/POST /v1/llm/custom-providers`,
+`PUT/DELETE /v1/llm/custom-providers/{id}`,
+`POST /v1/llm/custom-providers/test`.
 
 **No key is required to try it.** A provider with no key configured
 answers a cache miss from a clearly-labelled deterministic stub, so

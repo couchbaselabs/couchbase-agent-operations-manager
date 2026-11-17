@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { PolicyOverridesPanel } from "../components/llm/PolicyOverridesPanel";
+import { CustomProvidersPanel } from "../components/llm/CustomProvidersPanel";
+import { useAuth } from "../auth/AuthContext";
 import type { LLMCacheConfig, LLMCompleteResponse, LLMProvider, Role } from "../api/types";
 
 const TTL_PRESETS = [
@@ -25,7 +27,16 @@ const EVICTION_HELP: Record<string, string> = {
   fifo: "Evict the oldest entries by creation time.",
 };
 
+function hostOf(url: string | null | undefined): string {
+  try {
+    return new URL(url || "").host;
+  } catch {
+    return url || "";
+  }
+}
+
 export function LLMCacheSettingsPage() {
+  const { user } = useAuth();
   const [providers, setProviders] = useState<LLMProvider[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [config, setConfig] = useState<LLMCacheConfig | null>(null);
@@ -164,8 +175,12 @@ export function LLMCacheSettingsPage() {
                 >
                   <div className="flex-between">
                     <div className="stat-label">{p.vendor}</div>
-                    <span className={`badge ${p.api_key_configured ? "badge-trusted" : "badge-neutral"}`}>
-                      {p.api_key_configured ? "key set" : "not configured"}
+                    <span
+                      className={`badge ${
+                        p.custom ? "badge-info" : p.api_key_configured ? "badge-trusted" : "badge-neutral"
+                      }`}
+                    >
+                      {p.custom ? "custom" : p.api_key_configured ? "key set" : "not configured"}
                     </span>
                   </div>
                   <div className="stat-value" style={{ fontSize: 22 }}>
@@ -174,6 +189,8 @@ export function LLMCacheSettingsPage() {
                   <div className="stat-hint">
                     {selected
                       ? "Selected - agents route here"
+                      : p.custom
+                      ? hostOf(p.base_url)
                       : !p.api_key_configured
                       ? `Set ${p.env_key} in .env to call it live`
                       : null}
@@ -182,6 +199,8 @@ export function LLMCacheSettingsPage() {
               );
             })}
           </div>
+
+          {user?.role === "admin" && <CustomProvidersPanel onChanged={load} />}
 
           <div className="panel section-gap" style={{ marginBottom: 24 }}>
             <div className="two-col">

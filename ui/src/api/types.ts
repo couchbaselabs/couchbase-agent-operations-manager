@@ -244,6 +244,198 @@ export interface LLMProvider {
   default_model: string;
   api_key_configured: boolean;
   models: LLMModelOption[];
+  // True for a provider an admin added from Providers & Policy (see
+  // CustomLLMProvider below); base_url is set only for those.
+  custom?: boolean;
+  base_url?: string | null;
+}
+
+export type LLMAuthHeader = "bearer" | "api-key";
+export type LLMMaxTokensParam = "max_tokens" | "max_completion_tokens";
+
+// A starting point for the "Add LLM provider" form.
+export interface CustomLLMPreset {
+  id: string;
+  label: string;
+  vendor: string;
+  base_url: string;
+  docs_url: string;
+  api_key_label: string;
+  api_key_required: boolean;
+  auth_header: LLMAuthHeader;
+  max_tokens_param: LLMMaxTokensParam;
+  notes: string;
+  models: LLMModelOption[];
+}
+
+export interface CustomLLMProvider {
+  id: string;
+  label: string;
+  vendor: string;
+  preset: string | null;
+  base_url: string;
+  docs_url: string;
+  models: LLMModelOption[];
+  default_model: string;
+  max_tokens_param: LLMMaxTokensParam;
+  auth_header: LLMAuthHeader;
+  has_api_key: boolean;
+  in_use_by?: string[];
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomLLMProviderPayload {
+  preset: string | null;
+  label: string;
+  base_url: string;
+  models: LLMModelOption[];
+  default_model: string;
+  max_tokens_param: LLMMaxTokensParam;
+  auth_header: LLMAuthHeader;
+  // null keeps the stored key (edits), "" removes it.
+  api_key: string | null;
+}
+
+export interface CustomLLMTestResult {
+  ok: boolean;
+  model: string;
+  latency_ms: number;
+  reply?: string;
+  error?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
+
+// --- ROI metrics export (Settings -> Export ROI Metrics) ---------------------
+
+export interface RoiLlmTotals {
+  requests: number;
+  hits: number;
+  exact_hits: number;
+  semantic_hits: number;
+  misses: number;
+  bypasses: number;
+  errors: number;
+  hit_rate_pct: number;
+  tokens_saved: number;
+  tokens_spent: number;
+  cost_saved_usd: number;
+  cost_spent_usd: number;
+  bypass_cost_usd: number;
+  savings_rate_pct: number;
+  latency_saved_ms: number;
+  latency_saved_hours: number;
+}
+
+export interface RoiContextTotals {
+  lookups: number;
+  hits: number;
+  misses: number;
+  writes: number;
+  hit_rate_pct: number;
+  latency_saved_ms: number;
+  latency_saved_hours: number;
+  source_fetches_avoided: number;
+  cost_saved_usd: number | null;
+}
+
+export interface RoiEstimatePeriod {
+  days: number;
+  llm_cost_saved_usd: number;
+  context_cost_saved_usd: number | null;
+  cost_saved_usd: number;
+  llm_cost_spent_usd: number;
+  tokens_saved: number;
+  context_fetches_avoided: number;
+  latency_saved_hours: number;
+  platform_cost_usd: number | null;
+  net_savings_usd: number | null;
+  roi_pct: number | null;
+}
+
+export interface RoiTwelveMonthEstimate {
+  basis: {
+    method: string;
+    window_days: number;
+    days_with_activity: number;
+    daily_cost_saved_usd: number;
+    daily_llm_cost_saved_usd: number;
+    daily_context_cost_saved_usd: number | null;
+    daily_platform_cost_usd: number | null;
+    daily_tokens_saved: number;
+    daily_llm_requests: number;
+    daily_context_fetches_avoided: number;
+  };
+  period_start: string;
+  period_end: string;
+  total: RoiEstimatePeriod;
+  months: Array<
+    RoiEstimatePeriod & {
+      month: number;
+      period_start: string;
+      period_end: string;
+      cumulative_savings_usd: number;
+      cumulative_net_savings_usd: number | null;
+    }
+  >;
+}
+
+export interface RoiReport {
+  generated_at: string;
+  window: { days: number; since: string; until: string; retention_days: number };
+  assumptions: {
+    llm_pricing: string;
+    context_cost_per_fetch_usd: number | null;
+    platform_cost_usd: number | null;
+    roi_formula: string;
+  };
+  combined: {
+    cost_saved_usd: number;
+    lifetime_cost_saved_usd: number;
+    latency_saved_ms: number;
+    latency_saved_hours: number;
+    projected_annual_savings_usd: number;
+    platform_cost_usd: number | null;
+    net_savings_usd: number | null;
+    roi_pct: number | null;
+  };
+  twelve_month_estimate: RoiTwelveMonthEstimate;
+  llm: {
+    window: RoiLlmTotals;
+    lifetime: { tokens_saved: number; cost_saved_usd: number; cost_spent_usd: number; savings_rate_pct: number };
+    by_model: Array<
+      RoiLlmTotals & {
+        provider: string;
+        provider_label: string;
+        model: string;
+        lifetime_cost_saved_usd: number;
+        lifetime_cost_spent_usd: number;
+      }
+    >;
+    daily: Array<RoiLlmTotals & { date: string }>;
+  };
+  context: {
+    window: RoiContextTotals;
+    lifetime: {
+      lookups: number;
+      hits: number;
+      hit_rate_pct: number;
+      source_fetches_avoided: number;
+      latency_saved_ms: number;
+      latency_saved_hours: number;
+      cost_saved_usd: number | null;
+    };
+    by_agent: Array<RoiContextTotals & { agent: string; namespace: string }>;
+    daily: Array<RoiContextTotals & { date: string }>;
+  };
+}
+
+export interface RoiExportOptions {
+  window_days: number;
+  context_cost_per_fetch_usd?: number;
+  platform_cost_usd?: number;
 }
 
 export interface LLMCacheConfig {
