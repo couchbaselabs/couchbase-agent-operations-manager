@@ -15,6 +15,7 @@ Pre-filtering" this whole appliance is built around.
 import asyncio
 import hashlib
 import logging
+import re
 import time
 import uuid
 from datetime import timedelta
@@ -42,6 +43,8 @@ from couchbase.options import (
     UpsertOptions,
 )
 import couchbase.search as cb_search
+import couchbase.subdocument as SD
+from couchbase.n1ql import QueryScanConsistency
 from couchbase.vector_search import VectorQuery as CBVectorQuery, VectorSearch as CBVectorSearch
 
 from config import (
@@ -3085,6 +3088,111 @@ class CouchbaseStore:
             return await asyncio.to_thread(_run)
         except Exception:  # noqa: BLE001
             return 0
+
+    # -- Re-embedding a knowledge set (see reembed_knowledge_set in main.py) ---
+    # Changing a set's embedding model means a second vector for every chunk
+    # it holds, written to a new field beside the old one. These four are
+    # everything that job needs from Couchbase. A vector field name is
+    # interpolated into N1QL, so it is checked against the only shape
+    # knowledge_sets ever generates before it gets near a statement.
+
+    @staticmethod
+    def _checked_vector_field(field: str) -> str:
+        if not re.fullmatch(r"embedding(__[a-z0-9_]{1,80})?", field or ""):
+            raise ValueError(f"Not a knowledge vector field: {field!r}")
+        return field
+
+    async def count_set_chunks(self, location: dict | None, set_id: str, missing_field: str | None = None) -> int:
+        """Chunks in one set - all of them, or only those without `missing_field`."""
+        extra = f" AND d.`{self._checked_vector_field(missing_field)}` IS MISSING" if missing_field else ""
+
+        def _run():
+            q = (f'SELECT RAW COUNT(*) FROM {_keyspace(location)} d '
+                 f'WHERE d.doc_type = "knowledge_chunk" AND d.set_id = $set_id{extra}')
+            rows = list(self.cluster.query(q, QueryOptions(
+                named_parameters={"set_id": set_id}, metrics=False,
+                scan_consistency=QueryScanConsistency.REQUEST_PLUS,
+            )).rows())
+            return int(rows[0]) if rows else 0
+
+        return await asyncio.to_thread(_run)
+
+    async def list_set_chunks_missing(self, location: dict | None, set_id: str, field: str, limit: int) -> list[dict]:
+        """The next `limit` chunks of a set that have no `field` yet, as
+        {id, content, document_title}. REQUEST_PLUS so a batch written a
+        moment ago is not handed back to be embedded a second time."""
+        field = self._checked_vector_field(field)
+
+        def _run():
+            q = (f'SELECT META(d).id AS id, d.content AS content, d.document_title AS document_title '
+                 f'FROM {_keyspace(location)} d '
+                 f'WHERE d.doc_type = "knowledge_chunk" AND d.set_id = $set_id AND d.`{field}` IS MISSING '
+                 f'LIMIT {int(limit)}')
+            return list(self.cluster.query(q, QueryOptions(
+                named_parameters={"set_id": set_id}, metrics=False,
+                scan_consistency=QueryScanConsistency.REQUEST_PLUS,
+            )).rows())
+
+        return await asyncio.to_thread(_run)
+
+    async def write_chunk_vectors(self, location: dict | None, field: str, vectors: dict) -> int:
+        """Add one vector field to existing chunks ({doc id: vector}) without
+        rewriting the rest of the document. A chunk deleted since it was
+        listed is skipped. Returns how many were written."""
+        field = self._checked_vector_field(field)
+        coll = self._knowledge_collection(location)
+
+        def _run():
+            written = 0
+            for doc_id, vector in vectors.items():
+                try:
+                    coll.mutate_in(doc_id, [SD.upsert(field, vector)])
+                    written += 1
+                except DocumentNotFoundException:
+                    continue
+            return written
+
+        return await asyncio.to_thread(_run)
+
+    async def unset_set_chunk_field(self, location: dict | None, set_id: str, field: str) -> int:
+        """Remove a vector field from every chunk of a set, in bounded
+        batches so one statement never holds a huge mutation. Returns the
+        number of chunks changed."""
+        field = self._checked_vector_field(field)
+
+        def _run():
+            total = 0
+            for _ in range(10_000):
+                q = (f'UPDATE {_keyspace(location)} d UNSET d.`{field}` '
+                     f'WHERE d.doc_type = "knowledge_chunk" AND d.set_id = $set_id AND d.`{field}` IS NOT MISSING '
+                     f'LIMIT 2000 RETURNING RAW 1')
+                changed = len(list(self.cluster.query(q, QueryOptions(
+                    named_parameters={"set_id": set_id}, metrics=False,
+                    scan_consistency=QueryScanConsistency.REQUEST_PLUS,
+                )).rows()))
+                total += changed
+                if changed < 2000:
+                    break
+            return total
+
+        return await asyncio.to_thread(_run)
+
+    async def knowledge_index_count(self, index_name: str, location: dict | None = None) -> int | None:
+        """Documents a set's vector index has ingested so far, or None when
+        the Search service won't say."""
+        loc = location or default_knowledge_location()
+        try:
+            resp = await asyncio.to_thread(
+                lambda: requests.get(
+                    self._search_admin_url(index_name, loc["bucket"], loc["scope"]) + "/count",
+                    auth=(COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"]),
+                    timeout=15,
+                    verify=couchbase_requests_verify(),
+                )
+            )
+            return int(resp.json().get("count")) if resp.status_code < 400 else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _run_knowledge_search_sync(
         self, role: str, vector: list, top_k: int, document_id: str | None,

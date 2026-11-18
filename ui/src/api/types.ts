@@ -1314,6 +1314,25 @@ export interface EmbeddingModelOption {
   has_api_key?: boolean;
 }
 
+/** An embedding-model change on a knowledge set: every chunk is embedded
+ * again beside the live vectors, then the set switches over. */
+export interface KnowledgeSetReembed {
+  status: "running" | "failed" | "done";
+  // "embedding" while chunks are processed, "indexing" while the new vector index catches up.
+  phase?: "embedding" | "indexing" | null;
+  model_id: string;
+  model_label: string;
+  previous_model_id: string | null;
+  previous_model_label: string | null;
+  total_chunks: number;
+  done_chunks: number;
+  percent: number;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  started_by: string | null;
+}
+
 export interface KnowledgeSet {
   set_id: string;
   name: string;
@@ -1334,6 +1353,7 @@ export interface KnowledgeSet {
   rag_apps: string[];
   created_at: string | null;
   created_by: string | null;
+  reembed: KnowledgeSetReembed | null;
 }
 
 /** Where a knowledge set keeps its chunks on the cluster. */

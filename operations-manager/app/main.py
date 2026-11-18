@@ -6111,6 +6111,7 @@ async def ingest_knowledge(req: KnowledgeIngestRequest, request: Request):
                    "indexed, embedded and permanently invisible.",
         )
     kset = get_knowledge_set(req.set_id)
+    require_set_writable(kset)
     expires_at = resolve_document_expiry(req.ttl_seconds, req.expires_at)
 
     if len(req.content.encode("utf-8")) > KNOWLEDGE_MAX_INLINE_MB * 1024 * 1024:
@@ -6290,6 +6291,7 @@ def _ingest_params_from_query(
     if not roles_:
         raise HTTPException(status_code=400, detail="allowed_roles is required - a document no role can read is permanently invisible")
     kset = get_knowledge_set(set_id)
+    require_set_writable(kset)
     params: dict = {
         "title": (title or "").strip()[:300],
         "allowed_roles": roles_,
@@ -6610,6 +6612,7 @@ async def start_warehouse_sync_run(sync: dict, *, trigger: str, user: dict | Non
         raise HTTPException(status_code=409, detail="A run of this sync is still in progress")
     runner = _ingest_runner()
     kset = get_knowledge_set(sync.get("set_id"))
+    require_set_writable(kset)
     title = sync.get("table_name") or sync["name"]
     params = {
         "title": title, "allowed_roles": list(sync["allowed_roles"]), "set_id": kset["set_id"],
@@ -7779,6 +7782,25 @@ def embedder_for(kset: dict) -> embedding_models.SetEmbedder:
     return embedder
 
 
+def _public_reembed(job: dict | None) -> dict | None:
+    """An embedding-model change as the page shows it."""
+    if not job:
+        return None
+    label = lambda mid: (embedding_models.resolve(mid or "") or {}).get("label", mid)  # noqa: E731
+    total, done = int(job.get("total_chunks") or 0), int(job.get("done_chunks") or 0)
+    return {
+        "status": job.get("status"), "phase": job.get("phase"),
+        "model_id": job.get("model_id"), "model_label": label(job.get("model_id")),
+        "previous_model_id": job.get("previous_model_id"),
+        "previous_model_label": label(job.get("previous_model_id")) if job.get("previous_model_id") else None,
+        "total_chunks": total, "done_chunks": done,
+        "percent": round(done / total * 100) if total else (100 if job.get("status") == "done" else 0),
+        "error": job.get("error"),
+        "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
+        "started_by": job.get("started_by"),
+    }
+
+
 def public_knowledge_sets(documents: list[dict] | None = None) -> list[dict]:
     counts: dict[str, dict] = {}
     for d in documents or []:
@@ -7801,6 +7823,7 @@ def public_knowledge_sets(documents: list[dict] | None = None) -> list[dict]:
             "chunk_count": counts.get(s["set_id"], {}).get("chunks", 0),
             "rag_apps": sorted(a for a, app in rag_apps_registry.items()
                                if (app.get("set_id") or knowledge_sets.DEFAULT_SET_ID) == s["set_id"]),
+            "reembed": _public_reembed(s.get("reembed")),
         })
     return sorted(out, key=lambda s: (not s["builtin"], s.get("created_at") or ""))
 
@@ -7830,6 +7853,13 @@ async def load_knowledge_sets():
                            s["set_id"], knowledge_sets.location_label(s["location"], default_knowledge_location()), exc)
             store.register_knowledge_location(s["location"])
         await store.ensure_knowledge_index(s["index_name"], s["vector_field"], s["dims"], s["location"])
+        # An embedding-model change interrupted by a restart carries on from
+        # the chunks that still lack the new vector.
+        job = s.get("reembed") or {}
+        if job.get("status") == "running":
+            await store.ensure_knowledge_index(job["index_name"], job["vector_field"], job["dims"], s["location"])
+            _reembed_tasks[s["set_id"]] = spawn(reembed_knowledge_set(s["set_id"]))
+            logger.info("Resuming re-embedding of knowledge set '%s' with %s", s["set_id"], job.get("model_id"))
     logger.info("Knowledge sets loaded (%d besides the default)", len(sets))
 
 
@@ -7882,16 +7912,12 @@ async def list_knowledge_storage(request: Request):
     }
 
 
-@app.post("/v1/knowledge/sets")
-async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
-    """Create a knowledge set: pick its embedding model, and AOM creates the
-    set's own Couchbase vector index sized to that model. A hosted model is
-    test-called first so a missing or wrong key fails here, not on the
-    first upload."""
-    user = require_admin(request)
-    model = embedding_models.resolve(req.model_id)
+def usable_embedding_model(model_id: str) -> dict:
+    """The catalog entry for a model a knowledge set may be put on, or the
+    HTTP error that says why not."""
+    model = embedding_models.resolve(model_id)
     if not model:
-        raise HTTPException(status_code=400, detail=f"Unknown embedding model '{req.model_id}'")
+        raise HTTPException(status_code=400, detail=f"Unknown embedding model '{model_id}'")
     if model.get("custom") and model.get("status") == "pending":
         raise HTTPException(status_code=409, detail=f"{model['label']} is still downloading - try again once it shows as ready")
     if model.get("custom") and model.get("status") == "error":
@@ -7901,6 +7927,275 @@ async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
     if not embedding_models.is_available(model):
         env = embedding_models.PROVIDERS[model["provider"]][1]
         raise HTTPException(status_code=400, detail=f"{model['label']} needs {env} set on the operations manager")
+    return model
+
+
+def require_set_writable(kset: dict) -> None:
+    """Refuse new documents while a set is moving to another embedding
+    model: a chunk added mid-change would be embedded with the old model
+    only and vanish from search the moment the set switches over."""
+    if (kset.get("reembed") or {}).get("status") == "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Knowledge set '{kset['name']}' is being re-embedded with a new model - "
+                   f"add documents once that finishes (Knowledge Base shows its progress).",
+        )
+
+
+# -- Editing a set, and changing its embedding model ----------------------------
+# Vectors from two models cannot be compared, so a set cannot simply be
+# pointed at a different model: every chunk it holds has to be embedded
+# again. That is done beside the live data rather than over it -
+#
+#   1. a new vector index is created over a new vector field
+#      (knowledge_sets.next_revision);
+#   2. a background job embeds every chunk's stored text with the new model
+#      and writes the vector into that new field. The set keeps answering
+#      searches from the old field and index the whole time;
+#   3. once no chunk is missing the new vector and the new index has caught
+#      up, the set is switched to the new model, field and index in one
+#      step, and the old index and old vectors are removed.
+#
+# The job picks chunks by "has no new vector yet", so it resumes where it
+# stopped after a restart or a failure, and cancelling it just drops the
+# new index and field - the set never left the old model.
+REEMBED_BATCH_CHUNKS = 64
+REEMBED_INDEX_WAIT_SECONDS = 180
+_reembed_tasks: dict = {}
+_reembed_cancelled: set = set()
+
+
+class KnowledgeSetUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    # A different model than the set's current one starts a re-embedding job.
+    model_id: str | None = None
+
+
+def _reembed_embedder(model_id: str) -> embedding_models.SetEmbedder:
+    return embedding_models.SetEmbedder(
+        model_id, default_embeddings=embeddings, default_model_id=EMBEDDING_CONFIG["model_name"],
+    )
+
+
+async def reembed_knowledge_set(set_id: str):
+    """Background job: steps 2 and 3 above for one set."""
+    kset = knowledge_sets_registry.get(set_id)
+    job = (kset or {}).get("reembed") or {}
+    if not kset or job.get("status") != "running":
+        return
+    location, field, index = kset.get("location"), job["vector_field"], job["index_name"]
+    embedder = _reembed_embedder(job["model_id"])
+    last_saved = time.time()
+    try:
+        job["total_chunks"] = await store.count_set_chunks(location, set_id)
+        remaining = await store.count_set_chunks(location, set_id, missing_field=field)
+        job["done_chunks"] = max(0, job["total_chunks"] - remaining)
+        while True:
+            if set_id in _reembed_cancelled:
+                return
+            rows = await store.list_set_chunks_missing(location, set_id, field, REEMBED_BATCH_CHUNKS)
+            if not rows:
+                break
+            vectors = await embedder.embed_documents(
+                [knowledge.build_embedding_text(r.get("document_title") or "", r.get("content") or "") for r in rows]
+            )
+            if set_id in _reembed_cancelled:
+                return
+            await store.write_chunk_vectors(location, field, {r["id"]: v for r, v in zip(rows, vectors)})
+            job["done_chunks"] = min(job["total_chunks"], job["done_chunks"] + len(rows))
+            if time.time() - last_saved > 5:
+                last_saved = time.time()
+                await save_knowledge_sets()
+
+        # Search indexes ingest asynchronously. Switching before the new one
+        # has seen every chunk would make recent ones unfindable for a
+        # while, so wait for it - bounded, because an index that never
+        # reports is not a reason to stay on the old model forever.
+        job["phase"] = "indexing"
+        await save_knowledge_sets()
+        deadline = time.time() + REEMBED_INDEX_WAIT_SECONDS
+        while job["total_chunks"] and time.time() < deadline:
+            indexed = await store.knowledge_index_count(index, location)
+            if indexed is None or indexed >= job["total_chunks"]:
+                break
+            await asyncio.sleep(3)
+        if set_id in _reembed_cancelled:
+            return
+
+        old = {k: kset[k] for k in ("model_id", "dims", "index_name", "vector_field")}
+        kset.update(
+            model_id=job["model_id"], dims=job["dims"], index_name=index, vector_field=field,
+            revision=job["revision"],
+            reembed={
+                "status": "done", "model_id": job["model_id"], "previous_model_id": old["model_id"],
+                "total_chunks": job["total_chunks"], "done_chunks": job["total_chunks"],
+                "started_at": job.get("started_at"), "finished_at": rag_apps.now_iso(),
+                "started_by": job.get("started_by"),
+            },
+        )
+        _set_embedders.pop(set_id, None)
+        await save_knowledge_sets()
+        # Cached retrievals were ranked by the old model's vectors.
+        bump_knowledge_generation()
+        logger.info("Knowledge set '%s' moved from %s to %s (%d chunks re-embedded)",
+                    set_id, old["model_id"], job["model_id"], job["total_chunks"])
+
+        # Housekeeping. A failure here costs disk, not correctness - the set
+        # is already on the new model.
+        try:
+            await store.delete_knowledge_index(old["index_name"], location)
+            await store.unset_set_chunk_field(location, set_id, old["vector_field"])
+            for doc in await store.list_knowledge_documents(limit=1000):
+                if doc.get("set_id") == set_id and doc.get("embedding_model") != job["model_id"]:
+                    doc["embedding_model"] = job["model_id"]
+                    await store.upsert_knowledge_document(doc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Knowledge set '%s': cleanup after the model change did not finish: %s", set_id, exc)
+    except Exception as exc:  # noqa: BLE001
+        # The set is still on its old model and still answering. What has
+        # been embedded so far stays, so a retry continues from here.
+        logger.warning("Re-embedding knowledge set '%s' with %s failed: %s", set_id, job.get("model_id"), exc)
+        job.update(status="failed", error=str(exc)[:500], finished_at=rag_apps.now_iso())
+        await save_knowledge_sets()
+    finally:
+        _reembed_tasks.pop(set_id, None)
+
+
+async def _discard_reembed(kset: dict) -> None:
+    """Remove a change that never completed: the new index and the new
+    vectors written so far. The set is left exactly as it was."""
+    job = kset.pop("reembed", None) or {}
+    await save_knowledge_sets()
+    if job.get("index_name") and job["index_name"] != kset["index_name"]:
+        await store.delete_knowledge_index(job["index_name"], kset.get("location"))
+        try:
+            await store.unset_set_chunk_field(kset.get("location"), kset["set_id"], job["vector_field"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Knowledge set '%s': could not remove partial vectors: %s", kset["set_id"], exc)
+
+
+@app.put("/v1/knowledge/sets/{set_id}")
+async def update_knowledge_set(set_id: str, req: KnowledgeSetUpdateRequest, request: Request):
+    """Edit a knowledge set: its name and description, and its embedding
+    model.
+
+    Changing the model re-embeds every document already in the set, in the
+    background. The set keeps answering searches and RAG queries from its
+    current model until the new vectors are complete, then switches over in
+    one step - `reembed` on the set reports progress. While that runs, new
+    documents for the set are refused (409). A change that fails leaves the
+    set on its current model; sending the same request again resumes it.
+
+    The built-in default set takes its model from EMBEDDING_MODEL and
+    cannot be edited here."""
+    user = require_admin(request)
+    if set_id == knowledge_sets.DEFAULT_SET_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="The default knowledge set is built in: its embedding model is the appliance's EMBEDDING_MODEL "
+                   "setting. To use another model, create a knowledge set with it.",
+        )
+    kset = knowledge_sets_registry.get(set_id)
+    if not kset:
+        raise HTTPException(status_code=404, detail=f"No knowledge set '{set_id}'")
+    try:
+        knowledge_sets.edit_metadata(kset, name=req.name, description=req.description)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = kset.get("reembed") or {}
+    wants_model = req.model_id and (
+        req.model_id != kset["model_id"] or (job.get("status") == "failed" and job.get("model_id") == req.model_id)
+    )
+    if req.model_id and req.model_id != kset["model_id"] and job.get("status") == "running":
+        if job.get("model_id") != req.model_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This set is already being re-embedded with {job.get('model_id')} - cancel that first",
+            )
+        wants_model = False  # the same change, already under way
+    if req.model_id == kset["model_id"] and job.get("status") == "failed":
+        # Choosing the current model again abandons a failed change.
+        await _discard_reembed(kset)
+
+    if wants_model:
+        model = usable_embedding_model(req.model_id)
+        if not store.connected or embeddings is None:
+            raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+        active = [j for j in await store.list_knowledge_jobs(limit=200, active_only=True)
+                  if ((j.get("params") or {}).get("set_id") or knowledge_sets.DEFAULT_SET_ID) == set_id]
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{len(active)} ingestion job(s) are still writing to this set - change the model once they finish",
+            )
+        if model["provider"] not in ("local", "custom_hf"):
+            try:
+                await _reembed_embedder(model["id"]).embed_query("connection test")
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"{model['label']} test call failed: {exc}") from exc
+
+        resuming = job.get("status") == "failed" and job.get("model_id") == model["id"] and job.get("vector_field")
+        if job and not resuming:
+            await _discard_reembed(kset)
+        target = (
+            {k: job[k] for k in ("revision", "index_name", "vector_field")} if resuming
+            else knowledge_sets.next_revision(kset, COUCHBASE_CONFIG["knowledge_index"])
+        )
+        if not await store.ensure_knowledge_index(
+            target["index_name"], target["vector_field"], int(model["dims"]), kset.get("location"),
+        ):
+            raise HTTPException(status_code=502, detail=f"Could not create vector index '{target['index_name']}' in Couchbase")
+        kset["reembed"] = {
+            **target, "status": "running", "phase": "embedding", "model_id": model["id"], "dims": int(model["dims"]),
+            "total_chunks": 0, "done_chunks": 0, "error": None,
+            "started_at": rag_apps.now_iso(), "started_by": user.get("username"),
+        }
+        _reembed_cancelled.discard(set_id)
+        _reembed_tasks[set_id] = spawn(reembed_knowledge_set(set_id))
+        logger.info("Knowledge set '%s': changing embedding model %s -> %s (by %s)",
+                    set_id, kset["model_id"], model["id"], user.get("username"))
+
+    await save_knowledge_sets()
+    return {"set": next(s for s in public_knowledge_sets() if s["set_id"] == set_id), "reembed_started": bool(wants_model)}
+
+
+@app.delete("/v1/knowledge/sets/{set_id}/reembed")
+async def cancel_knowledge_set_reembed(set_id: str, request: Request):
+    """Cancel (or clear a failed) embedding-model change. The set stays on
+    its current model; the partial new vectors and index are removed."""
+    require_admin(request)
+    kset = knowledge_sets_registry.get(set_id)
+    if not kset:
+        raise HTTPException(status_code=404, detail=f"No knowledge set '{set_id}'")
+    job = kset.get("reembed") or {}
+    if job.get("status") not in ("running", "failed"):
+        raise HTTPException(status_code=409, detail="No embedding-model change is in progress for this set")
+    _reembed_cancelled.add(set_id)
+    task = _reembed_tasks.pop(set_id, None)
+    if task is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=30)
+        except Exception:  # noqa: BLE001
+            pass
+    if (kset.get("reembed") or {}).get("status") == "done":
+        # It finished while the cancel was on its way - nothing to undo.
+        _reembed_cancelled.discard(set_id)
+        raise HTTPException(status_code=409, detail="The model change had already completed")
+    await _discard_reembed(kset)
+    _reembed_cancelled.discard(set_id)
+    return {"cancelled": True, "set": next(s for s in public_knowledge_sets() if s["set_id"] == set_id)}
+
+
+@app.post("/v1/knowledge/sets")
+async def create_knowledge_set(req: KnowledgeSetRequest, request: Request):
+    """Create a knowledge set: pick its embedding model, and AOM creates the
+    set's own Couchbase vector index sized to that model. A hosted model is
+    test-called first so a missing or wrong key fails here, not on the
+    first upload."""
+    user = require_admin(request)
+    model = usable_embedding_model(req.model_id)
     try:
         location = knowledge_sets.validate_location(
             {"bucket": req.bucket, "scope": req.scope, "collection": req.collection}, default_knowledge_location(),
@@ -7972,9 +8267,13 @@ async def delete_knowledge_set(set_id: str, request: Request):
     kset = knowledge_sets_registry.get(set_id)
     if not kset:
         raise HTTPException(status_code=404, detail=f"No knowledge set '{set_id}'")
+    if (kset.get("reembed") or {}).get("status") == "running":
+        raise HTTPException(status_code=409, detail="This set is being re-embedded - cancel that first")
     docs = [d for d in await store.list_knowledge_documents(limit=1000) if d.get("set_id") == set_id]
     if docs:
         raise HTTPException(status_code=409, detail=f"Delete this set's {len(docs)} document(s) first")
+    if (kset.get("reembed") or {}).get("status") == "failed":
+        await _discard_reembed(kset)
     users = [a for a, app in rag_apps_registry.items() if app.get("set_id") == set_id]
     if users:
         raise HTTPException(status_code=409, detail=f"RAG application(s) {users} use this set - move or delete them first")

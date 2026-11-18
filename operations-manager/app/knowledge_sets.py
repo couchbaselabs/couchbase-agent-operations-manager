@@ -119,5 +119,31 @@ def new_set(*, name: str, set_id: str | None, model: dict, base_index_name: str,
     }
 
 
+def next_revision(kset: dict, base_index_name: str) -> dict:
+    """The index and vector-field names a set moves to when its embedding
+    model changes. The new vectors are written beside the old ones under
+    these names, so the set keeps answering from the old model until every
+    chunk has been re-embedded (see reembed_knowledge_set in app/main.py)."""
+    revision = int(kset.get("revision") or 1) + 1
+    key = storage_key(kset["set_id"])
+    return {
+        "revision": revision,
+        "index_name": f"{base_index_name}__{key}__r{revision}",
+        "vector_field": f"embedding__{key}__r{revision}",
+    }
+
+
+def edit_metadata(kset: dict, *, name: str | None, description: str | None) -> dict:
+    """Apply a name/description edit in place. Raises ValueError on an empty name."""
+    if name is not None:
+        name = name.strip()[:80]
+        if not name:
+            raise ValueError("name is required")
+        kset["name"] = name
+    if description is not None:
+        kset["description"] = description.strip()[:300]
+    return kset
+
+
 def chunk_set_id(chunk_or_doc: dict) -> str:
     return chunk_or_doc.get("set_id") or DEFAULT_SET_ID

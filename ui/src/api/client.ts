@@ -701,6 +701,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  // A model_id different from the set's current one starts re-embedding.
+  updateKnowledgeSet: (setId: string, payload: { name?: string; description?: string; model_id?: string }) =>
+    request<{ set: KnowledgeSet; reembed_started: boolean }>(`/v1/knowledge/sets/${encodeURIComponent(setId)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  cancelKnowledgeSetReembed: (setId: string) =>
+    request<{ cancelled: boolean; set: KnowledgeSet }>(
+      `/v1/knowledge/sets/${encodeURIComponent(setId)}/reembed`,
+      { method: "DELETE" },
+    ),
   deleteKnowledgeSet: (setId: string) =>
     request<{ deleted: boolean; set_id: string }>(`/v1/knowledge/sets/${encodeURIComponent(setId)}`, {
       method: "DELETE",

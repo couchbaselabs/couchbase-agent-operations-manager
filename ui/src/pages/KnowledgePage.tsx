@@ -9,6 +9,7 @@ import type {
 } from "../api/types";
 import { usePoll } from "../hooks/usePoll";
 import { WarehouseSyncsPanel } from "../components/knowledge/WarehouseSyncsPanel";
+import { EditKnowledgeSetPanel } from "../components/knowledge/EditKnowledgeSetPanel";
 
 function fmtBytes(n: number | null | undefined): string {
   if (n == null) return "?";
@@ -192,6 +193,7 @@ export function KnowledgePage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [editingSetId, setEditingSetId] = useState<string | null>(null);
 
   const [title, setTitle] = useState("");
   const [allowedRoles, setAllowedRoles] = useState<string[]>([]);
@@ -349,6 +351,11 @@ export function KnowledgePage() {
       setCreatingRole(false);
     }
   }
+
+  // An embedding-model change runs in the background; keep its progress
+  // bar moving, and pick up the switch-over when it lands.
+  const anyReembedRunning = !!data?.sets.some((s) => s.reembed?.status === "running");
+  usePoll(load, 3000, anyReembedRunning);
 
   // Ingestion jobs refresh on their own while any is active; a job that
   // just finished also refreshes the document list once.
@@ -769,6 +776,42 @@ export function KnowledgePage() {
       setModels((await api.embeddingModels()).models);
     } catch (e: any) {
       setError(e.message || "Remove failed");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  // Cancel a running embedding-model change, or clear a failed one. Either
+  // way the set stays on the model it has been answering from all along.
+  async function handleCancelReembed(id: string, name: string, failed: boolean) {
+    if (
+      !failed &&
+      !confirm(`Cancel the embedding-model change for "${name}"? The set stays on its current model and the work done so far is discarded.`)
+    )
+      return;
+    setBusyId(`set:${id}`);
+    setError(null);
+    try {
+      await api.cancelKnowledgeSetReembed(id);
+      setNotice(`The embedding-model change for "${name}" was ${failed ? "discarded" : "cancelled"}.`);
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not cancel the model change");
+      await load();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  // A failed change keeps what it had embedded; this picks up from there.
+  async function handleRetryReembed(id: string, modelId: string) {
+    setBusyId(`set:${id}`);
+    setError(null);
+    try {
+      await api.updateKnowledgeSet(id, { model_id: modelId });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Could not restart the model change");
     } finally {
       setBusyId(null);
     }
@@ -1999,6 +2042,22 @@ export function KnowledgePage() {
           )}
 
           <h2 style={{ fontSize: 16, margin: "22px 0 14px 0" }}>Knowledge sets</h2>
+          {(() => {
+            const editing = data.sets.find((s) => s.set_id === editingSetId);
+            return editing ? (
+              <EditKnowledgeSetPanel
+                key={editing.set_id}
+                set={editing}
+                models={models}
+                onCancel={() => setEditingSetId(null)}
+                onSaved={async (note) => {
+                  setEditingSetId(null);
+                  setNotice(note);
+                  await load();
+                }}
+              />
+            ) : null;
+          })()}
           <div className="card" style={{ marginBottom: 24 }}>
             <div className="table-wrap">
               <table className="data-table">
@@ -2030,6 +2089,44 @@ export function KnowledgePage() {
                           {s.provider_label}
                           {!s.available && " · key not configured"}
                         </div>
+                        {s.reembed?.status === "running" && (
+                          <div style={{ marginTop: 6, minWidth: 220 }}>
+                            <div style={{ fontSize: 12 }}>
+                              {s.reembed.phase === "indexing" ? "Indexing new vectors for " : "Re-embedding with "}
+                              <strong>{s.reembed.model_label}</strong> - {s.reembed.percent}%
+                            </div>
+                            <div
+                              style={{
+                                height: 6,
+                                borderRadius: 3,
+                                background: "var(--gray-bg)",
+                                overflow: "hidden",
+                                margin: "4px 0",
+                              }}
+                            >
+                              <div style={{ height: "100%", width: `${s.reembed.percent}%`, background: "var(--teal)" }} />
+                            </div>
+                            <div className="cell-muted" style={{ fontSize: 12 }}>
+                              {s.reembed.done_chunks.toLocaleString()} of {s.reembed.total_chunks.toLocaleString()} chunks.
+                              Still answering from {s.model_label}; uploads to this set are paused.
+                            </div>
+                          </div>
+                        )}
+                        {s.reembed?.status === "failed" && (
+                          <div style={{ marginTop: 6, maxWidth: 320 }}>
+                            <span className="badge badge-danger">change to {s.reembed.model_label} failed</span>
+                            <div className="cell-muted" style={{ fontSize: 12, marginTop: 4, wordBreak: "break-word" }}>
+                              {s.reembed.error} Still on {s.model_label}. {s.reembed.done_chunks.toLocaleString()} of{" "}
+                              {s.reembed.total_chunks.toLocaleString()} chunks were done and are kept for a retry.
+                            </div>
+                          </div>
+                        )}
+                        {s.reembed?.status === "done" && s.reembed.previous_model_label && (
+                          <div className="cell-muted" style={{ fontSize: 12, marginTop: 4 }}>
+                            Changed from {s.reembed.previous_model_label}
+                            {s.reembed.finished_at ? ` on ${new Date(s.reembed.finished_at).toLocaleDateString()}` : ""}
+                          </div>
+                        )}
                       </td>
                       <td className="cell-mono" style={{ textAlign: "right" }}>{s.dims}</td>
                       <td className="cell-mono" style={{ textAlign: "right" }}>{s.document_count}</td>
@@ -2042,7 +2139,48 @@ export function KnowledgePage() {
                         {s.rag_apps.length ? s.rag_apps.join(", ") : "-"}
                       </td>
                       <td>
+                        {s.builtin && (
+                          <span
+                            className="cell-muted"
+                            style={{ fontSize: 12 }}
+                            title="The default set uses the appliance's EMBEDDING_MODEL setting. To use another model, create a knowledge set with it."
+                          >
+                            built in
+                          </span>
+                        )}
                         {!s.builtin && (
+                          <div className="flex-row" style={{ flexWrap: "wrap" }}>
+                            {s.reembed?.status === "running" ? (
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                disabled={busyId === `set:${s.set_id}`}
+                                onClick={() => handleCancelReembed(s.set_id, s.name, false)}
+                              >
+                                Cancel model change
+                              </button>
+                            ) : (
+                              <button className="btn btn-secondary btn-sm" onClick={() => setEditingSetId(s.set_id)}>
+                                Edit
+                              </button>
+                            )}
+                            {s.reembed?.status === "failed" && (
+                              <>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  disabled={busyId === `set:${s.set_id}`}
+                                  onClick={() => handleRetryReembed(s.set_id, s.reembed!.model_id)}
+                                >
+                                  Retry
+                                </button>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  disabled={busyId === `set:${s.set_id}`}
+                                  onClick={() => handleCancelReembed(s.set_id, s.name, true)}
+                                >
+                                  Discard
+                                </button>
+                              </>
+                            )}
                           <button
                             className="btn btn-danger-outline btn-sm"
                             disabled={busyId === `set:${s.set_id}` || s.document_count > 0 || s.rag_apps.length > 0}
@@ -2055,6 +2193,7 @@ export function KnowledgePage() {
                           >
                             Delete
                           </button>
+                          </div>
                         )}
                       </td>
                     </tr>

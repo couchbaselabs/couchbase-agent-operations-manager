@@ -592,6 +592,18 @@ over.
   query against Snowflake, Databricks or BigQuery on a schedule and keep the
   result loaded. See [Loading large data into the Knowledge
   Base](#loading-large-data-into-the-knowledge-base).
+  A knowledge set can be **edited** from the Knowledge sets table: its
+  name and description, and its **embedding model**. Changing the model
+  re-embeds every chunk already in the set from its stored text, in the
+  background and beside the live vectors - the set keeps answering
+  searches and RAG applications from its current model until the new
+  vectors and their vector index are complete, then switches over in one
+  step. New documents for that set are refused while it runs; a change
+  that fails or is cancelled leaves the set on its current model, and a
+  retry resumes where it stopped. The built-in default set uses
+  `EMBEDDING_MODEL` and is not editable. API:
+  `PUT /v1/knowledge/sets/{set_id}`,
+  `DELETE /v1/knowledge/sets/{set_id}/reembed`.
 - **RAG Applications** - register an application over the Knowledge Base,
   try it, and read **Token usage by user**: per caller subject, queries,
   cache hits and hit rate, tokens spent and saved, cost spent and saved,
