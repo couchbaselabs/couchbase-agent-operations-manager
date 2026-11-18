@@ -317,6 +317,31 @@ def _price(value) -> float:
         return 0.0
 
 
+# "text-embedding-3-large", "embed-v4.0", "amazon.titan-embed-text-v2:0" ...
+_EMBEDDING_MODEL_ID = re.compile(r"(^|[^a-z])embed(ding|dings)?([^a-z]|$)", re.IGNORECASE)
+_AZURE_HOSTS = (".openai.azure.com", ".services.ai.azure.com", ".cognitiveservices.azure.com")
+
+
+def _azure_base_url(base_url: str) -> str:
+    """Azure's portal shows the bare resource endpoint
+    (https://<resource>.openai.azure.com/), which is what people paste. The
+    OpenAI-compatible API lives under /openai/v1 on that host, so add it
+    when the path is missing rather than save a URL that can only 404."""
+    scheme, _, rest = base_url.partition("://")
+    host, slash, path = rest.partition("/")
+    if not host.lower().endswith(_AZURE_HOSTS):
+        return base_url
+    path = (slash + path).rstrip("/")
+    if path in ("", "/openai"):
+        return f"{scheme}://{host}/openai/v1"
+    if "/deployments/" in path:
+        raise ValueError(
+            "That is a deployment-specific Azure URL. Use the resource's v1 endpoint instead - "
+            f"{scheme}://{host}/openai/v1 - and enter each deployment name as a model below."
+        )
+    return base_url
+
+
 def custom_provider(raw: dict | None, *, existing: dict | None = None, created_by: str | None = None) -> dict:
     """Validate one submitted custom provider into its stored shape.
     Raises ValueError with a message meant for the form. `existing` is the
@@ -338,6 +363,7 @@ def custom_provider(raw: dict | None, *, existing: dict | None = None, created_b
         raise ValueError("Replace the <placeholder> in the base URL with your own account or host")
     if not re.fullmatch(r"https?://[^\s/?#]+[^\s?#]*", base_url) or len(base_url) > 500:
         raise ValueError("Base URL must be an http(s) URL, e.g. https://llm.internal:8000/v1")
+    base_url = _azure_base_url(base_url)
 
     models, seen = [], set()
     for m in raw.get("models") or []:
@@ -348,6 +374,11 @@ def custom_provider(raw: dict | None, *, existing: dict | None = None, created_b
             continue
         if not _CUSTOM_MODEL_ID.fullmatch(model_id):
             raise ValueError(f"'{model_id[:60]}' is not a usable model ID (letters, digits and _ . : / @ + - only)")
+        if _EMBEDDING_MODEL_ID.search(model_id):
+            raise ValueError(
+                f"'{model_id[:60]}' looks like an embedding model. An LLM provider needs chat models - "
+                "embedding models are added on the Knowledge Base page, when creating a knowledge set."
+            )
         if model_id in seen:
             continue
         seen.add(model_id)
@@ -1025,8 +1056,16 @@ def test_custom(doc: dict, api_key: str = "", timeout: int = 20) -> dict:
             doc["id"], spec, model, "Reply with the single word: OK", 64, 0.0, (api_key or "").strip(), timeout,
         )
     except Exception as exc:  # noqa: BLE001
+        error = str(exc)[:500]
+        if error.startswith("HTTP 404"):
+            error += (
+                f" - Two things cause a 404 here: the base URL is not the root that /chat/completions is "
+                f"appended to, or '{model}' is not a model (on Azure: a deployment) that exists on this endpoint."
+            )
+        elif error.startswith(("HTTP 401", "HTTP 403")):
+            error += " - The endpoint rejected the API key, or the key is being sent in the wrong header."
         return {"ok": False, "model": model, "latency_ms": int((time.time() - started) * 1000),
-                "error": str(exc)[:500]}
+                "error": error[:800]}
     return {
         "ok": True, "model": model, "latency_ms": int((time.time() - started) * 1000),
         "reply": (result["text"] or "").strip()[:200],
