@@ -17,7 +17,10 @@ dependencies = [
 # Only needed for aom_sdk.mcp_server, the bridge that exposes this
 # appliance as a real MCP server. Everything else in the SDK depends on
 # nothing but `requests`.
-mcp = ["mcp>=1.2.0"]
+# aom_sdk.mcp_server uses the low-level Server's @list_tools()/@call_tool()
+# decorators, which mcp 2.0 removed, so stay on 1.x until it's ported
+# (sample-mcp-servers/ and operations-manager/ already pin 1.30.0).
+mcp = ["mcp>=1.2.0,<2"]
 
 [project.scripts]
 aom-mcp-server = "aom_sdk.mcp_server:main"
