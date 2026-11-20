@@ -1368,7 +1368,7 @@ async def governed_completion(prompt: str, *, purpose: str) -> tuple[str, bool]:
             "namespace": cfg["namespace"], "scope_key": scope,
             "prompt_preview": redact_text_for_storage(prompt.strip()[:240]),
             "total_tokens": hit.get("total_tokens", 0), "tokens_saved": hit.get("total_tokens", 0),
-            "cost_usd": 0.0, "cost_saved_usd": hit.get("cost_usd", 0.0), "latency_ms": 0,
+            "cost_usd": 0.0, "cost_saved_usd": llm_cache.entry_cost_usd(hit), "latency_ms": 0,
             "reason": f"internal {purpose} served from cache",
         })
         return hit.get("response", ""), True
@@ -3868,7 +3868,7 @@ async def llm_complete(
             # spent columns, need a separate, non-plateauing source.
             await store.increment_lifetime_stats(
                 tokens_saved_delta=int(hit.get("total_tokens", 0) or 0),
-                cost_saved_delta=float(hit.get("cost_usd", 0.0) or 0.0),
+                cost_saved_delta=llm_cache.entry_cost_usd(hit),
                 provider=provider,
                 model=model,
             )
@@ -3891,7 +3891,7 @@ async def llm_complete(
                 "total_tokens": hit.get("total_tokens", 0),
                 "tokens_saved": hit.get("total_tokens", 0),
                 "cost_usd": 0.0,
-                "cost_saved_usd": hit.get("cost_usd", 0.0),
+                "cost_saved_usd": llm_cache.entry_cost_usd(hit),
                 "latency_ms": latency_ms,
                 "latency_saved_ms": saved_ms,
                 "reason": f"served from cache ({outcome.replace('hit_', '')} match)",
@@ -3934,7 +3934,7 @@ async def llm_complete(
                 },
                 "cost_usd": 0.0,
                 "tokens_saved": hit.get("total_tokens", 0),
-                "cost_saved_usd": hit.get("cost_usd", 0.0),
+                "cost_saved_usd": llm_cache.entry_cost_usd(hit),
                 "latency_ms": latency_ms,
                 "stub": bool(hit.get("stub")),
                 "trace": {"trace_id": ctx["trace_id"]},
@@ -4124,7 +4124,7 @@ async def _record_cache_hit(entry: dict, cfg: dict, semantic: bool) -> int:
     else:
         entry["exact_hits"] = int(entry.get("exact_hits") or 0) + 1
     entry["tokens_saved"] = int(entry.get("tokens_saved") or 0) + int(entry.get("total_tokens") or 0)
-    entry["cost_saved_usd"] = round(float(entry.get("cost_saved_usd") or 0.0) + float(entry.get("cost_usd") or 0.0), 6)
+    entry["cost_saved_usd"] = round(float(entry.get("cost_saved_usd") or 0.0) + llm_cache.entry_cost_usd(entry), 6)
 
     ttl = int(cfg.get("ttl_seconds") or 0)
     remaining = 0

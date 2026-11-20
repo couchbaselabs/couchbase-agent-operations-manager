@@ -489,6 +489,13 @@ export function CustomProvidersPanel({ onChanged }: { onChanged: () => void | Pr
               Prices turn tokens saved into dollars saved on the LLM Cache dashboard and in the ROI export. Suggested
               prices are list-price estimates - replace them with your contracted rate, or leave 0 for a model you
               host yourself.
+              {form.preset === "azure_openai" && (
+                <>
+                  {" "}
+                  For Azure OpenAI, a deployment left at 0 is priced at Azure's Global Standard list price for the
+                  model behind it - enter your own rate for Data Zone, Regional, provisioned or negotiated pricing.
+                </>
+              )}
             </div>
           </div>
 

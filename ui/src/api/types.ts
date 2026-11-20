@@ -233,6 +233,8 @@ export interface LLMModelOption {
   id: string;
   input_usd_per_1m: number;
   output_usd_per_1m: number;
+  // "azure_list": an Azure OpenAI model left at 0, priced from Azure's list prices.
+  price_source?: "list" | "custom" | "azure_list";
 }
 
 export interface LLMProvider {

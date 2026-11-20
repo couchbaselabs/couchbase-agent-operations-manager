@@ -309,6 +309,66 @@ CUSTOM: dict[str, dict] = {}
 CUSTOM_SECRETS: dict[str, str] = {}
 CUSTOM_PRICING: dict[tuple[str, str], tuple[float, float]] = {}
 
+# Azure OpenAI list prices, USD per 1M tokens (input, output), Global
+# Standard pay-as-you-go. Used for an Azure provider's model whose prices
+# were left at 0: on Azure a "model" is a deployment name the admin chose,
+# so there is nothing in PRICING to find it under, and the form's blank
+# price would otherwise report every call - and every cache hit - as $0.
+# Data Zone and Regional deployments list about 10% higher; provisioned
+# (PTU) and negotiated rates are not per-token list prices at all - enter
+# those on the provider instead, which always wins.
+AZURE_OPENAI_PRICING: dict[str, tuple[float, float]] = {
+    "gpt-5.6-sol": (5.00, 30.00),
+    "gpt-5.6-terra": (2.00, 12.00),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5.5": (5.00, 30.00),
+    "gpt-5.4": (2.50, 15.00),
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5.4-nano": (0.20, 1.25),
+    "gpt-5.4-pro": (30.00, 180.00),
+    "gpt-5.2": (1.75, 14.00),
+    "gpt-5.1": (1.25, 10.00),
+    "gpt-5.1-codex-mini": (0.25, 2.00),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-5-pro": (15.00, 120.00),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "o4-mini": (1.10, 4.40),
+    "o3": (2.00, 8.00),
+    "o3-mini": (1.10, 4.40),
+    "o3-pro": (20.00, 80.00),
+    "o1": (15.00, 60.00),
+    "o1-mini": (1.10, 4.40),
+    "o1-pro": (150.00, 600.00),
+    "gpt-4-turbo": (10.00, 30.00),
+    "gpt-4": (30.00, 60.00),
+    "gpt-3.5-turbo": (0.50, 1.50),
+    "gpt-35-turbo": (0.50, 1.50),  # Azure's spelling
+}
+# (provider id, deployment name) -> the underlying model Azure named in its
+# last response for that deployment ("gpt-4o-2024-11-20"). Learned on each
+# call, so a deployment called "prod-chat" is still priced correctly.
+AZURE_REPORTED_MODEL: dict[tuple[str, str], str] = {}
+
+
+def azure_list_price(name: str | None) -> tuple[float, float] | None:
+    """Azure OpenAI list price for a model or deployment name, or None.
+    The longest known model name found in `name` on a word boundary wins,
+    so "gpt-4o-mini-2024-07-18" and "nov-gpt-4o-mini-prod" are both
+    gpt-4o-mini, and "gpt-5.4" is never read as "gpt-5"."""
+    text = re.sub(r"[\s_]+", "-", (name or "").strip().lower())
+    if not text:
+        return None
+    for key in sorted(AZURE_OPENAI_PRICING, key=len, reverse=True):
+        if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9]|\.[0-9])", text):
+            return AZURE_OPENAI_PRICING[key]
+    return None
+
 
 def _price(value) -> float:
     try:
@@ -454,7 +514,13 @@ def register_custom(doc: dict, api_key: str | None = None):
         "max_tokens_param": doc.get("max_tokens_param") or "max_tokens",
         "auth_header": doc.get("auth_header") or "bearer",
         "custom": True,
+        "azure": _is_azure_openai(doc),
     }
+
+
+def _is_azure_openai(doc: dict) -> bool:
+    host = (doc.get("base_url") or "").partition("://")[2].partition("/")[0].lower()
+    return doc.get("preset") == "azure_openai" or host.endswith(_AZURE_HOSTS)
 
 
 def unregister_custom(provider_id: str):
@@ -464,6 +530,8 @@ def unregister_custom(provider_id: str):
         PROVIDERS.pop(provider_id, None)
         for key in [k for k in CUSTOM_PRICING if k[0] == provider_id]:
             del CUSTOM_PRICING[key]
+        for key in [k for k in AZURE_REPORTED_MODEL if k[0] == provider_id]:
+            del AZURE_REPORTED_MODEL[key]
 
 
 def set_custom(docs: dict, secrets: dict | None = None):
@@ -742,15 +810,40 @@ def estimate_tokens(text: str) -> int:
 def price_for(model: str, provider: str | None = None) -> tuple[float, float]:
     """(input, output) USD per 1M tokens. A custom provider's own price for
     the model wins - including an explicit 0 for a self-hosted one."""
+    return priced(model, provider)[0]
+
+
+def priced(model: str, provider: str | None = None) -> tuple[tuple[float, float], str]:
+    """price_for plus where the price came from: "custom" (entered on the
+    provider), "azure_list" (an Azure OpenAI model left at 0, priced from
+    AZURE_OPENAI_PRICING) or "list" (PRICING / its default)."""
     custom = CUSTOM_PRICING.get((provider or "", model))
-    if custom is not None:
-        return custom
-    return PRICING.get(model, (1.00, 5.00))
+    if custom is None:
+        return PRICING.get(model, (1.00, 5.00)), "list"
+    if not any(custom) and (PROVIDERS.get(provider or "") or {}).get("azure"):
+        listed = azure_list_price(AZURE_REPORTED_MODEL.get((provider, model))) or azure_list_price(model)
+        if listed:
+            return listed, "azure_list"
+    return custom, "custom"
 
 
 def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, provider: str | None = None) -> float:
     in_price, out_price = price_for(model, provider)
     return round((prompt_tokens * in_price + completion_tokens * out_price) / 1_000_000, 6)
+
+
+def entry_cost_usd(entry: dict) -> float:
+    """What a cached answer cost to produce, i.e. what a hit on it saves.
+    An entry written while its model had no price carries cost_usd 0;
+    re-price it from its token counts so hits on answers cached before the
+    price existed still count as money saved."""
+    cost = float(entry.get("cost_usd") or 0.0)
+    if cost > 0:
+        return cost
+    return estimate_cost_usd(
+        entry.get("model") or "", int(entry.get("prompt_tokens") or 0),
+        int(entry.get("completion_tokens") or 0), entry.get("provider"),
+    )
 
 
 def is_bypassed(prompt: str, cfg: dict, role: str | None) -> str | None:
@@ -1030,6 +1123,8 @@ def _openai_compatible(
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
     text = content or ""
     usage = body.get("usage") or {}
+    if spec.get("azure") and isinstance(body.get("model"), str) and body["model"].strip():
+        AZURE_REPORTED_MODEL[(provider, model)] = body["model"].strip()[:200]
     return ProviderResult(
         text=text,
         prompt_tokens=int(usage.get("prompt_tokens") or estimate_tokens(prompt)),
@@ -1142,8 +1237,9 @@ def provider_catalog(api_keys: dict) -> list[dict]:
             "models": [
                 {
                     "id": m,
-                    "input_usd_per_1m": price_for(m, pid)[0],
-                    "output_usd_per_1m": price_for(m, pid)[1],
+                    "input_usd_per_1m": priced(m, pid)[0][0],
+                    "output_usd_per_1m": priced(m, pid)[0][1],
+                    "price_source": priced(m, pid)[1],
                 }
                 for m in spec["models"]
             ],

@@ -773,7 +773,10 @@ pre-fills the endpoint, authentication and suggested models for:
 
 Each provider carries its own model list and per-model prices (USD per 1M
 tokens) - the suggested prices are list-price estimates, so enter your
-contracted rate, or 0 for a model you host. **Test connection** sends one
+contracted rate, or 0 for a model you host. An Azure OpenAI deployment left
+at 0 is priced at Azure's Global Standard list price for the model behind
+it (taken from the model name Azure returns, so the deployment can be
+called anything); a price you enter always wins. **Test connection** sends one
 small prompt before or after saving. A saved provider behaves like a
 built-in one everywhere: the default policy, per-role / per-agent
 overrides, RAG applications, the dashboard and Live Topology. Its API key

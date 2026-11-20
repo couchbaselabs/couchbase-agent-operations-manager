@@ -383,6 +383,7 @@ export function PolicyOverridesPanel({
                   {(draftProvider?.models || []).map((m) => (
                     <option key={m.id} value={m.id}>
                       {m.id} - ${m.input_usd_per_1m}/M in, ${m.output_usd_per_1m}/M out
+                      {m.price_source === "azure_list" ? " (Azure list price)" : ""}
                     </option>
                   ))}
                 </select>
